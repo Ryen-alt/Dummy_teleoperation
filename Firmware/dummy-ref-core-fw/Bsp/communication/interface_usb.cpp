@@ -4,6 +4,14 @@
 #include "usbd_cdc_if.h"
 #include "usb_device.h"
 #include "interface_usb.hpp"
+#include "protocols/binary_control_session.hpp"
+#include "protocols/binary_protocol.hpp"
+#include "configurations/robot_config_generated.hpp"
+
+#include <cstring>
+
+extern "C" void ReadRobotStateForBinaryProtocol(float position[7], float velocity[7],
+                                                  uint8_t* validity);
 
 osThreadId_t usbServerTaskHandle;
 USBStats_t usb_stats_ = {0};
@@ -65,7 +73,7 @@ public:
         while (length)
         {
             size_t chunk = length < USB_TX_DATA_SIZE ? length : USB_TX_DATA_SIZE;
-            if (output_.process_packet(buffer, length) != 0)
+            if (output_.process_packet(buffer, chunk) != 0)
                 return -1;
             buffer += chunk;
             length -= chunk;
@@ -89,6 +97,87 @@ private:
 StreamSink *usbStreamOutputPtr = &usb_stream_output;
 
 BidirectionalPacketBasedChannel usb_channel(usb_packet_output_native);
+
+namespace
+{
+dummy::protocol::SessionConfig MakeBinarySessionConfig()
+{
+    dummy::protocol::SessionConfig config{};
+    config.config_sha256 = dummy::generated_config::kConfigSha256;
+    config.joint_min_rad = dummy::generated_config::kJointMinRad;
+    config.joint_max_rad = dummy::generated_config::kJointMaxRad;
+    config.max_velocity_rad_s = dummy::generated_config::kMaxVelocityRadS;
+    config.hardware_parameters_verified =
+        dummy::generated_config::kHardwareParametersVerified &&
+        dummy::generated_config::kExternalTargetExecutionReady;
+    config.max_lease_ms = 1000;
+    config.max_target_ttl_ms = 250;
+    return config;
+}
+
+dummy::protocol::StreamDecoder binary_decoder;
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1");
+uint32_t binary_last_micros = 0;
+uint64_t binary_micros_epoch = 0;
+uint64_t binary_last_state_us = 0;
+uint32_t binary_state_sequence = 0;
+bool cdc_binary_frame_active = false;
+bool binary_state_stream_enabled = false;
+
+uint64_t BinaryMonotonicMicros()
+{
+    const uint32_t current = micros();
+    if (current < binary_last_micros)
+        binary_micros_epoch += (uint64_t{1} << 32U);
+    binary_last_micros = current;
+    return binary_micros_epoch + current;
+}
+
+void SendBinaryPacket(dummy::protocol::Packet& packet, uint64_t now_us)
+{
+    std::array<uint8_t, 600> encoded{};
+    packet.header.sender_time_us = now_us;
+    const size_t length = dummy::protocol::EncodePacket(packet, encoded.data(), encoded.size());
+    if (length != 0)
+        usb_stream_output.process_bytes(encoded.data(), length, nullptr);
+}
+
+void ProcessBinaryBytes(const uint8_t* data, size_t length, uint64_t now_us)
+{
+    for (size_t index = 0; index < length; ++index)
+    {
+        dummy::protocol::Packet request{};
+        if (!binary_decoder.Feed(data[index], request))
+            continue;
+        auto result = binary_session.Process(request, now_us);
+        SendBinaryPacket(result.response, now_us);
+    }
+    binary_state_stream_enabled = binary_session.hello_valid();
+}
+
+void MaybeSendBinaryState(uint64_t now_us)
+{
+    constexpr uint64_t kStatePeriodUs = 20000; // 50 Hz, outside the 200 Hz control task.
+    if (!binary_state_stream_enabled || !binary_session.hello_valid() ||
+        now_us - binary_last_state_us < kStatePeriodUs)
+        return;
+    binary_last_state_us = now_us;
+    binary_session.Tick(now_us);
+
+    std::array<float, 7> position{};
+    std::array<float, 7> velocity{};
+    uint8_t validity = 0;
+    ReadRobotStateForBinaryProtocol(position.data(), velocity.data(), &validity);
+    const auto state = binary_session.MakeState(position, velocity, validity, now_us);
+    dummy::protocol::Packet packet{};
+    packet.header.message_type = static_cast<uint8_t>(dummy::protocol::MessageType::State);
+    packet.header.session_id = binary_session.telemetry_session_id();
+    packet.header.sequence = ++binary_state_sequence;
+    packet.header.payload_length = sizeof(state);
+    std::memcpy(packet.payload.data(), &state, sizeof(state));
+    SendBinaryPacket(packet, now_us);
+}
+} // namespace
 
 
 struct USBInterface
@@ -127,7 +216,7 @@ static void UsbServerTask(void *ctx)
     for (;;)
     {
         // const uint32_t usb_check_timeout = 1; // ms
-        osStatus sem_stat = osSemaphoreAcquire(sem_usb_rx, osWaitForever);
+        osStatus sem_stat = osSemaphoreAcquire(sem_usb_rx, 20);
         if (sem_stat == osOK)
         {
             usb_stats_.rx_cnt++;
@@ -137,7 +226,22 @@ static void UsbServerTask(void *ctx)
             {
                 CDC_interface.data_pending = false;
 
-                ASCII_protocol_parse_stream(CDC_interface.rx_buf, CDC_interface.rx_len, usb_stream_output);
+                const bool starts_binary = CDC_interface.rx_len > 0 && CDC_interface.rx_buf[0] == 0x06;
+                const bool starts_ascii = CDC_interface.rx_len > 0 &&
+                    CDC_interface.rx_buf[0] >= 0x20 && CDC_interface.rx_buf[0] <= 0x7e;
+                if (cdc_binary_frame_active ||
+                    (!starts_ascii && (binary_state_stream_enabled || starts_binary)))
+                {
+                    ProcessBinaryBytes(CDC_interface.rx_buf, CDC_interface.rx_len, BinaryMonotonicMicros());
+                    cdc_binary_frame_active =
+                        CDC_interface.rx_len > 0 && CDC_interface.rx_buf[CDC_interface.rx_len - 1] != 0;
+                }
+                else
+                {
+                    // Returning to the maintenance protocol also stops binary telemetry.
+                    binary_state_stream_enabled = false;
+                    ASCII_protocol_parse_stream(CDC_interface.rx_buf, CDC_interface.rx_len, usb_stream_output);
+                }
                 USBD_CDC_ReceivePacket(&hUsbDeviceFS, CDC_interface.out_ep);  // Allow next packet
             }
 
@@ -149,6 +253,7 @@ static void UsbServerTask(void *ctx)
                 USBD_CDC_ReceivePacket(&hUsbDeviceFS, ODrive_interface.out_ep);  // Allow next packet
             }
         }
+        MaybeSendBinaryState(BinaryMonotonicMicros());
     }
 }
 
@@ -179,7 +284,7 @@ void usb_rx_process_packet(uint8_t *buf, uint32_t len, uint8_t endpoint_pair)
 
 const osThreadAttr_t usbServerTask_attributes = {
     .name = "UsbServerTask",
-    .stack_size = 2000,
+    .stack_size = 4096,
     .priority = (osPriority_t) osPriorityNormal,
 };
 
