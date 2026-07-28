@@ -4,3 +4,12 @@
 
 /Dummy_URDF/
 
+# Local STM32CubeIDE/CMake/VS Code state for the Dummy firmware projects.
+/.vscode/
+/Firmware/dummy-*/.clangd
+/Firmware/dummy-*/.settings/
+/Firmware/dummy-*/.vscode/
+/Firmware/dummy-*/**/build/
+/Firmware/dummy-*/cmake-build-*/
+/Firmware/dummy-*/mx.scratch/
+

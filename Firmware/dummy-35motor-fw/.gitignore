@@ -1,0 +1,6 @@
+/build/
+/cmake-build-*/
+/mx.scratch/
+/.settings/
+/.vscode/
+/.clangd
