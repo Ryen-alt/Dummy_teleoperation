@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"E:/Dummy_data_collect/Firmware/dummy-ref-core-fw/build-codex/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
