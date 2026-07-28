@@ -1,0 +1,45 @@
+robot_id: dummy_v2_001
+config_version: 1
+hardware_parameters_verified: false
+
+joint_order: [joint1, joint2, joint3, joint4, joint5, joint6, gripper]
+joint_unit: rad
+action_semantics: absolute_joint_position
+control_rate_hz: 20
+firmware_loop_hz: 200
+
+# 初值由现有 STM32 固件的角度参数换算而来，必须逐关节真机复核。
+joint_zero_offset_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+joint_sign: [1, -1, 1, -1, 1, 1]
+joint_reduction: [30.0, 30.0, 30.0, 24.0, 30.0, 50.0]
+joint_limit_min_rad: [-2.967060, -1.274090, 0.610865, -3.141593, -2.094395, -12.566371]
+joint_limit_max_rad: [2.967060, 1.570796, 3.141593, 3.141593, 2.094395, 12.566371]
+joint_velocity_limit_rad_s: [0.35, 0.35, 0.35, 0.50, 0.50, 0.70]
+joint_acceleration_limit_rad_s2: [0.70, 0.70, 0.70, 1.00, 1.00, 1.40]
+initial_pose_rad: [0.0, -1.274090, 3.141593, 0.0, 0.0, 0.0]
+
+gripper_range: [0.0, 1.0]
+gripper_state_feedback: true
+max_state_age_ms: 200
+target_ttl_ms: 100
+lease_timeout_ms: 500
+max_target_overshoot_rad: 0.10
+
+cameras:
+  wrist:
+    model: D435
+    device_serial: ""
+    width: 640
+    height: 480
+    fps: 30
+    color_format: bgr8
+    depth_format: z16
+    align_depth_to_color: true
+    max_frame_age_ms: 100
+    max_sync_skew_ms: 50
+    calibration_version: uncalibrated-v0
+    # 固定曝光前先在目标照明下实测；null 表示暂由设备自动控制。
+    color_exposure: null
+    color_white_balance: null
+    depth_exposure: null
+
