@@ -5,7 +5,7 @@ import queue
 import threading
 from typing import Protocol
 
-from .protocol import Packet, StreamDecoder, encode_packet
+from .protocol import Packet, ProtocolError, StreamDecoder, encode_packet
 
 LOG = logging.getLogger(__name__)
 
@@ -126,8 +126,11 @@ class SerialTransport:
             while not self._stop.is_set():
                 data = self._serial.read(256)
                 if data:
+                    dropped_before = self.decoder.dropped_frames
                     for packet in self.decoder.feed(data):
                         self._publish(packet)
+                    if self.decoder.dropped_frames != dropped_before:
+                        raise ProtocolError("invalid serial frame received; stopping the host link")
         except BaseException as exc:
             if not self._stop.is_set():
                 self._publish(exc)

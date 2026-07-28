@@ -92,6 +92,7 @@ class DummyRobot:
             if self.camera is not None:
                 self.camera.start()
         except BaseException:
+            self._connected = False
             self._stop_reader_and_transport()
             raise
 
@@ -226,6 +227,8 @@ class DummyRobot:
             if response.message_type == MessageType.NACK:
                 ack = unpack_ack(response.payload)
                 raise CommandRejected(f"{ack.request_type.name} rejected: {ack.result.name} detail={ack.detail}")
+            if response.session_id != packet.session_id:
+                raise RobotError("response belongs to a stale control session")
             return response
         finally:
             with self._pending_lock:
@@ -238,6 +241,8 @@ class DummyRobot:
                 if packet is None:
                     continue
                 if packet.message_type == MessageType.STATE:
+                    if packet.session_id != self.session_id:
+                        continue
                     state = unpack_state(packet.payload, self.clock_ns())
                     if state.config_hash != self.config.config_hash:
                         raise ConfigError("STATE configuration hash mismatch")

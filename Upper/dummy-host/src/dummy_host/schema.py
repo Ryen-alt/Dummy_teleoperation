@@ -134,6 +134,9 @@ def load_robot_config(path: str | Path) -> RobotConfig:
         raise ConfigError(f"cannot load {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("configuration root must be a mapping")
+    robot_id = raw.get("robot_id")
+    if not isinstance(robot_id, str) or not robot_id.strip():
+        raise ConfigError("robot_id must be a non-empty string")
 
     order = tuple(raw.get("joint_order", ()))
     expected_order = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper")
@@ -192,13 +195,23 @@ def load_robot_config(path: str | Path) -> RobotConfig:
         raise ConfigError("D435 formats must be bgr8 color and z16 depth")
     if not camera.calibration_version:
         raise ConfigError("camera calibration_version is required")
+    for option_name in ("color_exposure", "color_white_balance", "depth_exposure"):
+        option_value = getattr(camera, option_name)
+        if option_value is not None and (
+            not isinstance(option_value, (int, float)) or not np.isfinite(option_value)
+        ):
+            raise ConfigError(f"{option_name} must be null or a finite number")
 
     verified = raw.get("hardware_parameters_verified")
     if not isinstance(verified, bool):
         raise ConfigError("hardware_parameters_verified must be boolean")
 
+    max_overshoot = float(raw.get("max_target_overshoot_rad", 0.0))
+    if not np.isfinite(max_overshoot) or max_overshoot < 0:
+        raise ConfigError("max_target_overshoot_rad must be finite and non-negative")
+
     return RobotConfig(
-        robot_id=str(raw.get("robot_id", "")),
+        robot_id=robot_id,
         config_version=_positive_int(raw, "config_version"),
         hardware_parameters_verified=verified,
         joint_order=order,
@@ -219,7 +232,7 @@ def load_robot_config(path: str | Path) -> RobotConfig:
         max_state_age_ms=_positive_int(raw, "max_state_age_ms"),
         target_ttl_ms=_positive_int(raw, "target_ttl_ms"),
         lease_timeout_ms=_positive_int(raw, "lease_timeout_ms"),
-        max_target_overshoot_rad=float(raw.get("max_target_overshoot_rad", 0.0)),
+        max_target_overshoot_rad=max_overshoot,
         cameras={"wrist": camera},
         config_hash=_canonical_hash(raw),
     )

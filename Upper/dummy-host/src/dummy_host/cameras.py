@@ -39,12 +39,16 @@ class DeviceClockMapper:
 
     def __init__(self) -> None:
         self._device_origin_ms: float | None = None
+        self._last_device_ms: float | None = None
         self._host_origin_ns: int | None = None
 
     def map(self, device_ms: float, arrival_ns: int) -> int:
-        if self._device_origin_ms is None or device_ms < self._device_origin_ms:
+        if self._device_origin_ms is None or (
+            self._last_device_ms is not None and device_ms < self._last_device_ms
+        ):
             self._device_origin_ms = device_ms
             self._host_origin_ns = arrival_ns
+        self._last_device_ms = device_ms
         assert self._host_origin_ns is not None
         capture_ns = self._host_origin_ns + int((device_ms - self._device_origin_ms) * 1e6)
         # A bad device timestamp must not claim a capture in the future.
