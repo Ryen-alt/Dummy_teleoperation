@@ -1,3 +1,0 @@
-E:/Dummy_data_collect/Firmware/dummy-ref-core-fw/build-codex/CMakeFiles/Core-STM32F4-fw.elf.dir
-E:/Dummy_data_collect/Firmware/dummy-ref-core-fw/build-codex/CMakeFiles/edit_cache.dir
-E:/Dummy_data_collect/Firmware/dummy-ref-core-fw/build-codex/CMakeFiles/rebuild_cache.dir

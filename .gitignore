@@ -10,6 +10,7 @@
 /Firmware/dummy-*/.settings/
 /Firmware/dummy-*/.vscode/
 /Firmware/dummy-*/**/build/
+/Firmware/dummy-*/build-codex/
 /Firmware/dummy-*/cmake-build-*/
 /Firmware/dummy-*/mx.scratch/
 
