@@ -39,7 +39,7 @@ DummyRobot::DummyRobot(CAN_HandleTypeDef* _hcan) :
     motorJ[4] = new CtrlStepMotor(_hcan, 4, false, 24, -180, 180);
     motorJ[5] = new CtrlStepMotor(_hcan, 5, true, 30, -120, 120);
     motorJ[6] = new CtrlStepMotor(_hcan, 6, true, 50, -720, 720);
-    hand = new DummyHand(_hcan, 7);
+    hand = new StepHand(_hcan, 7);
 
     dof6Solver = new DOF6Kinematic(L_BASE, D_BASE, L_ARM, L_FOREARM, D_ELBOW, L_WRIST);
 }
@@ -342,6 +342,83 @@ void DummyRobot::SetCommandMode(uint32_t _mode)
 }
 
 
+StepHand::StepHand(CAN_HandleTypeDef* _hcan, uint8_t _id) :
+    CtrlStepMotor(_hcan, _id, false, 8, -115.0f, 115.0f)
+{
+}
+
+
+void StepHand::SetPercent(float _percent)
+{
+    if (_percent < 0.0f)_percent = 0.0f;
+    else if (_percent > 100.0f)_percent = 100.0f;
+
+    const float targetAngle = openedAngle + (_percent / 100.0f) * (closedAngle - openedAngle);
+    SetAngleWithVelocityLimit(targetAngle, 65.0f);
+}
+
+
+void StepHand::SetGripCurrent(float _current)
+{
+    if (_current < 0.0f)_current = 0.0f;
+    else if (_current > 2.0f)_current = 2.0f;
+    gripCurrent = _current;
+}
+
+
+void StepHand::DriveWithCurrent(float _direction)
+{
+    if (_direction < -1.0f)_direction = -1.0f;
+    else if (_direction > 1.0f)_direction = 1.0f;
+    SetCurrentSetPoint(_direction * gripCurrent);
+}
+
+
+void StepHand::HandCalibration()
+{
+    if (isCalibrating)
+        return;
+
+    isCalibrating = true;
+    SetEnable(true);
+
+    SetAngleWithVelocityLimit(openedAngle, 7.0f);
+    HAL_Delay(900);
+    ApplyPositionAsHome();
+    HAL_Delay(100);
+    UpdateAngle();
+    HAL_Delay(100);
+    openedAngle = angle;
+
+    SetAngleWithVelocityLimit(closedAngle, 7.0f);
+    HAL_Delay(900);
+    UpdateAngle();
+    HAL_Delay(100);
+    closedAngle = angle;
+
+    SetEnable(false);
+    isCalibrating = false;
+}
+
+
+void StepHand::SetGripperEnable(bool _enable)
+{
+    SetEnable(_enable);
+}
+
+
+void StepHand::RequestAngle()
+{
+    UpdateAngle();
+}
+
+
+bool StepHand::IsEnabled() const
+{
+    return state != STOP;
+}
+
+
 DummyHand::DummyHand(CAN_HandleTypeDef* _hcan, uint8_t
 _id) :
     nodeID(_id), hcan(_hcan)
@@ -416,6 +493,8 @@ void DummyRobot::CommandHandler::EmergencyStop()
     context->MoveJ(context->currentJoints.a[0], context->currentJoints.a[1], context->currentJoints.a[2],
                    context->currentJoints.a[3], context->currentJoints.a[4], context->currentJoints.a[5]);
     context->MoveJoints(context->targetJoints);
+    context->hand->DriveWithCurrent(0.0f);
+    context->hand->SetGripperEnable(false);
     context->isEnabled = false;
     ClearFifo();
 }

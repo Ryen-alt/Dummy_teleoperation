@@ -53,6 +53,46 @@ private:
 };
 
 
+// Linear-rail gripper driven by a CtrlStep-compatible motor on CAN node 7.
+// Position percent is defined as 0% = fully open and 100% = fully closed.
+class StepHand : public CtrlStepMotor
+{
+public:
+    explicit StepHand(CAN_HandleTypeDef* _hcan, uint8_t _id);
+
+    void SetPercent(float _percent);
+    void SetGripCurrent(float _current);
+    void DriveWithCurrent(float _direction);
+    void HandCalibration();
+    void SetGripperEnable(bool _enable);
+    void RequestAngle();
+    bool IsEnabled() const;
+
+    float gripCurrent = 0.7f;
+    float openedAngle = -115.0f;
+    float closedAngle = 115.0f;
+
+    auto MakeProtocolDefinitions()
+    {
+        return make_protocol_member_list(
+            make_protocol_ro_property("angle", &angle),
+            make_protocol_ro_property("opened_angle", &openedAngle),
+            make_protocol_ro_property("closed_angle", &closedAngle),
+            make_protocol_ro_property("grip_current", &gripCurrent),
+            make_protocol_function("set_position_percent", *this, &StepHand::SetPercent, "percent"),
+            make_protocol_function("set_grip_current", *this, &StepHand::SetGripCurrent, "current"),
+            make_protocol_function("drive_current", *this, &StepHand::DriveWithCurrent, "direction"),
+            make_protocol_function("calibrate", *this, &StepHand::HandCalibration),
+            make_protocol_function("set_enable", *this, &StepHand::SetGripperEnable, "enable"),
+            make_protocol_function("update_angle", *this, &StepHand::RequestAngle)
+        );
+    }
+
+private:
+    bool isCalibrating = false;
+};
+
+
 class DummyRobot
 {
 public:
@@ -119,7 +159,7 @@ public:
     volatile uint8_t jointsStateFlag = 0b00000000;
     CommandMode commandMode = DEFAULT_COMMAND_MODE;
     CtrlStepMotor* motorJ[7] = {nullptr};
-    DummyHand* hand = {nullptr};
+    StepHand* hand = {nullptr};
 
 
     void Init();
