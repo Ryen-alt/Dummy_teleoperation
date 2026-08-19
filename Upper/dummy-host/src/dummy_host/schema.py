@@ -3,25 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from enum import IntEnum
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 import yaml
 
+from .domain.models import AppliedAction, ControlMode, RobotState
+
 
 class ConfigError(ValueError):
     pass
-
-
-class ControlMode(IntEnum):
-    DISABLED = 1
-    HOLD = 2
-    TELEOP = 3
-    POLICY = 4
-    GRAVITY = 5
-    FAULT = 6
 
 
 @dataclass(frozen=True)
@@ -41,13 +33,26 @@ class CameraConfig:
     color_exposure: float | None = None
     color_white_balance: float | None = None
     depth_exposure: float | None = None
+    driver: str = "realsense"
+    enabled: bool = True
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class CameraRigConfig:
+    rig_id: str
+    version: int
+    cameras: Mapping[str, CameraConfig]
+    config_hash: str
 
 
 @dataclass(frozen=True)
 class RobotConfig:
     robot_id: str
     config_version: int
+    robot_calibration_id: str
     hardware_parameters_verified: bool
+    external_target_execution_ready: bool
     joint_order: tuple[str, ...]
     joint_unit: str
     action_semantics: str
@@ -67,39 +72,17 @@ class RobotConfig:
     target_ttl_ms: int
     lease_timeout_ms: int
     max_target_overshoot_rad: float
-    cameras: Mapping[str, CameraConfig]
+    camera_rig: CameraRigConfig
     config_hash: str = field(compare=True)
 
     @property
     def config_hash_bytes(self) -> bytes:
         return bytes.fromhex(self.config_hash)
 
-
-@dataclass(frozen=True)
-class RobotState:
-    position: np.ndarray
-    velocity: np.ndarray
-    monotonic_ns: int
-    mcu_time_us: int
-    mode: ControlMode
-    fault_bits: int
-    position_valid: bool
-    velocity_valid: bool
-    gripper_valid: bool
-    last_received_sequence: int
-    last_applied_sequence: int
-    target_age_ms: int
-    config_hash: str
-
-
-@dataclass(frozen=True)
-class AppliedAction:
-    requested: np.ndarray
-    applied: np.ndarray
-    sequence: int
-    monotonic_ns: int
-    clipped: bool
-    reasons: tuple[str, ...]
+    @property
+    def cameras(self) -> Mapping[str, CameraConfig]:
+        """Compatibility view; new code should consume camera_rig explicitly."""
+        return self.camera_rig.cameras
 
 
 def _array(raw: Mapping[str, Any], key: str, length: int, *, dtype: Any = np.float32) -> np.ndarray:
@@ -126,7 +109,13 @@ def _canonical_hash(raw: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def load_robot_config(path: str | Path) -> RobotConfig:
+def _robot_config_hash(raw: Mapping[str, Any]) -> str:
+    # Cameras have their own version/hash and must not force a firmware rebuild.
+    camera_keys = {"camera_rig_id", "camera_rig_version", "cameras"}
+    return _canonical_hash({key: value for key, value in raw.items() if key not in camera_keys})
+
+
+def _read_yaml_mapping(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -134,6 +123,98 @@ def load_robot_config(path: str | Path) -> RobotConfig:
         raise ConfigError(f"cannot load {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("configuration root must be a mapping")
+    return raw
+
+
+def _parse_camera_rig(raw: Mapping[str, Any]) -> CameraRigConfig:
+    rig_id = raw.get("camera_rig_id")
+    if not isinstance(rig_id, str) or not rig_id.strip():
+        raise ConfigError("camera_rig_id must be a non-empty string")
+    rig_version = _positive_int(raw, "camera_rig_version")
+    cameras_raw = raw.get("cameras")
+    if not isinstance(cameras_raw, dict) or not cameras_raw:
+        raise ConfigError("cameras must be a non-empty mapping of logical roles")
+    cameras: dict[str, CameraConfig] = {}
+    for role, cam_raw in cameras_raw.items():
+        if not isinstance(role, str) or not role or not role.replace("_", "").isalnum():
+            raise ConfigError(f"invalid camera role {role!r}")
+        if not isinstance(cam_raw, dict):
+            raise ConfigError(f"camera {role} must be a mapping")
+        driver = str(cam_raw.get("driver", "")).lower()
+        if driver not in {"realsense", "opencv", "fake", "replay"}:
+            raise ConfigError(f"camera {role} has unsupported driver {driver!r}")
+        model = str(cam_raw.get("model", ""))
+        if not model:
+            raise ConfigError(f"camera {role} model must be non-empty")
+        enabled = cam_raw.get("enabled", True)
+        required = cam_raw.get("required", True)
+        align_depth = cam_raw.get("align_depth_to_color", False)
+        if (
+            not isinstance(enabled, bool)
+            or not isinstance(required, bool)
+            or not isinstance(align_depth, bool)
+        ):
+            raise ConfigError(
+                f"camera {role} enabled/required/align_depth_to_color flags must be boolean"
+            )
+        if required and not enabled:
+            raise ConfigError(f"required camera {role} cannot be disabled")
+        camera = CameraConfig(
+            name=role,
+            model=model,
+            device_serial=str(cam_raw.get("device_serial", "")),
+            width=_positive_int(cam_raw, "width"),
+            height=_positive_int(cam_raw, "height"),
+            fps=_positive_int(cam_raw, "fps"),
+            color_format=str(cam_raw.get("color_format", "")),
+            depth_format=str(cam_raw.get("depth_format", "none")),
+            align_depth_to_color=align_depth,
+            max_frame_age_ms=_positive_int(cam_raw, "max_frame_age_ms"),
+            max_sync_skew_ms=_positive_int(cam_raw, "max_sync_skew_ms"),
+            calibration_version=str(cam_raw.get("calibration_version", "")),
+            color_exposure=cam_raw.get("color_exposure"),
+            color_white_balance=cam_raw.get("color_white_balance"),
+            depth_exposure=cam_raw.get("depth_exposure"),
+            driver=driver,
+            enabled=enabled,
+            required=required,
+        )
+        if camera.color_format != "rgb8":
+            raise ConfigError(f"camera {role} output color_format must be rgb8")
+        if driver == "realsense" and camera.depth_format != "z16":
+            raise ConfigError(f"RealSense camera {role} depth_format must be z16")
+        if driver == "opencv" and camera.depth_format != "none":
+            raise ConfigError(f"OpenCV camera {role} depth_format must be none")
+        if not camera.calibration_version:
+            raise ConfigError(f"camera {role} calibration_version is required")
+        for option_name in ("color_exposure", "color_white_balance", "depth_exposure"):
+            option_value = getattr(camera, option_name)
+            if option_value is not None and (
+                isinstance(option_value, bool)
+                or not isinstance(option_value, (int, float))
+                or not np.isfinite(option_value)
+            ):
+                raise ConfigError(f"camera {role} {option_name} must be null or finite")
+        cameras[role] = camera
+    camera_rig_raw = {
+        "camera_rig_id": rig_id,
+        "camera_rig_version": rig_version,
+        "cameras": cameras_raw,
+    }
+    return CameraRigConfig(rig_id, rig_version, cameras, _canonical_hash(camera_rig_raw))
+
+
+def load_camera_rig_config(path: str | Path) -> CameraRigConfig:
+    """Load an independently versioned camera rig without changing robot safety identity."""
+    return _parse_camera_rig(_read_yaml_mapping(path))
+
+
+def load_robot_config(
+    path: str | Path,
+    *,
+    camera_rig_path: str | Path | None = None,
+) -> RobotConfig:
+    raw = _read_yaml_mapping(path)
     robot_id = raw.get("robot_id")
     if not isinstance(robot_id, str) or not robot_id.strip():
         raise ConfigError("robot_id must be a non-empty string")
@@ -168,52 +249,40 @@ def load_robot_config(path: str | Path) -> RobotConfig:
     if len(gripper) != 2 or not np.isfinite(gripper).all() or gripper[0] >= gripper[1]:
         raise ConfigError("gripper_range must contain an increasing finite pair")
 
-    cameras_raw = raw.get("cameras")
-    if not isinstance(cameras_raw, dict) or set(cameras_raw) != {"wrist"}:
-        raise ConfigError("this deployment requires exactly one camera named wrist")
-    cam_raw = cameras_raw["wrist"]
-    if not isinstance(cam_raw, dict) or str(cam_raw.get("model", "")).upper() != "D435":
-        raise ConfigError("wrist camera model must be D435")
-    camera = CameraConfig(
-        name="wrist",
-        model="D435",
-        device_serial=str(cam_raw.get("device_serial", "")),
-        width=_positive_int(cam_raw, "width"),
-        height=_positive_int(cam_raw, "height"),
-        fps=_positive_int(cam_raw, "fps"),
-        color_format=str(cam_raw.get("color_format", "")),
-        depth_format=str(cam_raw.get("depth_format", "")),
-        align_depth_to_color=bool(cam_raw.get("align_depth_to_color", True)),
-        max_frame_age_ms=_positive_int(cam_raw, "max_frame_age_ms"),
-        max_sync_skew_ms=_positive_int(cam_raw, "max_sync_skew_ms"),
-        calibration_version=str(cam_raw.get("calibration_version", "")),
-        color_exposure=cam_raw.get("color_exposure"),
-        color_white_balance=cam_raw.get("color_white_balance"),
-        depth_exposure=cam_raw.get("depth_exposure"),
+    camera_rig = (
+        load_camera_rig_config(camera_rig_path)
+        if camera_rig_path is not None
+        else _parse_camera_rig(raw)
     )
-    if camera.color_format != "bgr8" or camera.depth_format != "z16":
-        raise ConfigError("D435 formats must be bgr8 color and z16 depth")
-    if not camera.calibration_version:
-        raise ConfigError("camera calibration_version is required")
-    for option_name in ("color_exposure", "color_white_balance", "depth_exposure"):
-        option_value = getattr(camera, option_name)
-        if option_value is not None and (
-            not isinstance(option_value, (int, float)) or not np.isfinite(option_value)
-        ):
-            raise ConfigError(f"{option_name} must be null or a finite number")
 
     verified = raw.get("hardware_parameters_verified")
     if not isinstance(verified, bool):
         raise ConfigError("hardware_parameters_verified must be boolean")
+    execution_ready = raw.get("external_target_execution_ready")
+    if not isinstance(execution_ready, bool):
+        raise ConfigError("external_target_execution_ready must be boolean")
+    if execution_ready and not verified:
+        raise ConfigError(
+            "external_target_execution_ready requires hardware_parameters_verified"
+        )
+    robot_calibration_id = raw.get("robot_calibration_id")
+    if not isinstance(robot_calibration_id, str) or not robot_calibration_id.strip():
+        raise ConfigError("robot_calibration_id must be a non-empty string")
 
     max_overshoot = float(raw.get("max_target_overshoot_rad", 0.0))
     if not np.isfinite(max_overshoot) or max_overshoot < 0:
         raise ConfigError("max_target_overshoot_rad must be finite and non-negative")
 
+    gripper_feedback = raw.get("gripper_state_feedback", False)
+    if not isinstance(gripper_feedback, bool):
+        raise ConfigError("gripper_state_feedback must be boolean")
+
     return RobotConfig(
         robot_id=robot_id,
         config_version=_positive_int(raw, "config_version"),
+        robot_calibration_id=robot_calibration_id,
         hardware_parameters_verified=verified,
+        external_target_execution_ready=execution_ready,
         joint_order=order,
         joint_unit="rad",
         action_semantics="absolute_joint_position",
@@ -228,11 +297,11 @@ def load_robot_config(path: str | Path) -> RobotConfig:
         joint_acceleration_limit_rad_s2=acceleration,
         initial_pose_rad=initial,
         gripper_range=(gripper[0], gripper[1]),
-        gripper_state_feedback=bool(raw.get("gripper_state_feedback", False)),
+        gripper_state_feedback=gripper_feedback,
         max_state_age_ms=_positive_int(raw, "max_state_age_ms"),
         target_ttl_ms=_positive_int(raw, "target_ttl_ms"),
         lease_timeout_ms=_positive_int(raw, "lease_timeout_ms"),
         max_target_overshoot_rad=max_overshoot,
-        cameras={"wrist": camera},
-        config_hash=_canonical_hash(raw),
+        camera_rig=camera_rig,
+        config_hash=_robot_config_hash(raw),
     )

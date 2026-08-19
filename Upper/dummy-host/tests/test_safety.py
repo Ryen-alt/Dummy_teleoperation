@@ -59,3 +59,15 @@ def test_stale_state_causes_hold_condition(config) -> None:
     with pytest.raises(SafetyError, match="stale"):
         safety.apply(state.position.copy(), state, now)
 
+
+def test_stricter_per_command_velocity_limit_is_honored(config) -> None:
+    safety = SafetyFilter(config)
+    now = time.monotonic_ns()
+    state = make_state(config, now)
+    requested = state.position.copy()
+    requested[0] += 0.1
+    limit = config.joint_velocity_limit_rad_s.copy()
+    limit[0] = 0.02
+    result = safety.apply(requested, state, now, velocity_limit_rad_s=limit)
+    assert result.applied[0] - state.position[0] <= 0.02 / config.control_rate_hz + 1e-7
+

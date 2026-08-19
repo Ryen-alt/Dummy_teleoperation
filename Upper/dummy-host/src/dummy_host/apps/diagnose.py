@@ -4,7 +4,7 @@ import argparse
 import logging
 import time
 
-from dummy_host.cameras import D435Camera
+from dummy_host.cameras import CameraManager
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import load_robot_config
 from dummy_host.transport_serial import SerialTransport
@@ -16,30 +16,45 @@ def main() -> None:
     parser.add_argument("--port", required=True)
     parser.add_argument("--baudrate", type=int, default=115_200)
     parser.add_argument("--without-camera", action="store_true")
+    parser.add_argument("--camera-rig", help="optional independently versioned camera-rig YAML")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--duration", type=float, help="stop after this many seconds")
+    parser.add_argument("--interval", type=float, default=0.5, help="status print interval in seconds")
     args = parser.parse_args()
+    if args.duration is not None and args.duration <= 0:
+        parser.error("--duration must be positive")
+    if args.interval <= 0:
+        parser.error("--interval must be positive")
     logging.basicConfig(level=args.log_level.upper())
 
-    config = load_robot_config(args.config)
-    camera = None if args.without_camera else D435Camera(config.cameras["wrist"])
-    robot = DummyRobot(config, SerialTransport(args.port, args.baudrate), camera=camera)
+    config = load_robot_config(args.config, camera_rig_path=args.camera_rig)
+    camera_manager = None if args.without_camera else CameraManager.from_config(config.camera_rig)
+    robot = DummyRobot(
+        config,
+        SerialTransport(args.port, args.baudrate),
+        camera_manager=camera_manager,
+    )
     print(f"host_config_hash={config.config_hash}")
     try:
         with robot:
             print(f"firmware_version={robot.firmware_version}")
-            while True:
+            started = time.monotonic()
+            while args.duration is None or time.monotonic() - started < args.duration:
                 state = robot.read_state()
                 camera_text = "disabled"
-                if camera is not None:
-                    stats = camera.stats()
-                    camera_text = f"frames={stats.frames} dropped={stats.dropped_frames} error={stats.last_error}"
+                if camera_manager is not None:
+                    camera_text = ", ".join(
+                        f"{role}:frames={stats.frames} dropped={stats.dropped_frames} "
+                        f"error={stats.last_error}"
+                        for role, stats in camera_manager.stats().items()
+                    )
                 print(
                     f"mode={state.mode.name} q={state.position.tolist()} "
                     f"fault=0x{state.fault_bits:04x} applied={state.last_applied_sequence} "
                     f"state_age_ms={(time.monotonic_ns() - state.monotonic_ns) / 1e6:.1f} "
                     f"camera=({camera_text})"
                 )
-                time.sleep(0.5)
+                time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
 

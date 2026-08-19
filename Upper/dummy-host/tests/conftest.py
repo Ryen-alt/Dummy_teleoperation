@@ -11,3 +11,8 @@ from dummy_host.schema import RobotConfig, load_robot_config
 def config() -> RobotConfig:
     return load_robot_config(Path(__file__).parents[1] / "configs" / "robot_config.yaml")
 
+
+@pytest.fixture
+def config_path() -> Path:
+    return Path(__file__).parents[1] / "configs" / "robot_config.yaml"
+

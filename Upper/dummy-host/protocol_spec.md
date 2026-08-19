@@ -45,10 +45,51 @@ through the host safety layer.
 
 The response packet repeats the request sequence. A new control acquisition uses
 a new non-zero `session_id`. Targets are absolute `[joint1..joint6, gripper]`,
-joint units are radians, and the gripper is normalized to `[0,1]`.
+joint units are radians in the URDF joint convention, and the gripper is normalized
+to `[0,1]`. Both `SET_JOINT_TARGET` and `STATE` use this same convention; the CAD/
+URDF zero pose is therefore six joint zeros. The MCU keeps the historical firmware
+angles internal and converts only at the binary boundary:
+
+```text
+q_urdf     = joint_sign * (q_firmware - joint_zero_offset_rad)
+q_firmware = joint_zero_offset_rad + joint_sign * q_urdf
+```
+
+For configuration version 2 the firmware-zero vector is
+`[0, -73°, 180°, 0, 0, 0]` and the sign vector is `[+1,+1,+1,-1,+1,-1]`.
+ASCII maintenance commands remain historical firmware coordinates in degrees and
+must not be mixed with binary/URDF values. Version-1 recordings must not be replayed
+as version-2 targets; the configuration hash makes this mismatch explicit.
+Until physical limit calibration is complete, the controller soft limits are the
+intersection of the URDF limits and the historical firmware-safe range, expressed
+in URDF coordinates. They may therefore be narrower than the mechanical URDF limits.
 
 Targets are latest-wins. The MCU must reject wrong version/hash/session/mode,
 non-increasing sequence, expired TTL, non-finite or out-of-limit values. Target
 timeout and lease timeout transition to HOLD locally; Linux is not a hard-real-time
 safety boundary.
+
+## Keyboard/gamepad application boundary
+
+Keyboard key codes, gamepad axes, button names, dead-man state and Episode keys
+are Linux application data. They are never sent to the MCU as device-specific
+messages. The host performs the following conversion at the configured 20 Hz:
+
+1. evdev snapshot -> timestamped `TeleopCommand` containing six joint velocities,
+   gripper velocity, dead-man, HOLD/ESTOP and source;
+2. per-run joint/gripper allow-list -> acceleration-limited integration from the
+   latest valid measured state;
+3. common `DummyRobot` safety filter -> absolute float32 target and a velocity
+   ceiling no greater than `robot_config.yaml`;
+4. `SET_JOINT_TARGET` -> firmware latest-wins buffer -> 200 Hz executor;
+5. STATE `last_received_sequence`/`last_applied_sequence` closes the link back to
+   the recorded action sequence.
+
+Dead-man release does not send a zero velocity and assume the robot will stop. The
+host sends HOLD, releases the lease and resets the integrator; USB/process failure
+is independently covered by target TTL and lease timeout in firmware. Raw input,
+requested action, applied action and the later STATE acknowledgement are stored in
+the Linux session and associated by sequence. A STATE packet is not required to
+acknowledge the same action in the same 20 Hz row; delayed acknowledgement remains
+traceable in subsequent rows.
 

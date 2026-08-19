@@ -31,7 +31,14 @@ class SafetyFilter:
         self._last_velocity.fill(0)
         self._last_time_ns = None
 
-    def apply(self, action: np.ndarray, state: RobotState, now_ns: int) -> SafetyResult:
+    def apply(
+        self,
+        action: np.ndarray,
+        state: RobotState,
+        now_ns: int,
+        *,
+        velocity_limit_rad_s: np.ndarray | None = None,
+    ) -> SafetyResult:
         if not isinstance(action, np.ndarray):
             raise SafetyError("action must be a numpy.ndarray")
         if action.dtype != np.float32:
@@ -51,6 +58,20 @@ class SafetyFilter:
             raise SafetyError(f"robot is not in a motion mode: {state.mode.name}")
         if state.config_hash != self.config.config_hash:
             raise SafetyError("robot state configuration hash mismatch")
+
+        velocity_limit = self.config.joint_velocity_limit_rad_s
+        if velocity_limit_rad_s is not None:
+            if not isinstance(velocity_limit_rad_s, np.ndarray):
+                raise SafetyError("velocity_limit_rad_s must be a numpy.ndarray")
+            if velocity_limit_rad_s.dtype != np.float32 or velocity_limit_rad_s.shape != (6,):
+                raise SafetyError("velocity_limit_rad_s must be float32[6]")
+            if (
+                not np.isfinite(velocity_limit_rad_s).all()
+                or np.any(velocity_limit_rad_s <= 0)
+                or np.any(velocity_limit_rad_s > self.config.joint_velocity_limit_rad_s)
+            ):
+                raise SafetyError("velocity_limit_rad_s is outside configured limits")
+            velocity_limit = velocity_limit_rad_s
 
         requested = action.copy()
         applied = action.copy()
@@ -86,8 +107,8 @@ class SafetyFilter:
         requested_velocity = (applied[:6] - base) / dt
         velocity = np.clip(
             requested_velocity,
-            -self.config.joint_velocity_limit_rad_s,
-            self.config.joint_velocity_limit_rad_s,
+            -velocity_limit,
+            velocity_limit,
         )
         max_dv = self.config.joint_acceleration_limit_rad_s2 * dt
         velocity = np.clip(velocity, self._last_velocity - max_dv, self._last_velocity + max_dv)

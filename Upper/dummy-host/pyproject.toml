@@ -16,11 +16,20 @@ dependencies = [
 
 [project.optional-dependencies]
 d435 = ["pyrealsense2>=2.55"]
+opencv = ["opencv-python-headless>=4.10"]
+bringup = ["evdev>=1.7; platform_system == 'Linux'"]
+teleop = ["evdev>=1.7; platform_system == 'Linux'"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
 dummy-host-diagnose = "dummy_host.apps.diagnose:main"
 dummy-host-camera = "dummy_host.apps.camera_check:main"
+dummy-host-generate-firmware-config = "dummy_host.config_codegen:main"
+dummy-host-joint-bringup = "dummy_host.bringup:main"
+dummy-host-list-inputs = "dummy_host.input_evdev:main"
+dummy-host-gamepad-test = "dummy_host.apps.gamepad_mapping_test:main"
+dummy-host-teleop-collect = "dummy_host.apps.teleop_collect:main"
+dummy-host-session-check = "dummy_host.apps.session_check:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

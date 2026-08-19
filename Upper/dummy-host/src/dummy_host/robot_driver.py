@@ -8,7 +8,9 @@ from collections.abc import Callable
 
 import numpy as np
 
-from .cameras import D435Camera
+from .cameras import Camera, CameraManager
+from .control import ActionGateway
+from .domain import ActionProposal, ActionSpace, RobotHealth
 from .protocol import (
     ACQUIRE_CONTROL,
     SET_MODE,
@@ -42,18 +44,36 @@ class DummyRobot:
         config: RobotConfig,
         transport: PacketTransport,
         *,
-        camera: D435Camera | None = None,
+        camera: Camera | None = None,
+        camera_manager: CameraManager | None = None,
         allow_unverified_hardware: bool = False,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         response_timeout_s: float = 0.5,
+        connect_timeout_s: float = 2.0,
     ) -> None:
         self.config = config
         self.transport = transport
+        if camera is not None and camera_manager is not None:
+            raise ValueError("provide camera or camera_manager, not both")
         self.camera = camera
+        self.camera_manager = (
+            camera_manager
+            if camera_manager is not None
+            else (None if camera is None else CameraManager({camera.role: camera}))
+        )
+        self.observation_synchronizer = (
+            None if self.camera_manager is None else ObservationSynchronizer(self.camera_manager)
+        )
         self.allow_unverified_hardware = allow_unverified_hardware
         self.clock_ns = clock_ns
+        if response_timeout_s <= 0:
+            raise ValueError("response_timeout_s must be positive")
+        if connect_timeout_s <= 0:
+            raise ValueError("connect_timeout_s must be positive")
         self.response_timeout_s = response_timeout_s
+        self.connect_timeout_s = connect_timeout_s
         self.safety = SafetyFilter(config)
+        self.action_gateway = ActionGateway(config, self.safety)
         self.session_id = secrets.randbits(32) or 1
         self._sequence = 0
         self._state: RobotState | None = None
@@ -74,13 +94,16 @@ class DummyRobot:
     def connect(self) -> None:
         if self._connected:
             return
+        with self._state_condition:
+            self._state = None
         self.transport.open()
         self._stop.clear()
         self._reader_error = None
         self._reader = threading.Thread(target=self._read_loop, name="dummy-robot-rx", daemon=True)
         self._reader.start()
+        deadline = time.monotonic() + self.connect_timeout_s
         try:
-            response = self._request(MessageType.HELLO, pack_hello(self.config.config_hash_bytes))
+            response = self._hello_with_retry(deadline)
             if response.message_type != MessageType.HELLO_ACK:
                 raise RobotError(f"expected HELLO_ACK, received {response.message_type.name}")
             remote_hash, _, self.firmware_version = unpack_hello_ack(response.payload)
@@ -88,9 +111,10 @@ class DummyRobot:
                 raise ConfigError(
                     f"firmware config hash {remote_hash.hex()} does not match host {self.config.config_hash}"
                 )
+            self._wait_for_first_state(deadline)
             self._connected = True
-            if self.camera is not None:
-                self.camera.start()
+            if self.camera_manager is not None:
+                self.camera_manager.start()
         except BaseException:
             self._connected = False
             self._stop_reader_and_transport()
@@ -103,8 +127,8 @@ class DummyRobot:
                 self.release_control()
             except BaseException:
                 pass
-        if self.camera is not None:
-            self.camera.stop()
+        if self.camera_manager is not None:
+            self.camera_manager.stop()
         self._stop_reader_and_transport()
         self._connected = False
 
@@ -114,11 +138,14 @@ class DummyRobot:
         if target_mode not in (ControlMode.TELEOP, ControlMode.POLICY):
             raise RobotError("control can only be acquired in TELEOP or POLICY mode")
         if (
-            not self.config.hardware_parameters_verified
+            (
+                not self.config.hardware_parameters_verified
+                or not self.config.external_target_execution_ready
+            )
             and not self.transport.is_simulated
             and not self.allow_unverified_hardware
         ):
-            raise ConfigError("hardware parameters are not verified; refusing real control acquisition")
+            raise ConfigError("real external target execution is not verified and ready")
         self._expect_ack(
             self._request(MessageType.ACQUIRE_CONTROL, ACQUIRE_CONTROL.pack(self.config.lease_timeout_ms)),
             MessageType.ACQUIRE_CONTROL,
@@ -129,14 +156,14 @@ class DummyRobot:
         )
         self._wait_for_mode(target_mode)
         self._control_acquired = True
-        self.safety.reset()
+        self.action_gateway.reset()
 
     def release_control(self) -> None:
         if not self._connected or not self._control_acquired:
             return
         self._expect_ack(self._request(MessageType.RELEASE_CONTROL), MessageType.RELEASE_CONTROL)
         self._control_acquired = False
-        self.safety.reset()
+        self.action_gateway.reset()
 
     def read_state(self, max_age_ms: int | None = None) -> RobotState:
         self._raise_reader_error()
@@ -152,20 +179,64 @@ class DummyRobot:
 
     def get_observation(self) -> dict[str, object]:
         state = self.read_state()
-        if self.camera is None:
+        if self.observation_synchronizer is None:
             return {
                 "observation.state": state.position.copy(),
                 "timestamp_ns": state.monotonic_ns,
                 "gripper_state_valid": state.gripper_valid,
             }
-        return ObservationSynchronizer(self.camera).build(state).as_policy_dict()
+        return self.observation_synchronizer.build(state).as_policy_dict()
 
-    def send_action(self, action: np.ndarray) -> AppliedAction:
+    def send_action(
+        self,
+        action: np.ndarray,
+        *,
+        max_velocity_rad_s: np.ndarray | None = None,
+    ) -> AppliedAction:
+        return self.apply_absolute_action(
+            action,
+            source="direct",
+            max_velocity_rad_s=max_velocity_rad_s,
+        )
+
+    def apply_absolute_action(
+        self,
+        action: np.ndarray,
+        *,
+        source: str = "direct",
+        max_velocity_rad_s: np.ndarray | None = None,
+    ) -> AppliedAction:
+        self._require_control()
+        now_ns = self.clock_ns()
+        try:
+            proposal = ActionProposal(
+                source=source,
+                action_space=ActionSpace.JOINT_POSITION_ABSOLUTE,
+                values=action,
+                generated_at_ns=now_ns,
+                valid_until_ns=now_ns + self.config.target_ttl_ms * 1_000_000,
+            )
+        except ValueError:
+            self._best_effort_hold()
+            raise
+        return self.submit_action(proposal, max_velocity_rad_s=max_velocity_rad_s)
+
+    def submit_action(
+        self,
+        proposal: ActionProposal,
+        *,
+        max_velocity_rad_s: np.ndarray | None = None,
+    ) -> AppliedAction:
         self._require_control()
         now_ns = self.clock_ns()
         state = self.read_state()
         try:
-            result = self.safety.apply(action, state, now_ns)
+            result = self.action_gateway.evaluate(
+                proposal,
+                state,
+                now_ns,
+                velocity_limit_rad_s=max_velocity_rad_s,
+            )
         except SafetyError:
             self._best_effort_hold()
             raise
@@ -177,13 +248,24 @@ class DummyRobot:
             monotonic_us(now_ns),
             pack_joint_target(
                 result.applied,
-                self.config.joint_velocity_limit_rad_s,
+                self.config.joint_velocity_limit_rad_s
+                if max_velocity_rad_s is None
+                else max_velocity_rad_s,
                 self.config.target_ttl_ms,
             ),
         )
         response = self._send_wait(packet)
         self._expect_ack(response, MessageType.SET_JOINT_TARGET)
-        return AppliedAction(result.requested, result.applied, sequence, now_ns, result.clipped, result.reasons)
+        return AppliedAction(
+            result.requested,
+            result.applied,
+            sequence,
+            now_ns,
+            result.clipped,
+            result.reasons,
+            canonical=result.applied,
+            source=proposal.source,
+        )
 
     def heartbeat(self) -> None:
         self._require_control()
@@ -192,13 +274,35 @@ class DummyRobot:
     def hold(self) -> None:
         self._require_connected()
         self._expect_ack(self._request(MessageType.HOLD), MessageType.HOLD)
-        self.safety.reset()
+        self._wait_for_mode(ControlMode.HOLD)
+        self.action_gateway.reset()
 
     def emergency_stop(self) -> None:
         self._require_connected()
         self._expect_ack(self._request(MessageType.ESTOP), MessageType.ESTOP)
+        self._wait_for_mode(ControlMode.FAULT)
         self._control_acquired = False
-        self.safety.reset()
+        self.action_gateway.reset()
+
+    def health(self) -> RobotHealth:
+        now_ns = self.clock_ns()
+        with self._state_condition:
+            state = self._state
+        if state is None:
+            return RobotHealth(self.is_connected, False, None, 0, None)
+        age_ms = (now_ns - state.monotonic_ns) / 1e6
+        return RobotHealth(
+            connected=self.is_connected,
+            state_fresh=0 <= age_ms <= self.config.max_state_age_ms,
+            mode=state.mode,
+            fault_bits=state.fault_bits,
+            state_age_ms=age_ms,
+            details={
+                "last_received_sequence": state.last_received_sequence,
+                "last_applied_sequence": state.last_applied_sequence,
+                "target_age_ms": state.target_age_ms,
+            },
+        )
 
     def __enter__(self) -> "DummyRobot":
         self.connect()
@@ -213,14 +317,55 @@ class DummyRobot:
             Packet(message_type, self.session_id, self._next_sequence(), monotonic_us(now_ns), payload)
         )
 
-    def _send_wait(self, packet: Packet) -> Packet:
+    def _hello_with_retry(self, deadline: float) -> Packet:
+        payload = pack_hello(self.config.config_hash_bytes)
+        last_timeout: RobotError | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RobotError(
+                    f"timeout waiting for HELLO response after {self.connect_timeout_s:.1f} s"
+                ) from last_timeout
+            now_ns = self.clock_ns()
+            packet = Packet(
+                MessageType.HELLO,
+                self.session_id,
+                self._next_sequence(),
+                monotonic_us(now_ns),
+                payload,
+            )
+            try:
+                return self._send_wait(
+                    packet,
+                    timeout_s=min(self.response_timeout_s, remaining),
+                )
+            except RobotError as exc:
+                if not isinstance(exc.__cause__, queue.Empty):
+                    raise
+                last_timeout = exc
+
+    def _wait_for_first_state(self, deadline: float) -> None:
+        with self._state_condition:
+            while self._state is None:
+                self._raise_reader_error()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RobotError(
+                        "timeout waiting for first STATE after HELLO; "
+                        "check that the firmware uses the latest HELLO session for telemetry"
+                    )
+                self._state_condition.wait(remaining)
+
+    def _send_wait(self, packet: Packet, *, timeout_s: float | None = None) -> Packet:
         pending: queue.Queue[Packet] = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[packet.sequence] = pending
         try:
             self.transport.send(packet)
             try:
-                response = pending.get(timeout=self.response_timeout_s)
+                response = pending.get(
+                    timeout=self.response_timeout_s if timeout_s is None else timeout_s
+                )
             except queue.Empty as exc:
                 self._raise_reader_error()
                 raise RobotError(f"timeout waiting for {packet.message_type.name} response") from exc
@@ -261,6 +406,8 @@ class DummyRobot:
             if not self._stop.is_set():
                 self._reader_error = exc
                 self._stop.set()
+                with self._state_condition:
+                    self._state_condition.notify_all()
 
     def _expect_ack(self, packet: Packet, expected: MessageType) -> None:
         if packet.message_type != MessageType.ACK:

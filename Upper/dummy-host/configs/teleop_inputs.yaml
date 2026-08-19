@@ -1,0 +1,76 @@
+version: 2
+
+control:
+  # These are deliberately below robot_config.yaml limits. Raise them only
+  # after the corresponding joint has passed low-speed real-machine tests.
+  joint_speed_rad_s: [0.02, 0.02, 0.02, 0.03, 0.03, 0.04]
+  joint_acceleration_rad_s2: [0.08, 0.08, 0.08, 0.12, 0.12, 0.16]
+  gripper_speed_per_s: 0.20
+  input_timeout_ms: 150
+
+keyboard:
+  # Hold KEY_SPACE continuously before any motion key has an effect.
+  joint_positive: [KEY_Q, KEY_W, KEY_E, KEY_R, KEY_U, KEY_I]
+  joint_negative: [KEY_A, KEY_S, KEY_D, KEY_F, KEY_J, KEY_K]
+  gripper_open: KEY_O
+  gripper_close: KEY_L
+  deadman: KEY_SPACE
+  hold: KEY_B
+  estop: KEY_ESC
+  episode_buttons:
+    start: KEY_F5
+    success: KEY_F6
+    failure: KEY_F7
+    cancel: KEY_F8
+
+gamepad:
+  # Physical Xbox/Linux evdev codes -> stable logical controls. A different
+  # controller can replace this protocol block without changing robot mapping.
+  protocol:
+    id: xbox_linux_evdev_v1
+    transport: evdev
+    axes:
+      left_x: ABS_X
+      left_y: ABS_Y
+      right_x: ABS_RX
+      right_y: ABS_RY
+      left_trigger: ABS_Z
+      right_trigger: ABS_RZ
+      dpad_x: ABS_HAT0X
+      dpad_y: ABS_HAT0Y
+    buttons:
+      a: BTN_SOUTH
+      b: BTN_EAST
+      x: BTN_WEST
+      y: BTN_NORTH
+      lb: BTN_TL
+      rb: BTN_TR
+      view: BTN_SELECT
+      menu: BTN_START
+      xbox: BTN_MODE
+      left_stick: BTN_THUMBL
+      right_stick: BTN_THUMBR
+
+  # Stable logical controls -> robot operations. This section is portable to
+  # evdev, serial, Bluetooth or a vendor SDK transport.
+  mapping:
+    joint_axes:
+      - {axis: left_x, joint: 1, invert: false}
+      - {axis: left_y, joint: 2, invert: true}
+      - {axis: right_y, joint: 3, invert: true}
+      - {axis: right_x, joint: 4, invert: false}
+      - {axis: dpad_x, joint: 5, invert: false}
+      - {axis: dpad_y, joint: 6, invert: true}
+    gripper_open: x
+    gripper_close: b
+    deadman: lb
+    hold: view
+    # A chord is intentional: one accidental button press must not issue ESTOP.
+    estop_chord: [lb, rb, menu]
+    episode_buttons:
+      start: y
+      success: a
+      failure: left_stick
+      cancel: right_stick
+    deadzone: 0.12
+    response_exponent: 1.6

@@ -1,0 +1,41 @@
+# Example only: replace device identifiers and calibration versions before collection.
+# This file can evolve independently from the robot/firmware safety configuration.
+camera_rig_id: lab_dual_camera_example_v1
+camera_rig_version: 1
+cameras:
+  wrist:
+    driver: realsense
+    model: D435
+    enabled: true
+    required: true
+    device_serial: "REPLACE_WITH_D435_SERIAL"
+    width: 640
+    height: 480
+    fps: 30
+    color_format: rgb8
+    depth_format: z16
+    align_depth_to_color: true
+    max_frame_age_ms: 100
+    max_sync_skew_ms: 50
+    calibration_version: replace-with-wrist-calibration-id
+    color_exposure: null
+    color_white_balance: null
+    depth_exposure: null
+  global:
+    driver: opencv
+    model: uvc-rgb
+    enabled: true
+    required: true
+    device_serial: "0"
+    width: 640
+    height: 480
+    fps: 30
+    color_format: rgb8
+    depth_format: none
+    align_depth_to_color: false
+    max_frame_age_ms: 100
+    max_sync_skew_ms: 50
+    calibration_version: replace-with-global-calibration-id
+    color_exposure: null
+    color_white_balance: null
+    depth_exposure: null

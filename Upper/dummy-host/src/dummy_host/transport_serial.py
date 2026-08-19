@@ -44,10 +44,14 @@ class SerialTransport:
         read_timeout_s: float = 0.05,
         rx_queue_size: int = 128,
         tx_queue_size: int = 32,
+        max_consecutive_invalid_frames: int = 3,
     ) -> None:
+        if max_consecutive_invalid_frames <= 0:
+            raise ValueError("max_consecutive_invalid_frames must be positive")
         self.port = port
         self.baudrate = baudrate
         self.read_timeout_s = read_timeout_s
+        self.max_consecutive_invalid_frames = max_consecutive_invalid_frames
         self._rx: queue.Queue[Packet | BaseException] = queue.Queue(rx_queue_size)
         self._tx: queue.Queue[bytes | None] = queue.Queue(tx_queue_size)
         self._stop = threading.Event()
@@ -69,8 +73,23 @@ class SerialTransport:
                 timeout=self.read_timeout_s,
                 write_timeout=self.read_timeout_s,
             )
+            # USB CDC can retain bytes from the previous host session. The
+            # firmware also streams STATE continuously, so opening the port
+            # may otherwise begin halfway through a COBS frame.
+            self._serial.reset_input_buffer()
+            self._serial.reset_output_buffer()
         except serial.SerialException as exc:
+            if self._serial is not None:
+                self._serial.close()
+                self._serial = None
             raise TransportError(f"cannot open serial port {self.port}: {exc}") from exc
+        self.decoder = StreamDecoder()
+        for pending in (self._rx, self._tx):
+            while True:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    break
         self._stop.clear()
         self._threads = [
             threading.Thread(target=self._read_loop, name="dummy-serial-rx", daemon=True),
@@ -122,15 +141,32 @@ class SerialTransport:
 
     def _read_loop(self) -> None:
         assert self._serial is not None
+        consecutive_invalid_frames = 0
         try:
             while not self._stop.is_set():
                 data = self._serial.read(256)
                 if data:
                     dropped_before = self.decoder.dropped_frames
-                    for packet in self.decoder.feed(data):
+                    packets = self.decoder.feed(data)
+                    dropped = self.decoder.dropped_frames - dropped_before
+                    for packet in packets:
                         self._publish(packet)
-                    if self.decoder.dropped_frames != dropped_before:
-                        raise ProtocolError("invalid serial frame received; stopping the host link")
+                    if packets:
+                        consecutive_invalid_frames = 0
+                    elif dropped:
+                        consecutive_invalid_frames += dropped
+                        LOG.warning(
+                            "discarded %d invalid serial frame(s) while resynchronizing "
+                            "(%d consecutive, %d total)",
+                            dropped,
+                            consecutive_invalid_frames,
+                            self.decoder.dropped_frames,
+                        )
+                        if consecutive_invalid_frames > self.max_consecutive_invalid_frames:
+                            raise ProtocolError(
+                                "too many consecutive invalid serial frames "
+                                f"({consecutive_invalid_frames}); stopping the host link"
+                            )
         except BaseException as exc:
             if not self._stop.is_set():
                 self._publish(exc)

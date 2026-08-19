@@ -1,6 +1,11 @@
 robot_id: dummy_v2_001
-config_version: 1
-hardware_parameters_verified: false
+config_version: 3
+# Operator-confirmed arm/gripper calibration baseline. Changing a robot-safety
+# value changes the robot hash and requires regenerating/reflashing firmware.
+# Camera fields have their own rig hash and may be overridden by --camera-rig.
+robot_calibration_id: dummy_v2_001-arm-gripper-20260811-v1
+hardware_parameters_verified: true
+external_target_execution_ready: true
 
 joint_order: [joint1, joint2, joint3, joint4, joint5, joint6, gripper]
 joint_unit: rad
@@ -8,15 +13,21 @@ action_semantics: absolute_joint_position
 control_rate_hz: 20
 firmware_loop_hz: 200
 
-# 初值由现有 STM32 固件的角度参数换算而来，必须逐关节真机复核。
-joint_zero_offset_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-joint_sign: [1, -1, 1, -1, 1, 1]
+# 以下值已经过逐关节真机复核，并由上面的 calibration ID 冻结。
+# 二进制协议和上位机统一使用 URDF 关节坐标。固件旧坐标仅保留在 MCU 内部：
+# q_urdf = joint_sign * (q_firmware - joint_zero_offset_rad)。
+# 下列方向由 URDF、固件 FK 和逐轴低速真机测试共同确认。
+joint_zero_offset_rad: [0.0, -1.274090, 3.141593, 0.0, 0.0, 0.0]
+joint_sign: [1, 1, 1, -1, 1, -1]
 joint_reduction: [30.0, 30.0, 30.0, 24.0, 30.0, 50.0]
-joint_limit_min_rad: [-2.967060, -1.274090, 0.610865, -3.141593, -2.094395, -12.566371]
-joint_limit_max_rad: [2.967060, 1.570796, 3.141593, 3.141593, 2.094395, 12.566371]
+# 操作者确认的绝对安全限位，已从旧固件角度换算为 URDF 弧度：
+# firmware_deg = [-170..170, -70..100, 30..180, -180..180, -90..90, -360..200]。
+joint_limit_min_rad: [-2.967059728, 0.052359878, -2.617993878, -3.141592654, -1.570796327, -3.490658504]
+joint_limit_max_rad: [2.967059728, 3.019419606, 0.0, 3.141592654, 1.570796327, 6.283185307]
 joint_velocity_limit_rad_s: [0.35, 0.35, 0.35, 0.50, 0.50, 0.70]
 joint_acceleration_limit_rad_s2: [0.70, 0.70, 0.70, 1.00, 1.00, 1.40]
-initial_pose_rad: [0.0, -1.274090, 3.141593, 0.0, 0.0, 0.0]
+# 旧 REST_POSE 的 J2=-73° 已超出新的 -70° 安全下限；夹到边界后对应 URDF +3°。
+initial_pose_rad: [0.0, 0.052359878, 0.0, 0.0, 0.0, 0.0]
 
 gripper_range: [0.0, 1.0]
 gripper_state_feedback: true
@@ -25,14 +36,20 @@ target_ttl_ms: 100
 lease_timeout_ms: 500
 max_target_overshoot_rad: 0.10
 
+camera_rig_id: lab_wrist_d435_v1
+camera_rig_version: 1
 cameras:
   wrist:
+    driver: realsense
     model: D435
+    enabled: true
+    required: true
     device_serial: ""
     width: 640
     height: 480
     fps: 30
-    color_format: bgr8
+    # The SDK is configured for BGR; the camera adapter normalizes it to RGB.
+    color_format: rgb8
     depth_format: z16
     align_depth_to_color: true
     max_frame_age_ms: 100
