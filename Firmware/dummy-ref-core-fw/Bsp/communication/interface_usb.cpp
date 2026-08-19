@@ -5,6 +5,7 @@
 #include "usb_device.h"
 #include "interface_usb.hpp"
 #include "protocols/binary_control_session.hpp"
+#include "protocols/binary_control_bridge.hpp"
 #include "protocols/binary_protocol.hpp"
 #include "configurations/robot_config_generated.hpp"
 
@@ -110,13 +111,13 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
     config.hardware_parameters_verified =
         dummy::generated_config::kHardwareParametersVerified &&
         dummy::generated_config::kExternalTargetExecutionReady;
-    config.max_lease_ms = 1000;
-    config.max_target_ttl_ms = 250;
+    config.max_lease_ms = dummy::generated_config::kLeaseTimeoutMs;
+    config.max_target_ttl_ms = dummy::generated_config::kTargetTtlMs;
     return config;
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1");
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.1");
 uint32_t binary_last_micros = 0;
 uint64_t binary_micros_epoch = 0;
 uint64_t binary_last_state_us = 0;
@@ -132,6 +133,56 @@ uint64_t BinaryMonotonicMicros()
     binary_last_micros = current;
     return binary_micros_epoch + current;
 }
+
+} // namespace
+
+namespace dummy::protocol
+{
+
+uint64_t BinaryControlMonotonicMicros()
+{
+    taskENTER_CRITICAL();
+    const uint64_t now_us = BinaryMonotonicMicros();
+    taskEXIT_CRITICAL();
+    return now_us;
+}
+
+BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us)
+{
+    BinaryControlSnapshot snapshot{};
+    taskENTER_CRITICAL();
+    binary_session.Tick(now_us);
+    snapshot.mode = binary_session.mode();
+    snapshot.hello_valid = binary_session.hello_valid();
+    snapshot.lease_active = binary_session.lease_active();
+    const ActiveTarget& active = binary_session.active_target();
+    snapshot.target.position = active.target;
+    snapshot.target.max_velocity_rad_s = active.max_velocity;
+    snapshot.target.sequence = active.sequence;
+    snapshot.target.valid = active.valid;
+    taskEXIT_CRITICAL();
+    return snapshot;
+}
+
+void MarkBinaryTargetApplied(uint32_t sequence)
+{
+    taskENTER_CRITICAL();
+    binary_session.MarkTargetApplied(sequence);
+    taskEXIT_CRITICAL();
+}
+
+bool BinaryControlLeaseActive()
+{
+    taskENTER_CRITICAL();
+    const bool active = binary_session.lease_active();
+    taskEXIT_CRITICAL();
+    return active;
+}
+
+} // namespace dummy::protocol
+
+namespace
+{
 
 void SendBinaryPacket(dummy::protocol::Packet& packet, uint64_t now_us)
 {
@@ -149,7 +200,9 @@ void ProcessBinaryBytes(const uint8_t* data, size_t length, uint64_t now_us)
         dummy::protocol::Packet request{};
         if (!binary_decoder.Feed(data[index], request))
             continue;
+        taskENTER_CRITICAL();
         auto result = binary_session.Process(request, now_us);
+        taskEXIT_CRITICAL();
         SendBinaryPacket(result.response, now_us);
     }
     binary_state_stream_enabled = binary_session.hello_valid();
@@ -162,13 +215,13 @@ void MaybeSendBinaryState(uint64_t now_us)
         now_us - binary_last_state_us < kStatePeriodUs)
         return;
     binary_last_state_us = now_us;
-    binary_session.Tick(now_us);
-
     std::array<float, 7> position{};
     std::array<float, 7> velocity{};
     uint8_t validity = 0;
     ReadRobotStateForBinaryProtocol(position.data(), velocity.data(), &validity);
+    taskENTER_CRITICAL();
     const auto state = binary_session.MakeState(position, velocity, validity, now_us);
+    taskEXIT_CRITICAL();
     dummy::protocol::Packet packet{};
     packet.header.message_type = static_cast<uint8_t>(dummy::protocol::MessageType::State);
     packet.header.session_id = binary_session.telemetry_session_id();
@@ -229,10 +282,18 @@ static void UsbServerTask(void *ctx)
                 const bool starts_binary = CDC_interface.rx_len > 0 && CDC_interface.rx_buf[0] == 0x06;
                 const bool starts_ascii = CDC_interface.rx_len > 0 &&
                     CDC_interface.rx_buf[0] >= 0x20 && CDC_interface.rx_buf[0] <= 0x7e;
-                if (cdc_binary_frame_active ||
+                const bool binary_lease_active = dummy::protocol::BinaryControlLeaseActive();
+                if (starts_ascii && binary_lease_active && !cdc_binary_frame_active)
+                {
+                    // The maintenance channel cannot take ownership while a
+                    // binary control lease exists. Drop the text command.
+                }
+                else if (cdc_binary_frame_active ||
                     (!starts_ascii && (binary_state_stream_enabled || starts_binary)))
                 {
-                    ProcessBinaryBytes(CDC_interface.rx_buf, CDC_interface.rx_len, BinaryMonotonicMicros());
+                    ProcessBinaryBytes(
+                        CDC_interface.rx_buf, CDC_interface.rx_len,
+                        dummy::protocol::BinaryControlMonotonicMicros());
                     cdc_binary_frame_active =
                         CDC_interface.rx_len > 0 && CDC_interface.rx_buf[CDC_interface.rx_len - 1] != 0;
                 }
@@ -253,7 +314,7 @@ static void UsbServerTask(void *ctx)
                 USBD_CDC_ReceivePacket(&hUsbDeviceFS, ODrive_interface.out_ep);  // Allow next packet
             }
         }
-        MaybeSendBinaryState(BinaryMonotonicMicros());
+        MaybeSendBinaryState(dummy::protocol::BinaryControlMonotonicMicros());
     }
 }
 

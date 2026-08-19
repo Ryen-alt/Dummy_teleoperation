@@ -1,14 +1,14 @@
-#include "common_inc.h"
+﻿#include "common_inc.h"
 
-extern DummyRobot dummy;
+extern DummyRobot robot;
 
 
 static CtrlStepMotor* FindActuator(uint32_t node)
 {
     if (node >= 1 && node <= 6)
-        return dummy.motorJ[node];
-    if (dummy.hand != nullptr && node == dummy.hand->nodeID)
-        return dummy.hand;
+        return robot.motorJ[node];
+    if (robot.hand != nullptr && node == robot.hand->nodeID)
+        return robot.hand;
     return nullptr;
 }
 
@@ -26,7 +26,7 @@ static bool HandleHandCommand(const char* cmd, const std::string &command, Strea
             Respond(responseChannel, "error hand position %lu - expected 0-100", percent);
         } else
         {
-            dummy.hand->SetPercent(static_cast<float>(percent));
+            robot.hand->SetPercent(static_cast<float>(percent));
             Respond(responseChannel, "ok hand position %lu", percent);
         }
         return true;
@@ -43,7 +43,7 @@ static bool HandleHandCommand(const char* cmd, const std::string &command, Strea
             Respond(responseChannel, "error hand current %.3f - expected 0-2.0", current);
         } else
         {
-            dummy.hand->SetGripCurrent(current);
+            robot.hand->SetGripCurrent(current);
             Respond(responseChannel, "ok hand current %.3f", current);
         }
         return true;
@@ -52,37 +52,37 @@ static bool HandleHandCommand(const char* cmd, const std::string &command, Strea
     if (command.rfind("!HAND_ZERO", 0) == 0)
     {
         Respond(responseChannel, "hand calibration start");
-        dummy.hand->HandCalibration();
+        robot.hand->HandCalibration();
         Respond(responseChannel, "ok hand calibration open=%.2f closed=%.2f",
-                dummy.hand->openedAngle, dummy.hand->closedAngle);
+                robot.hand->openedAngle, robot.hand->closedAngle);
         return true;
     }
 
     if (command.rfind("!HAND_EN", 0) == 0)
     {
-        dummy.hand->SetGripperEnable(true);
-        Respond(responseChannel, "ok hand enabled=%d", static_cast<int>(dummy.hand->IsEnabled()));
+        robot.hand->SetGripperEnable(true);
+        Respond(responseChannel, "ok hand enabled=%d", static_cast<int>(robot.hand->IsEnabled()));
         return true;
     }
 
     if (command.rfind("!HAND_DIS", 0) == 0)
     {
-        dummy.hand->DriveWithCurrent(0.0f);
-        dummy.hand->SetGripperEnable(false);
-        Respond(responseChannel, "ok hand enabled=%d", static_cast<int>(dummy.hand->IsEnabled()));
+        robot.hand->DriveWithCurrent(0.0f);
+        robot.hand->SetGripperEnable(false);
+        Respond(responseChannel, "ok hand enabled=%d", static_cast<int>(robot.hand->IsEnabled()));
         return true;
     }
 
     if (command.rfind("!HAND_O", 0) == 0)
     {
-        dummy.hand->DriveWithCurrent(1.0f);
+        robot.hand->DriveWithCurrent(1.0f);
         Respond(responseChannel, "ok hand open");
         return true;
     }
 
     if (command.rfind("!HAND_C", 0) == 0)
     {
-        dummy.hand->DriveWithCurrent(-1.0f);
+        robot.hand->DriveWithCurrent(-1.0f);
         Respond(responseChannel, "ok hand close");
         return true;
     }
@@ -96,27 +96,27 @@ static void HandleBangCommand(const char* cmd, StreamSink &responseChannel)
     std::string command(cmd);
     if (command.find("STOP") != std::string::npos)
     {
-        dummy.commandHandler.EmergencyStop();
+        robot.commandHandler.EmergencyStop();
         Respond(responseChannel, "Stopped ok");
     } else if (command.find("START") != std::string::npos)
     {
-        dummy.SetEnable(true);
+        robot.SetEnable(true);
         Respond(responseChannel, "Started ok");
     } else if (command.find("HOME") != std::string::npos)
     {
-        dummy.Homing();
+        robot.Homing();
         Respond(responseChannel, "Started ok");
     } else if (command.find("CALIBRATION") != std::string::npos)
     {
-        dummy.CalibrateHomeOffset();
+        robot.CalibrateHomeOffset();
         Respond(responseChannel, "calibration ok");
     } else if (command.find("RESET") != std::string::npos)
     {
-        dummy.Resting();
+        robot.Resting();
         Respond(responseChannel, "Started ok");
     } else if (command.find("DISABLE") != std::string::npos)
     {
-        dummy.SetEnable(false);
+        robot.SetEnable(false);
         Respond(responseChannel, "Disabled ok");
     } else if (!HandleHandCommand(cmd, command, responseChannel))
     {
@@ -139,22 +139,22 @@ void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
         if (command.find("GETJPOS") != std::string::npos)
         {
             Respond(_responseChannel, "ok %.2f %.2f %.2f %.2f %.2f %.2f",
-                    dummy.currentJoints.a[0], dummy.currentJoints.a[1],
-                    dummy.currentJoints.a[2], dummy.currentJoints.a[3],
-                    dummy.currentJoints.a[4], dummy.currentJoints.a[5]);
+                    robot.currentJoints.a[0], robot.currentJoints.a[1],
+                    robot.currentJoints.a[2], robot.currentJoints.a[3],
+                    robot.currentJoints.a[4], robot.currentJoints.a[5]);
         } else if (command.find("GETLPOS") != std::string::npos)
         {
-            dummy.UpdateJointPose6D();
+            robot.UpdateJointPose6D();
             Respond(_responseChannel, "ok %.2f %.2f %.2f %.2f %.2f %.2f",
-                    dummy.currentPose6D.X, dummy.currentPose6D.Y,
-                    dummy.currentPose6D.Z, dummy.currentPose6D.A,
-                    dummy.currentPose6D.B, dummy.currentPose6D.C);
+                    robot.currentPose6D.X, robot.currentPose6D.Y,
+                    robot.currentPose6D.Z, robot.currentPose6D.A,
+                    robot.currentPose6D.B, robot.currentPose6D.C);
         } else if (command.find("SET_DCE_KV") != std::string::npos)
         {
             uint32_t node, value;
             if (sscanf(_cmd, "#SET_DCE_KV %lu %lu", &node, &value) == 2 && node >= 1 && node <= 6)
             {
-                dummy.motorJ[node]->SetDceKv(value);
+                robot.motorJ[node]->SetDceKv(value);
                 Respond(_responseChannel, "ok SET MOTOR [%lu] DCE_KV [%lu]", node, value);
             } else
                 Respond(_responseChannel, "error SET_DCE_KV - use node 1-6");
@@ -163,7 +163,7 @@ void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
             uint32_t node, value;
             if (sscanf(_cmd, "#SET_DCE_KP %lu %lu", &node, &value) == 2 && node >= 1 && node <= 6)
             {
-                dummy.motorJ[node]->SetDceKp(value);
+                robot.motorJ[node]->SetDceKp(value);
                 Respond(_responseChannel, "ok SET MOTOR [%lu] DCE_KP [%lu]", node, value);
             } else
                 Respond(_responseChannel, "error SET_DCE_KP - use node 1-6");
@@ -172,7 +172,7 @@ void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
             uint32_t node, value;
             if (sscanf(_cmd, "#SET_DCE_KI %lu %lu", &node, &value) == 2 && node >= 1 && node <= 6)
             {
-                dummy.motorJ[node]->SetDceKi(value);
+                robot.motorJ[node]->SetDceKi(value);
                 Respond(_responseChannel, "ok SET MOTOR [%lu] DCE_KI [%lu]", node, value);
             } else
                 Respond(_responseChannel, "error SET_DCE_KI - use node 1-6");
@@ -181,7 +181,7 @@ void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
             uint32_t node, value;
             if (sscanf(_cmd, "#SET_DCE_KD %lu %lu", &node, &value) == 2 && node >= 1 && node <= 6)
             {
-                dummy.motorJ[node]->SetDceKd(value);
+                robot.motorJ[node]->SetDceKd(value);
                 Respond(_responseChannel, "ok SET MOTOR [%lu] DCE_KD [%lu]", node, value);
             } else
                 Respond(_responseChannel, "error SET_DCE_KD - use node 1-6");
@@ -202,7 +202,7 @@ void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
             uint32_t mode;
             if (sscanf(_cmd, "#CMDMODE %lu", &mode) == 1)
             {
-                dummy.SetCommandMode(mode);
+                robot.SetCommandMode(mode);
                 Respond(_responseChannel, "ok Set command mode to [%lu]", mode);
             } else
                 Respond(_responseChannel, "error CMDMODE");
@@ -261,7 +261,7 @@ void OnUsbAsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel)
             Respond(_responseChannel, "ok");
     } else if (_cmd[0] == '>' || _cmd[0] == '@' || _cmd[0] == '&')
     {
-        uint32_t freeSize = dummy.commandHandler.Push(_cmd);
+        uint32_t freeSize = robot.commandHandler.Push(_cmd);
         Respond(_responseChannel, "%lu", freeSize);
     }
 }
@@ -281,22 +281,22 @@ void OnUart4AsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel
         if (command.find("GETJPOS") != std::string::npos)
         {
             Respond(_responseChannel, "ok %.2f %.2f %.2f %.2f %.2f %.2f",
-                    dummy.currentJoints.a[0], dummy.currentJoints.a[1],
-                    dummy.currentJoints.a[2], dummy.currentJoints.a[3],
-                    dummy.currentJoints.a[4], dummy.currentJoints.a[5]);
+                    robot.currentJoints.a[0], robot.currentJoints.a[1],
+                    robot.currentJoints.a[2], robot.currentJoints.a[3],
+                    robot.currentJoints.a[4], robot.currentJoints.a[5]);
         } else if (command.find("GETLPOS") != std::string::npos)
         {
-            dummy.UpdateJointPose6D();
+            robot.UpdateJointPose6D();
             Respond(_responseChannel, "ok %.2f %.2f %.2f %.2f %.2f %.2f",
-                    dummy.currentPose6D.X, dummy.currentPose6D.Y,
-                    dummy.currentPose6D.Z, dummy.currentPose6D.A,
-                    dummy.currentPose6D.B, dummy.currentPose6D.C);
+                    robot.currentPose6D.X, robot.currentPose6D.Y,
+                    robot.currentPose6D.Z, robot.currentPose6D.A,
+                    robot.currentPose6D.B, robot.currentPose6D.C);
         } else if (command.find("CMDMODE") != std::string::npos)
         {
             uint32_t mode;
             if (sscanf(_cmd, "#CMDMODE %lu", &mode) == 1)
             {
-                dummy.SetCommandMode(mode);
+                robot.SetCommandMode(mode);
                 Respond(_responseChannel, "Set command mode to [%lu]", mode);
             } else
                 Respond(_responseChannel, "error CMDMODE");
@@ -304,7 +304,7 @@ void OnUart4AsciiCmd(const char* _cmd, size_t _len, StreamSink &_responseChannel
             Respond(_responseChannel, "ok");
     } else if (_cmd[0] == '>' || _cmd[0] == '@' || _cmd[0] == '&')
     {
-        uint32_t freeSize = dummy.commandHandler.Push(_cmd);
+        uint32_t freeSize = robot.commandHandler.Push(_cmd);
         Respond(_responseChannel, "%lu", freeSize);
     }
 }

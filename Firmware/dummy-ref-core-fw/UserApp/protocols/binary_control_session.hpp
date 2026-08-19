@@ -52,7 +52,7 @@ public:
     bool lease_active() const { return lease_active_; }
     uint32_t session_id() const { return session_id_; }
     uint32_t telemetry_session_id() const
-    { return session_id_ != 0 ? session_id_ : hello_session_id_; }
+    { return lease_active_ ? session_id_ : hello_session_id_; }
     uint32_t last_received_sequence() const { return last_received_sequence_; }
     uint32_t last_applied_sequence() const { return last_applied_sequence_; }
     const ActiveTarget& active_target() const { return active_target_; }

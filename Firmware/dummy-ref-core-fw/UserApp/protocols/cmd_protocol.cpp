@@ -1,8 +1,8 @@
-
+﻿
 #include "common_inc.h"
 
 /*----------------- 1.Add Your Extern Variables Here (Optional) ------------------*/
-extern DummyRobot dummy;
+extern DummyRobot robot;
 #define TEST_ADC_CHANNEL_0 0
 class HelperFunctions
 {
@@ -32,7 +32,7 @@ static inline auto MakeObjTree()
         make_protocol_ro_property("serial_number", &serialNumber),
         make_protocol_function("get_temperature", staticFunctions, &HelperFunctions::GetTemperatureHelper),
         make_protocol_function("get_voltage", staticFunctions, &HelperFunctions::GetVoltageHelper),
-        make_protocol_object("robot", dummy.MakeProtocolDefinitions())
+        make_protocol_object("robot", robot.MakeProtocolDefinitions())
     );
 }
 

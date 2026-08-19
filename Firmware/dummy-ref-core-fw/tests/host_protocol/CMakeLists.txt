@@ -9,17 +9,21 @@ add_executable(dummy_protocol_host_test
     protocol_host_test.cpp
     ../../UserApp/protocols/binary_protocol.cpp
     ../../UserApp/protocols/binary_control_session.cpp
+    ../../UserApp/protocols/external_target_executor.cpp
 )
 target_include_directories(dummy_protocol_host_test PRIVATE
     ../../UserApp/protocols
     ../../UserApp/configurations
 )
 if(MSVC)
-    target_compile_options(dummy_protocol_host_test PRIVATE /W4 /WX)
+    # Release adds NDEBUG, but this standalone test uses assert for checks.
+    target_compile_options(dummy_protocol_host_test PRIVATE /W4 /WX /UNDEBUG)
 else()
-    target_compile_options(dummy_protocol_host_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    # Keep the checks active in the Release build required by the acceptance guide.
+    target_compile_options(dummy_protocol_host_test PRIVATE
+        -Wall -Wextra -Wpedantic -Werror -UNDEBUG
+    )
 endif()
 
 enable_testing()
 add_test(NAME dummy_protocol_host_test COMMAND dummy_protocol_host_test)
-

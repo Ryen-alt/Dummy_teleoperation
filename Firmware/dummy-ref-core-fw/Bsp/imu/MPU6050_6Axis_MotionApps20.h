@@ -39,7 +39,7 @@ THE SOFTWARE.
 // MotionApps 2.0 DMP implementation, built using the MPU-6050EVB evaluation board
 #define MPU6050_INCLUDE_DMP_MOTIONAPPS20
 
-#include "mpu6050.hpp"
+#include "MPU6050.hpp"
 
 // Tom Carpenter's conditional PROGMEM code
 // http://forum.arduino.cc/index.php?topic=129407.0

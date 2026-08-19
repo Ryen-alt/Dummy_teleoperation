@@ -3,6 +3,7 @@
 
 #include "algorithms/kinematic/6dof_kinematic.h"
 #include "actuators/ctrl_step/ctrl_step.hpp"
+#include <array>
 #include "string"
 #define ALL 0
 
@@ -143,8 +144,11 @@ public:
     TuningHelper tuningHelper = TuningHelper(this);
 
 
-    // This is the pose when power on.
-    const DOF6Kinematic::Joint6D_t REST_POSE = {0, -73, 180, 0, 0, 0};
+    // Safe pose when power on. J2 is clamped to the confirmed -70 degree limit.
+    const DOF6Kinematic::Joint6D_t REST_POSE = {0, -70, 180, 0, 0, 0};
+    // Legacy application-coordinate value reported after each motor board has
+    // accepted its zero offset. It can lie outside the reachable safe range.
+    const DOF6Kinematic::Joint6D_t ZERO_OFFSET_POSE = {0, -73, 180, 0, 0, 0};
     const float DEFAULT_JOINT_SPEED = 30;  // degree/s
     const DOF6Kinematic::Joint6D_t DEFAULT_JOINT_ACCELERATION_BASES = {150, 100, 200, 200, 200, 200};
     const float DEFAULT_JOINT_ACCELERATION_LOW = 30;    // 0~100
@@ -154,7 +158,7 @@ public:
 
     DOF6Kinematic::Joint6D_t currentJoints = REST_POSE;
     DOF6Kinematic::Joint6D_t targetJoints = REST_POSE;
-    DOF6Kinematic::Joint6D_t initPose = REST_POSE;
+    DOF6Kinematic::Joint6D_t initPose = ZERO_OFFSET_POSE;
     DOF6Kinematic::Pose6D_t currentPose6D = {};
     volatile uint8_t jointsStateFlag = 0b00000000;
     CommandMode commandMode = DEFAULT_COMMAND_MODE;
@@ -166,6 +170,9 @@ public:
     bool MoveJ(float _j1, float _j2, float _j3, float _j4, float _j5, float _j6);
     bool MoveL(float _x, float _y, float _z, float _a, float _b, float _c);
     void MoveJoints(DOF6Kinematic::Joint6D_t _joints);
+    // The binary host-facing target is expressed in URDF joint coordinates.
+    void ApplyExternalUrdfTargetRad(const std::array<float, 7>& target);
+    void HoldCurrentPosition();
     void SetJointSpeed(float _speed);
     void SetJointAcceleration(float _acc);
     void UpdateJointAngles();

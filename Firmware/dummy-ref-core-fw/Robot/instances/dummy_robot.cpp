@@ -1,5 +1,6 @@
 #include "communication.hpp"
 #include "dummy_robot.h"
+#include "../../UserApp/protocols/joint_space_mapping.hpp"
 
 namespace
 {
@@ -11,6 +12,31 @@ constexpr float L_ARM = 0.14600f;
 constexpr float L_FOREARM = 0.115455f;
 constexpr float D_ELBOW = 0.05200f;
 constexpr float L_WRIST = 0.09900f;
+constexpr float RADIANS_TO_DEGREES = 57.295779513082320876f;
+
+float LegacyLimitEndpointDegrees(float urdfRadians, size_t jointIndex)
+{
+    return dummy::protocol::UrdfRadiansToLegacyFirmwareRadians(urdfRadians, jointIndex) *
+           RADIANS_TO_DEGREES;
+}
+
+float LegacyLimitMinDegrees(size_t jointIndex)
+{
+    const float endpointA = LegacyLimitEndpointDegrees(
+        dummy::generated_config::kJointMinRad[jointIndex], jointIndex);
+    const float endpointB = LegacyLimitEndpointDegrees(
+        dummy::generated_config::kJointMaxRad[jointIndex], jointIndex);
+    return endpointA < endpointB ? endpointA : endpointB;
+}
+
+float LegacyLimitMaxDegrees(size_t jointIndex)
+{
+    const float endpointA = LegacyLimitEndpointDegrees(
+        dummy::generated_config::kJointMinRad[jointIndex], jointIndex);
+    const float endpointB = LegacyLimitEndpointDegrees(
+        dummy::generated_config::kJointMaxRad[jointIndex], jointIndex);
+    return endpointA > endpointB ? endpointA : endpointB;
+}
 }
 
 inline float AbsMaxOf6(DOF6Kinematic::Joint6D_t _joints, uint8_t &_index)
@@ -33,12 +59,12 @@ DummyRobot::DummyRobot(CAN_HandleTypeDef* _hcan) :
     hcan(_hcan)
 {
     motorJ[ALL] = new CtrlStepMotor(_hcan, 0, false, 1, -180, 180);
-    motorJ[1] = new CtrlStepMotor(_hcan, 1, true, 30, -170, 170);
-    motorJ[2] = new CtrlStepMotor(_hcan, 2, false, 30, -73, 90);
-    motorJ[3] = new CtrlStepMotor(_hcan, 3, true, 30, 35, 180);
-    motorJ[4] = new CtrlStepMotor(_hcan, 4, false, 24, -180, 180);
-    motorJ[5] = new CtrlStepMotor(_hcan, 5, true, 30, -120, 120);
-    motorJ[6] = new CtrlStepMotor(_hcan, 6, true, 50, -720, 720);
+    motorJ[1] = new CtrlStepMotor(_hcan, 1, false, 50, LegacyLimitMinDegrees(0), LegacyLimitMaxDegrees(0));
+    motorJ[2] = new CtrlStepMotor(_hcan, 2, true, 50, LegacyLimitMinDegrees(1), LegacyLimitMaxDegrees(1));
+    motorJ[3] = new CtrlStepMotor(_hcan, 3, true, 50, LegacyLimitMinDegrees(2), LegacyLimitMaxDegrees(2));
+    motorJ[4] = new CtrlStepMotor(_hcan, 4, true, 50, LegacyLimitMinDegrees(3), LegacyLimitMaxDegrees(3));
+    motorJ[5] = new CtrlStepMotor(_hcan, 5, true, 50, LegacyLimitMinDegrees(4), LegacyLimitMaxDegrees(4));
+    motorJ[6] = new CtrlStepMotor(_hcan, 6, true, 50, LegacyLimitMinDegrees(5), LegacyLimitMaxDegrees(5));
     hand = new StepHand(_hcan, 7);
 
     dof6Solver = new DOF6Kinematic(L_BASE, D_BASE, L_ARM, L_FOREARM, D_ELBOW, L_WRIST);
@@ -76,6 +102,31 @@ void DummyRobot::MoveJoints(DOF6Kinematic::Joint6D_t _joints)
         motorJ[j]->SetAngleWithVelocityLimit(_joints.a[j - 1] - initPose.a[j - 1],
                                              dynamicJointSpeeds.a[j - 1]);
     }
+}
+
+
+void DummyRobot::ApplyExternalUrdfTargetRad(const std::array<float, 7>& target)
+{
+    constexpr float kRadiansToDegrees = 57.295779513082320876F;
+    for (int index = 0; index < 6; ++index)
+    {
+        const float target_degrees =
+            dummy::protocol::UrdfRadiansToLegacyFirmwareRadians(target[index], index) *
+            kRadiansToDegrees;
+        targetJoints.a[index] = target_degrees;
+        // The 200 Hz executor has already bounded position, velocity and
+        // acceleration. Send its incremental absolute target directly.
+        motorJ[index + 1]->SetAngle(target_degrees - initPose.a[index]);
+    }
+    hand->SetPercent(target[6] * 100.0F);
+}
+
+
+void DummyRobot::HoldCurrentPosition()
+{
+    targetJoints = currentJoints;
+    for (int index = 0; index < 6; ++index)
+        motorJ[index + 1]->SetAngle(currentJoints.a[index] - initPose.a[index]);
 }
 
 
@@ -272,6 +323,15 @@ void DummyRobot::Resting()
 
 void DummyRobot::SetEnable(bool _enable)
 {
+    // The control loop continuously transmits targetJoints as soon as isEnabled
+    // becomes true.  targetJoints is initialized to REST_POSE, so enabling before
+    // latching the measured pose makes every joint jump toward REST_POSE.  Load a
+    // hold target into both the robot state and the motor boards before energizing
+    // the axes.  This also makes repeated !START commands stop at the measured
+    // pose instead of resurrecting a stale target.
+    if (_enable)
+        HoldCurrentPosition();
+
     motorJ[ALL]->SetEnable(_enable);
     isEnabled = _enable;
 }

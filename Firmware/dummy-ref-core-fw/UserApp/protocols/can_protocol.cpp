@@ -1,6 +1,6 @@
-#include "common_inc.h"
+﻿#include "common_inc.h"
 
-extern DummyRobot dummy;
+extern DummyRobot robot;
 
 
 void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* data)
@@ -15,11 +15,11 @@ void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* d
     bool armJointResponse = false;
     if (id >= 1 && id <= 6)
     {
-        actuator = dummy.motorJ[id];
+        actuator = robot.motorJ[id];
         armJointResponse = true;
-    } else if (dummy.hand != nullptr && id == dummy.hand->nodeID)
+    } else if (robot.hand != nullptr && id == robot.hand->nodeID)
     {
-        actuator = dummy.hand;
+        actuator = robot.hand;
     }
 
     // Ignore responses from unconfigured CAN node IDs instead of indexing
@@ -36,7 +36,7 @@ void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* d
                 memcpy(&position, data, sizeof(position));
                 actuator->UpdateAngleCallback(position, data[4] != 0);
                 if (armJointResponse)
-                    dummy.UpdateJointAnglesCallback();
+                    robot.UpdateJointAnglesCallback();
             }
             break;
         case 0x25:
