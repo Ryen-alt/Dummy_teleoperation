@@ -1,6 +1,26 @@
 **/__pycache__/
 **/.pytest_cache/
 *.py[cod]
+**/.venv/
+**/*.egg-info/
+**/.mypy_cache/
+**/.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local build outputs and Markdown notes.
+build/
+*.md
+
+# Editor, OS, and temporary files.
+**/.idea/
+**/.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
 
 /Dummy_URDF/
 
@@ -9,8 +29,15 @@
 /Firmware/dummy-*/.clangd
 /Firmware/dummy-*/.settings/
 /Firmware/dummy-*/.vscode/
+/Firmware/**/build*/
 /Firmware/dummy-*/**/build/
 /Firmware/dummy-*/build-codex/
 /Firmware/dummy-*/cmake-build-*/
 /Firmware/dummy-*/mx.scratch/
+
+# Local hardware-validation outputs. Keep the canonical teleop_inputs.yaml,
+# but ignore per-run copies produced from DUMMY_RUN_ID.
+/Upper/dummy-host/logs/
+/Upper/dummy-host/sessions/
+/Upper/dummy-host/configs/teleop_inputs_*.yaml
 
