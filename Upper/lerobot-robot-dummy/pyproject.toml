@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot-robot-dummy"
+version = "0.1.0"
+description = "Version-isolated LeRobot v3 adapter for Dummy Raw Sessions"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dummy-host==0.1.0",
+    "lerobot==0.4.0",
+    "numpy>=1.26",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+dummy-export-lerobot-v3 = "lerobot_robot_dummy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

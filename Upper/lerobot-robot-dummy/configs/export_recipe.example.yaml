@@ -1,0 +1,11 @@
+recipe_id: dummy_rgb_v1
+version: 1
+dataset_format: lerobot_v3
+control_hz: 20
+required_camera_roles: [wrist]
+accepted_outcomes: [accepted]
+include_depth: false
+metadata:
+  description: Accepted teleoperation episodes with applied actions as labels
+  image_color_space: RGB
+  depth_unit: metre_when_enabled

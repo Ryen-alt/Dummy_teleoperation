@@ -1,0 +1,3 @@
+# API boundary pin. Generate a platform-specific full lock from this constraint
+# in the target Linux/CUDA environment; do not reuse a control-host environment.
+lerobot==0.4.0
