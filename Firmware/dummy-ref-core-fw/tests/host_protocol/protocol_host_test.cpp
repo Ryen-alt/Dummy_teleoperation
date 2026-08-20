@@ -268,6 +268,10 @@ Packet MakeConfiguredHello()
 
 void TestUrdfJointSpaceMapping()
 {
+    const std::array<float, 6> expected_reduction = {30.0F, 30.0F, 30.0F,
+                                                      24.0F, 30.0F, 50.0F};
+    assert(dummy::generated_config::kJointReduction == expected_reduction);
+
     const std::array<float, 6> firmware_rest_degrees = {0.0F, -73.0F, 180.0F,
                                                         0.0F, 0.0F, 0.0F};
     for (size_t index = 0; index < firmware_rest_degrees.size(); ++index)

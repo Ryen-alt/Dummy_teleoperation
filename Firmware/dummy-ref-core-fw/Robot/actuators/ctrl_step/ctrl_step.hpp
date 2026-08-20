@@ -17,7 +17,7 @@ public:
 
     const uint32_t CTRL_CIRCLE_COUNT = 200 * 256;
 
-    CtrlStepMotor(CAN_HandleTypeDef* _hcan, uint8_t _id, bool _inverse = false, uint8_t _reduction = 1,
+    CtrlStepMotor(CAN_HandleTypeDef* _hcan, uint8_t _id, bool _inverse = false, float _reduction = 1.0F,
                   float _angleLimitMin = -180, float _angleLimitMax = 180);
 
     uint8_t nodeID;
@@ -26,7 +26,7 @@ public:
     float angleLimitMin;
     uint32_t temperature = 0.0;
     bool inverseDirection;
-    uint8_t reduction;
+    float reduction;
     State state = STOP;
 
     void SetAngle(float _angle);

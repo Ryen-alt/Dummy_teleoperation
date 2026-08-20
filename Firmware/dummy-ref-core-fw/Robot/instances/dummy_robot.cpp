@@ -59,12 +59,18 @@ DummyRobot::DummyRobot(CAN_HandleTypeDef* _hcan) :
     hcan(_hcan)
 {
     motorJ[ALL] = new CtrlStepMotor(_hcan, 0, false, 1, -180, 180);
-    motorJ[1] = new CtrlStepMotor(_hcan, 1, false, 50, LegacyLimitMinDegrees(0), LegacyLimitMaxDegrees(0));
-    motorJ[2] = new CtrlStepMotor(_hcan, 2, true, 50, LegacyLimitMinDegrees(1), LegacyLimitMaxDegrees(1));
-    motorJ[3] = new CtrlStepMotor(_hcan, 3, true, 50, LegacyLimitMinDegrees(2), LegacyLimitMaxDegrees(2));
-    motorJ[4] = new CtrlStepMotor(_hcan, 4, true, 50, LegacyLimitMinDegrees(3), LegacyLimitMaxDegrees(3));
-    motorJ[5] = new CtrlStepMotor(_hcan, 5, true, 50, LegacyLimitMinDegrees(4), LegacyLimitMaxDegrees(4));
-    motorJ[6] = new CtrlStepMotor(_hcan, 6, true, 50, LegacyLimitMinDegrees(5), LegacyLimitMaxDegrees(5));
+    motorJ[1] = new CtrlStepMotor(_hcan, 1, false, dummy::generated_config::kJointReduction[0],
+                                  LegacyLimitMinDegrees(0), LegacyLimitMaxDegrees(0));
+    motorJ[2] = new CtrlStepMotor(_hcan, 2, true, dummy::generated_config::kJointReduction[1],
+                                  LegacyLimitMinDegrees(1), LegacyLimitMaxDegrees(1));
+    motorJ[3] = new CtrlStepMotor(_hcan, 3, true, dummy::generated_config::kJointReduction[2],
+                                  LegacyLimitMinDegrees(2), LegacyLimitMaxDegrees(2));
+    motorJ[4] = new CtrlStepMotor(_hcan, 4, true, dummy::generated_config::kJointReduction[3],
+                                  LegacyLimitMinDegrees(3), LegacyLimitMaxDegrees(3));
+    motorJ[5] = new CtrlStepMotor(_hcan, 5, true, dummy::generated_config::kJointReduction[4],
+                                  LegacyLimitMinDegrees(4), LegacyLimitMaxDegrees(4));
+    motorJ[6] = new CtrlStepMotor(_hcan, 6, true, dummy::generated_config::kJointReduction[5],
+                                  LegacyLimitMinDegrees(5), LegacyLimitMaxDegrees(5));
     hand = new StepHand(_hcan, 7);
 
     dof6Solver = new DOF6Kinematic(L_BASE, D_BASE, L_ARM, L_FOREARM, D_ELBOW, L_WRIST);
@@ -147,11 +153,11 @@ bool DummyRobot::MoveJ(float _j1, float _j2, float _j3, float _j4, float _j5, fl
         DOF6Kinematic::Joint6D_t deltaJoints = targetJointsTmp - currentJoints;
         uint8_t index;
         float maxAngle = AbsMaxOf6(deltaJoints, index);
-        float time = maxAngle * (float) (motorJ[index + 1]->reduction) / jointSpeed;
+        float time = maxAngle * motorJ[index + 1]->reduction / jointSpeed;
         for (int j = 1; j <= 6; j++)
         {
             dynamicJointSpeeds.a[j - 1] =
-                abs(deltaJoints.a[j - 1] * (float) (motorJ[j]->reduction) / time * 0.1f); //0~10r/s
+                abs(deltaJoints.a[j - 1] * motorJ[j]->reduction / time * 0.1f); //0~10r/s
         }
 
         jointsStateFlag = 0;
