@@ -4,8 +4,10 @@ import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
+import dummy_host.bringup as bringup_module
 from dummy_host.bringup import (
     BringupError,
     EvdevDeadman,
@@ -13,7 +15,8 @@ from dummy_host.bringup import (
     run_real_bringup,
     run_simulated_bringup,
 )
-from dummy_host.schema import RobotConfig
+from dummy_host.safety import SafetyError
+from dummy_host.schema import ControlMode, RobotConfig
 
 
 def test_bringup_plan_is_single_joint_and_bounded(config: RobotConfig) -> None:
@@ -31,6 +34,25 @@ def test_bringup_plan_is_single_joint_and_bounded(config: RobotConfig) -> None:
 def test_bringup_plan_rejects_unsafe_delta(config: RobotConfig, delta: float) -> None:
     with pytest.raises(BringupError):
         make_joint_bringup_plan(config, joint=1, delta_deg=delta)
+
+
+@pytest.mark.parametrize(("joint", "delta"), [(2, -0.2), (3, 0.2)])
+def test_real_plan_defers_soft_limit_check_to_live_state(
+    config: RobotConfig,
+    joint: int,
+    delta: float,
+) -> None:
+    with pytest.raises(BringupError, match="configured soft limit"):
+        make_joint_bringup_plan(config, joint=joint, delta_deg=delta)
+
+    plan = make_joint_bringup_plan(
+        config,
+        joint=joint,
+        delta_deg=delta,
+        validate_initial_pose_limits=False,
+    )
+    assert plan.joint == joint
+    assert plan.delta_deg == delta
 
 
 def test_simulated_bringup_closes_in_hold(config: RobotConfig) -> None:
@@ -70,6 +92,106 @@ def test_real_bringup_is_blocked_and_closes_deadman_when_unverified(
             log_jsonl=tmp_path / "unused.jsonl",
         )
     assert deadman.closed
+
+
+def test_real_bringup_refuses_to_overwrite_log_and_closes_deadman(
+    config: RobotConfig,
+    tmp_path,
+) -> None:
+    class FakeDeadman:
+        closed = False
+
+        def is_pressed(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            self.closed = True
+
+    log_path = tmp_path / "j1_pos.jsonl"
+    log_path.write_text("existing evidence\n", encoding="utf-8")
+    deadman = FakeDeadman()
+    plan = make_joint_bringup_plan(config, joint=1)
+
+    with pytest.raises(BringupError, match="refusing to overwrite"):
+        run_real_bringup(
+            config,
+            plan,
+            port="unused",
+            deadman=deadman,
+            log_jsonl=log_path,
+        )
+
+    assert deadman.closed
+    assert log_path.read_text(encoding="utf-8") == "existing evidence\n"
+
+
+def test_real_bringup_preserves_primary_error_when_release_cleanup_fails(
+    config: RobotConfig,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class FakeDeadman:
+        closed = False
+
+        def is_pressed(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeRobot:
+        instance = None
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            FakeRobot.instance = self
+            self.is_connected = False
+            self.state = SimpleNamespace(
+                position=np.concatenate(
+                    (config.initial_pose_rad.copy(), np.asarray([0.5], dtype=np.float32))
+                ),
+                position_valid=True,
+                gripper_valid=True,
+                mode=ControlMode.TELEOP,
+                last_applied_sequence=0,
+            )
+
+        def connect(self) -> None:
+            self.is_connected = True
+
+        def acquire_control(self, _mode: ControlMode) -> None:
+            pass
+
+        def read_state(self):
+            return self.state
+
+        def send_action(self, *_args, **_kwargs):
+            raise SafetyError("primary motion-mode failure")
+
+        def hold(self) -> None:
+            self.state.mode = ControlMode.HOLD
+
+        def release_control(self) -> None:
+            raise RuntimeError("secondary NO_LEASE cleanup failure")
+
+        def disconnect(self) -> None:
+            self.is_connected = False
+
+    monkeypatch.setattr(bringup_module, "DummyRobot", FakeRobot)
+    deadman = FakeDeadman()
+    plan = make_joint_bringup_plan(config, joint=1, duration_s=0.01)
+
+    with pytest.raises(SafetyError, match="primary motion-mode failure"):
+        run_real_bringup(
+            config,
+            plan,
+            port="unused",
+            deadman=deadman,
+            log_jsonl=tmp_path / "failed.jsonl",
+        )
+
+    assert deadman.closed
+    assert FakeRobot.instance is not None
+    assert not FakeRobot.instance.is_connected
 
 
 def test_evdev_deadman_system_error_is_safe_release(monkeypatch) -> None:

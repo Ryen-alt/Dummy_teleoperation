@@ -2,6 +2,7 @@
 #include "binary_protocol.hpp"
 #include "external_target_executor.hpp"
 #include "joint_space_mapping.hpp"
+#include "monotonic_micros.hpp"
 #include "robot_config_generated.hpp"
 
 #include <array>
@@ -124,6 +125,20 @@ void TestCodecVectors()
     const size_t target_length = EncodePacket(target_packet, output.data(), output.size());
     assert(target_length == target_wire.size());
     assert(std::equal(target_wire.begin(), target_wire.end(), output.begin()));
+}
+
+void TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap()
+{
+    MonotonicMicros32 clock;
+    assert(clock.Extend(1000U) == 1000U);
+    assert(clock.Extend(1100U) == 1100U);
+    assert(clock.Extend(1090U) == 1100U);
+    assert(clock.Extend(1101U) == 1101U);
+
+    MonotonicMicros32 wrapping_clock;
+    assert(wrapping_clock.Extend(0xFFFFFFF0U) == 0xFFFFFFF0ULL);
+    assert(wrapping_clock.Extend(0x00000020U) ==
+           (uint64_t{1} << 32U) + 0x20U);
 }
 
 void TestUnverifiedConfigurationCannotAcquire()
@@ -403,6 +418,7 @@ void TestLeaseTimeoutAndSessionIndependentEstop()
 int main()
 {
     TestCodecVectors();
+    TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();

@@ -7,6 +7,7 @@
 #include "protocols/binary_control_session.hpp"
 #include "protocols/binary_control_bridge.hpp"
 #include "protocols/binary_protocol.hpp"
+#include "protocols/monotonic_micros.hpp"
 #include "configurations/robot_config_generated.hpp"
 
 #include <cstring>
@@ -117,9 +118,8 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.1");
-uint32_t binary_last_micros = 0;
-uint64_t binary_micros_epoch = 0;
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.2");
+dummy::protocol::MonotonicMicros32 binary_monotonic_micros;
 uint64_t binary_last_state_us = 0;
 uint32_t binary_state_sequence = 0;
 bool cdc_binary_frame_active = false;
@@ -127,11 +127,7 @@ bool binary_state_stream_enabled = false;
 
 uint64_t BinaryMonotonicMicros()
 {
-    const uint32_t current = micros();
-    if (current < binary_last_micros)
-        binary_micros_epoch += (uint64_t{1} << 32U);
-    binary_last_micros = current;
-    return binary_micros_epoch + current;
+    return binary_monotonic_micros.Extend(micros());
 }
 
 } // namespace

@@ -84,6 +84,7 @@ def make_joint_bringup_plan(
     max_velocity_rad_s: float = 0.02,
     duration_s: float = 1.0,
     max_abs_delta_deg: float = 1.0,
+    validate_initial_pose_limits: bool = True,
 ) -> JointBringupPlan:
     if joint not in range(1, 7):
         raise BringupError("joint must be in [1, 6]")
@@ -101,7 +102,7 @@ def make_joint_bringup_plan(
     )
     final = start.copy()
     final[joint - 1] += np.float32(math.radians(delta_deg))
-    if (
+    if validate_initial_pose_limits and (
         final[joint - 1] < config.joint_limit_min_rad[joint - 1]
         or final[joint - 1] > config.joint_limit_max_rad[joint - 1]
     ):
@@ -177,6 +178,11 @@ def run_real_bringup(
     if not config.hardware_parameters_verified:
         deadman.close()
         raise BringupError("real bring-up is blocked until hardware_parameters_verified is true")
+    log_path = Path(log_jsonl)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if log_path.exists():
+        deadman.close()
+        raise BringupError(f"refusing to overwrite existing bring-up log: {log_path}")
     robot = DummyRobot(config, SerialTransport(port))
     stop = threading.Event()
     scheduler = FixedRateScheduler(plan.control_rate_hz)
@@ -187,8 +193,7 @@ def run_real_bringup(
     final_state = None
     stats = SchedulerStats(0, 0, 0.0, 0.0)
     acquired = False
-    log_path = Path(log_jsonl)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    primary_error: BaseException | None = None
 
     try:
         robot.connect()
@@ -216,7 +221,7 @@ def run_real_bringup(
             raise BringupError("target rebased from the live state is outside the soft limit")
         deadline_ns = time.monotonic_ns() + int(plan.duration_s * 1e9)
 
-        with log_path.open("w", encoding="utf-8", newline="\n") as log:
+        with log_path.open("x", encoding="utf-8", newline="\n") as log:
 
             def tick(now_ns: int) -> None:
                 nonlocal actions_sent, last_sequence, final_state
@@ -244,16 +249,31 @@ def run_real_bringup(
                 log.flush()
 
             stats = scheduler.run(tick, stop)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
+        cleanup_error: BaseException | None = None
         try:
             if robot.is_connected:
                 robot.hold()
                 final_state = robot.read_state()
                 if acquired:
                     robot.release_control()
-        finally:
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
             robot.disconnect()
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        try:
             deadman.close()
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if primary_error is None and cleanup_error is not None:
+            raise cleanup_error
 
     return BringupRunResult(
         actions_sent=actions_sent,
@@ -290,6 +310,9 @@ def main() -> None:
         delta_deg=args.delta_deg,
         max_velocity_rad_s=args.max_velocity,
         duration_s=args.duration,
+        # Dry-run/simulation use the configured initial pose. Real execution
+        # rebases from fresh feedback and validates the live target in run_real_bringup().
+        validate_initial_pose_limits=not args.execute,
     )
     if args.dry_run:
         print(json.dumps(asdict(plan), indent=2, ensure_ascii=False))
