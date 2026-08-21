@@ -3,7 +3,7 @@
 
 
 CtrlStepMotor::CtrlStepMotor(CAN_HandleTypeDef* _hcan, uint8_t _id, bool _inverse,
-                             float _reduction, float _angleLimitMin, float _angleLimitMax) :
+                             uint8_t _reduction, float _angleLimitMin, float _angleLimitMax) :
     nodeID(_id), hcan(_hcan), inverseDirection(_inverse), reduction(_reduction),
     angleLimitMin(_angleLimitMin), angleLimitMax(_angleLimitMax)
 {
@@ -251,7 +251,7 @@ void CtrlStepMotor::EraseConfigs()
 void CtrlStepMotor::SetAngle(float _angle)
 {
     _angle = inverseDirection ? -_angle : _angle;
-    float stepMotorCnt = _angle / 360.0f * reduction;
+    float stepMotorCnt = _angle / 360.0f * (float) reduction;
     SetPositionSetPoint(stepMotorCnt);
 }
 
@@ -259,7 +259,7 @@ void CtrlStepMotor::SetAngle(float _angle)
 void CtrlStepMotor::SetAngleWithVelocityLimit(float _angle, float _vel)
 {
     _angle = inverseDirection ? -_angle : _angle;
-    float stepMotorCnt = _angle / 360.0f * reduction;
+    float stepMotorCnt = _angle / 360.0f * (float) reduction;
     SetPositionWithVelocityLimit(stepMotorCnt, _vel);
 }
 
@@ -277,7 +277,7 @@ void CtrlStepMotor::UpdateAngleCallback(float _pos, bool _isFinished)
 {
     state = _isFinished ? FINISH : RUNNING;
 
-    float tmp = _pos / reduction * 360;
+    float tmp = _pos / (float) reduction * 360;
     angle = inverseDirection ? -tmp : tmp;
 }
 

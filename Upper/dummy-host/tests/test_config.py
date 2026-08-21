@@ -13,8 +13,9 @@ def test_config_is_deterministic_and_calibrated(config) -> None:
     assert len(config.config_hash) == 64
     assert tuple(config.cameras) == ("wrist",)
     assert config.cameras["wrist"].model == "D435"
-    assert config.config_version == 3
-    assert config.robot_calibration_id == "dummy_v2_001-arm-gripper-20260811-v1"
+    assert config.config_version == 4
+    assert config.robot_calibration_id == "dummy_v2_001-arm-gripper-20260821-v2"
+    assert config.joint_reduction.tolist() == [50.0] * 6
     assert config.hardware_parameters_verified
     assert config.external_target_execution_ready
 
@@ -75,4 +76,3 @@ def test_external_camera_rig_overrides_cameras_without_changing_robot_hash() -> 
     assert overridden.camera_rig == rig
     assert overridden.config_hash == embedded.config_hash
     assert overridden.camera_rig.config_hash != embedded.camera_rig.config_hash
-

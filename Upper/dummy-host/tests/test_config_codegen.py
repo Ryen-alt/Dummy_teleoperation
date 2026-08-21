@@ -33,7 +33,8 @@ def test_urdf_coordinate_mapping_contract(config: RobotConfig) -> None:
     firmware_rest_rad = np.deg2rad(np.asarray([0.0, -70.0, 180.0, 0.0, 0.0, 0.0]))
     urdf_rest_rad = config.joint_sign * (firmware_rest_rad - config.joint_zero_offset_rad)
 
-    assert config.config_version == 3
+    assert config.config_version == 4
+    np.testing.assert_array_equal(config.joint_reduction, np.full(6, 50.0))
     np.testing.assert_allclose(urdf_rest_rad, config.initial_pose_rad, atol=1e-6)
     np.testing.assert_allclose(
         config.initial_pose_rad,

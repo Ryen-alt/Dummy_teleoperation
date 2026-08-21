@@ -12,20 +12,20 @@
 namespace dummy::generated_config
 {
 constexpr char kRobotId[] = "dummy_v2_001";
-constexpr char kRobotCalibrationId[] = "dummy_v2_001-arm-gripper-20260811-v1";
-constexpr uint32_t kConfigVersion = 3U;
+constexpr char kRobotCalibrationId[] = "dummy_v2_001-arm-gripper-20260821-v2";
+constexpr uint32_t kConfigVersion = 4U;
 constexpr bool kHardwareParametersVerified = true;
 constexpr bool kExternalTargetExecutionReady = true;
 constexpr std::array<uint8_t, 32> kConfigSha256 = {
-    0x36, 0x77, 0x1b, 0xf7, 0xf2, 0x6f, 0x79, 0xe2,
-    0x82, 0x0f, 0x2a, 0xf0, 0x78, 0xdc, 0x93, 0x1e,
-    0xe5, 0x69, 0xce, 0x9e, 0xdf, 0x06, 0x45, 0x60,
-    0xe0, 0xfa, 0xdc, 0xb7, 0x79, 0x14, 0xf1, 0x23,
+    0x3a, 0xc2, 0x0a, 0x54, 0x76, 0xb6, 0x6f, 0x10,
+    0x49, 0x29, 0x32, 0x19, 0xd8, 0x3f, 0x78, 0x7e,
+    0x2a, 0xe5, 0x93, 0x16, 0xd3, 0x40, 0x96, 0x27,
+    0x01, 0xa8, 0x03, 0x7b, 0x5d, 0xa5, 0xef, 0x1f,
 };
 
 constexpr std::array<float, 6> kJointZeroOffsetRad = {0.0F, -1.2740901F, 3.141593F, 0.0F, 0.0F, 0.0F};
 constexpr std::array<int8_t, 6> kJointSign = {1, 1, 1, -1, 1, -1};
-constexpr std::array<float, 6> kJointReduction = {30.0F, 30.0F, 30.0F, 24.0F, 30.0F, 50.0F};
+constexpr std::array<float, 6> kJointReduction = {50.0F, 50.0F, 50.0F, 50.0F, 50.0F, 50.0F};
 constexpr std::array<float, 6> kInitialPoseRad = {0.0F, 0.052359879F, 0.0F, 0.0F, 0.0F, 0.0F};
 constexpr std::array<float, 6> kJointMinRad = {-2.9670596F, 0.052359879F, -2.6179938F, -3.1415927F, -1.5707964F, -3.4906585F};
 constexpr std::array<float, 6> kJointMaxRad = {2.9670596F, 3.0194197F, 0.0F, 3.1415927F, 1.5707964F, 6.2831855F};
