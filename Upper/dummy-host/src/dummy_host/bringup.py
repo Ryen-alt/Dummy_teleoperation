@@ -240,9 +240,15 @@ def run_real_bringup(
                     "sequence": applied.sequence,
                     "last_received_sequence": final_state.last_received_sequence,
                     "last_applied_sequence": final_state.last_applied_sequence,
+                    "state_position": final_state.position.tolist(),
+                    "state_velocity": final_state.velocity.tolist(),
+                    "position_valid": final_state.position_valid,
+                    "velocity_valid": final_state.velocity_valid,
+                    "gripper_valid": final_state.gripper_valid,
                     "state_age_ms": (time.monotonic_ns() - state_before.monotonic_ns) / 1e6,
                     "fault_bits": final_state.fault_bits,
                     "mode": final_state.mode.name,
+                    "firmware_version": robot.firmware_version,
                     "reasons": list(applied.reasons),
                 }
                 log.write(json.dumps(record, separators=(",", ":")) + "\n")

@@ -50,6 +50,9 @@ def main() -> None:
                     )
                 print(
                     f"mode={state.mode.name} q={state.position.tolist()} "
+                    f"dq={state.velocity.tolist()} "
+                    f"valid=p{int(state.position_valid)}/v{int(state.velocity_valid)}"
+                    f"/g{int(state.gripper_valid)} "
                     f"fault=0x{state.fault_bits:04x} applied={state.last_applied_sequence} "
                     f"state_age_ms={(time.monotonic_ns() - state.monotonic_ns) / 1e6:.1f} "
                     f"camera=({camera_text})"
@@ -61,4 +64,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
