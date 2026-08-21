@@ -9,7 +9,7 @@ from dummy_host.fake_mcu import FakeMcuTransport
 from dummy_host.recording import SessionRecorder
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import RobotConfig
-from dummy_host.teleop import KeyboardMapper, TeleopCommand, load_teleop_profile
+from dummy_host.teleop import KeyboardMapper, TeleopCommand, TeleopError, load_teleop_profile
 from dummy_host.teleop_runtime import run_teleop_collection
 
 
@@ -39,6 +39,30 @@ class IdleKeyboard(ScriptedKeyboard):
         assert now_ns is not None
         self.polls += 1
         return self.mapper.map(set(), now_ns)
+
+
+class FrozenTimestampKeyboard(ScriptedKeyboard):
+    def __init__(self, mapper: KeyboardMapper) -> None:
+        super().__init__(mapper)
+        self.command: TeleopCommand | None = None
+
+    def poll(self, now_ns: int | None = None) -> TeleopCommand:
+        assert now_ns is not None
+        self.polls += 1
+        if self.command is None:
+            self.command = self.mapper.map({"KEY_SPACE", "KEY_Q"}, now_ns)
+        return self.command
+
+
+class AdvancingClock:
+    def __init__(self, *, step_ns: int = 50_000_000) -> None:
+        self.value = 0
+        self.step_ns = step_ns
+
+    def __call__(self) -> int:
+        current = self.value
+        self.value += self.step_ns
+        return current
 
 
 def test_keyboard_fake_mcu_collection_closes_in_hold(
@@ -122,3 +146,32 @@ def test_required_camera_cannot_be_silently_omitted(
         )
     recorder.close(clean_shutdown=False)
     assert source.closed
+
+
+def test_frozen_input_timestamp_deterministically_holds_after_150_ms(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    profile = load_teleop_profile(Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml")
+    assert profile.input_timeout_ms == 150
+    source = FrozenTimestampKeyboard(KeyboardMapper(profile))
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_frozen_input",
+    )
+    with pytest.raises(TeleopError, match="input command is stale"):
+        run_teleop_collection(
+            robot,
+            source,
+            recorder,
+            profile,
+            duration_s=2.0,
+            clock_ns=AdvancingClock(),
+        )
+    recorder.close(clean_shutdown=False)
+    assert source.closed
+    assert not robot.is_connected
+    assert '"event":"input_timeout"' in recorder.events_path.read_text(encoding="utf-8")
