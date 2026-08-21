@@ -69,7 +69,7 @@ def test_gamepad_mapper_applies_deadzone_inversion_and_estop_chord() -> None:
     assert command.estop_requested
     assert command.joint_velocity_rad_s[0] > 0
     assert command.joint_velocity_rad_s[1] < 0
-    assert command.raw["protocol_id"] == "xbox_linux_evdev_v1"
+    assert command.raw["protocol_id"] == "flydigi_vader5_linux_evdev_v1"
     assert shape_axis(0.05, profile.gamepad.deadzone, profile.gamepad.response_exponent) == 0
 
 

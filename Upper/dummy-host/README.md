@@ -70,9 +70,10 @@ test -n "$DUMMY_GAMEPAD" && test -e "$DUMMY_GAMEPAD"
 sudo evtest "$DUMMY_GAMEPAD"
 ```
 
-默认映射在 `configs/teleop_inputs.yaml`。键盘必须持续按住 `KEY_SPACE`，Xbox 手柄
-必须持续按住 LB（逻辑控制 `lb`），否则上位机发送 HOLD 并释放租约。物理 Xbox evdev
-协议与机械臂操作映射相互独立，详见 `docs/Xbox手柄映射与虚拟测试.md`。
+默认映射在 `configs/teleop_inputs.yaml`，并按本机 Flydigi Vader 5 Pro 实测配置为
+物理 X=`BTN_NORTH`、Y=`BTN_WEST`。键盘必须持续按住 `KEY_SPACE`，手柄必须持续
+按住 LB（逻辑控制 `lb`），否则上位机发送 HOLD 并释放租约。物理 evdev 协议与
+机械臂操作映射相互独立，详见 `docs/Xbox手柄映射与虚拟测试.md`。
 
 先运行完全虚拟的映射测试；该程序不会打开串口或创建机器人实例：
 
@@ -154,4 +155,3 @@ Linux 用户需确保当前账号有串口访问权限。D435 和机械臂 USB C
 - 关节角和目标在线上使用 URDF 坐标弧度，URDF 零位应上报六轴全零，夹爪使用 `[0, 1]`；
 - 状态过期、相机过期、CRC/版本/哈希错误均显式失败；
 - 退出路径发送 HOLD 并释放租约。
-

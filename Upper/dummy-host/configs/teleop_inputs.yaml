@@ -24,10 +24,10 @@ keyboard:
     cancel: KEY_F8
 
 gamepad:
-  # Physical Xbox/Linux evdev codes -> stable logical controls. A different
-  # controller can replace this protocol block without changing robot mapping.
+  # Flydigi Vader 5 Pro/Linux evdev codes -> stable logical controls.
+  # This controller reports its physical X as BTN_NORTH and Y as BTN_WEST.
   protocol:
-    id: xbox_linux_evdev_v1
+    id: flydigi_vader5_linux_evdev_v1
     transport: evdev
     axes:
       left_x: ABS_X
@@ -41,8 +41,8 @@ gamepad:
     buttons:
       a: BTN_SOUTH
       b: BTN_EAST
-      x: BTN_WEST
-      y: BTN_NORTH
+      x: BTN_NORTH
+      y: BTN_WEST
       lb: BTN_TL
       rb: BTN_TR
       view: BTN_SELECT

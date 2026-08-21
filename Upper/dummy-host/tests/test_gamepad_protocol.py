@@ -21,15 +21,15 @@ def _profile():
     return load_teleop_profile(Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml")
 
 
-def test_xbox_evdev_protocol_decodes_to_stable_logical_controls() -> None:
+def test_flydigi_evdev_protocol_decodes_to_stable_logical_controls() -> None:
     profile = _profile()
     protocol = profile.gamepad.protocol
-    assert protocol.protocol_id == "xbox_linux_evdev_v1"
+    assert protocol.protocol_id == "flydigi_vader5_linux_evdev_v1"
     assert protocol.transport == "evdev"
     adapter = ConfiguredGamepadProtocolAdapter(protocol)
     state = adapter.decode(
         {"ABS_X": 0.75, "ABS_Y": -0.5, "ABS_HAT0X": 1.0},
-        {"BTN_TL", "BTN_WEST"},
+        {"BTN_TL", "BTN_NORTH"},
         1_000,
     )
     assert state.axes["left_x"] == 0.75
@@ -89,7 +89,7 @@ def test_custom_transport_factory_is_pluggable() -> None:
     assert isinstance(source, GamepadSource)
 
 
-def test_evdev_xbox_source_resolves_physical_codes_then_maps_logical_controls(
+def test_evdev_flydigi_source_resolves_physical_codes_then_maps_logical_controls(
     monkeypatch, tmp_path
 ) -> None:
     class ECodes:
@@ -108,7 +108,7 @@ def test_evdev_xbox_source_resolves_physical_codes_then_maps_logical_controls(
             return name
 
         def pressed(self, configured):
-            return {"BTN_TL", "BTN_WEST"}
+            return {"BTN_TL", "BTN_NORTH"}
 
         def axis(self, code):
             return {"ABS_X": 0.8, "ABS_Y": -0.6}.get(code, 0.0)
@@ -162,7 +162,7 @@ def test_evdev_unplug_system_error_is_reported_as_disconnect(monkeypatch) -> Non
     assert device.last_error is not None
 
 
-def test_virtual_xbox_demo_maps_all_six_joints_without_robot(config) -> None:
+def test_virtual_gamepad_demo_maps_all_six_joints_without_robot(config) -> None:
     results = demo_results(_profile(), config)
     assert results[0].status == "DEADMAN_RELEASED/HOLD"
     assert results[1].command.joint_velocity_rad_s[0] > 0
@@ -201,7 +201,7 @@ def test_human_render_exposes_disconnected_state(config, capsys) -> None:
     assert "connected=false" in output
 
 
-def test_xbox_episode_buttons_are_edge_triggered() -> None:
+def test_gamepad_episode_buttons_are_edge_triggered() -> None:
     mapper = GamepadMapper(_profile())
     first = mapper.map({}, {"y"}, 1_000)
     held = mapper.map({}, {"y"}, 2_000)
