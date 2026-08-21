@@ -13,7 +13,7 @@
 #include <cstring>
 
 extern "C" void ReadRobotStateForBinaryProtocol(float position[7], float velocity[7],
-                                                  uint8_t* validity);
+                                                  uint8_t* validity, uint64_t now_us);
 
 osThreadId_t usbServerTaskHandle;
 USBStats_t usb_stats_ = {0};
@@ -118,7 +118,7 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.4");
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.5");
 dummy::protocol::MonotonicMicros32 binary_monotonic_micros;
 uint64_t binary_last_state_us = 0;
 uint32_t binary_state_sequence = 0;
@@ -214,7 +214,7 @@ void MaybeSendBinaryState(uint64_t now_us)
     std::array<float, 7> position{};
     std::array<float, 7> velocity{};
     uint8_t validity = 0;
-    ReadRobotStateForBinaryProtocol(position.data(), velocity.data(), &validity);
+    ReadRobotStateForBinaryProtocol(position.data(), velocity.data(), &validity, now_us);
     taskENTER_CRITICAL();
     const auto state = binary_session.MakeState(position, velocity, validity, now_us);
     taskEXIT_CRITICAL();

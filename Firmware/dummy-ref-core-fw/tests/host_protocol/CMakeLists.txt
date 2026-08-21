@@ -10,6 +10,7 @@ add_executable(dummy_protocol_host_test
     ../../UserApp/protocols/binary_protocol.cpp
     ../../UserApp/protocols/binary_control_session.cpp
     ../../UserApp/protocols/external_target_executor.cpp
+    ../../UserApp/protocols/measured_state_estimator.cpp
 )
 target_include_directories(dummy_protocol_host_test PRIVATE
     ../../UserApp/protocols

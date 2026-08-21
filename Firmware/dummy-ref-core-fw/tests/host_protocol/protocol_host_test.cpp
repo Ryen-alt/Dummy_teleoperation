@@ -3,6 +3,7 @@
 #include "external_target_executor.hpp"
 #include "joint_space_mapping.hpp"
 #include "monotonic_micros.hpp"
+#include "measured_state_estimator.hpp"
 #include "robot_config_generated.hpp"
 
 #include <array>
@@ -139,6 +140,36 @@ void TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap()
     assert(wrapping_clock.Extend(0xFFFFFFF0U) == 0xFFFFFFF0ULL);
     assert(wrapping_clock.Extend(0x00000020U) ==
            (uint64_t{1} << 32U) + 0x20U);
+}
+
+void TestMeasuredVelocityUsesOnlyValidMonotonicIntervals()
+{
+    MeasuredStateEstimator fast_estimator;
+    std::array<float, 7> fast_position{};
+    assert(!fast_estimator.Update(fast_position, 1000U, true).valid);
+    fast_position[0] = 1.0F;
+    assert(!fast_estimator.Update(fast_position, 1500U, true).valid);
+
+    MeasuredStateEstimator estimator(100000U);
+    std::array<float, 7> position{};
+    assert(!estimator.Update(position, 1000U, true).valid);
+
+    position[0] = 0.01F;
+    position[6] = 0.1F;
+    const VelocityEstimate moving = estimator.Update(position, 51000U, true);
+    assert(moving.valid);
+    assert(std::fabs(moving.velocity[0] - 0.2F) < 1e-6F);
+    assert(std::fabs(moving.velocity[6] - 2.0F) < 1e-6F);
+
+    // A repeated timestamp and a long feedback gap both invalidate exactly one
+    // interval and rebase the next estimate instead of emitting a spike.
+    assert(!estimator.Update(position, 51000U, true).valid);
+    position[0] = 0.02F;
+    assert(!estimator.Update(position, 200000U, true).valid);
+    assert(!estimator.Update(position, 250000U, false).valid);
+    assert(!estimator.Update(position, 300000U, true).valid);
+    position[0] = 0.03F;
+    assert(estimator.Update(position, 350000U, true).valid);
 }
 
 void TestUnverifiedConfigurationCannotAcquire()
@@ -423,6 +454,7 @@ int main()
 {
     TestCodecVectors();
     TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap();
+    TestMeasuredVelocityUsesOnlyValidMonotonicIntervals();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();
