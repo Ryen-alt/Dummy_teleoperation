@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import collections
+import bisect
 import logging
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Mapping, Protocol, runtime_checkable
 
 import numpy as np
@@ -456,6 +459,22 @@ class OpenCVCamera(SyntheticCamera):
         if not capture.isOpened():
             capture.release()
             raise CameraError(f"cannot open OpenCV camera {self.config.device_serial!r}")
+        try:
+            if self.config.color_exposure is not None:
+                if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                    capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                if not capture.set(cv2.CAP_PROP_EXPOSURE, self.config.color_exposure):
+                    raise CameraError("OpenCV backend rejected fixed color_exposure")
+            if self.config.color_white_balance is not None:
+                if hasattr(cv2, "CAP_PROP_AUTO_WB"):
+                    capture.set(cv2.CAP_PROP_AUTO_WB, 0)
+                if not capture.set(
+                    cv2.CAP_PROP_WB_TEMPERATURE, self.config.color_white_balance
+                ):
+                    raise CameraError("OpenCV backend rejected fixed color_white_balance")
+        except BaseException:
+            capture.release()
+            raise
         with self._lock:
             self._frames.clear()
             self._metrics = CameraMetrics()
@@ -520,6 +539,253 @@ class OpenCVCamera(SyntheticCamera):
                 LOG.exception("OpenCV camera %s stopped", self.role)
 
 
+@dataclass(frozen=True)
+class _ReplayEntry:
+    frame_number: int
+    capture_ns: int
+    arrival_ns: int
+    color_depth_skew_ms: float
+    calibration_version: str
+    frame_path: str
+
+
+class ReplayCamera:
+    """Real-time, monotonic replay of one logical role from Raw Session v2.
+
+    ``CameraConfig.device_serial`` names the source session directory. Recorded
+    monotonic timestamps are rebased at ``start()`` so the normal stale-frame
+    and synchronization guards remain active during offline replay.
+    """
+
+    def __init__(
+        self,
+        config: CameraConfig,
+        *,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
+        self.config = config
+        self._clock_ns = clock_ns
+        self._entries: tuple[_ReplayEntry, ...] = ()
+        self._offsets_ns: tuple[int, ...] = ()
+        self._started_ns: int | None = None
+        self._cache_index: int | None = None
+        self._cache_frame: CameraFrame | None = None
+
+    @property
+    def role(self) -> str:
+        return self.config.name
+
+    @property
+    def required(self) -> bool:
+        return self.config.required
+
+    def start(self) -> None:
+        if self._started_ns is not None:
+            return
+        session_dir = Path(self.config.device_serial)
+        from .apps.session_check import SessionCheckError, check_session
+
+        try:
+            report = check_session(session_dir)
+        except SessionCheckError as exc:
+            raise CameraError(f"cannot validate replay session: {exc}") from exc
+        if not report.ok or not report.clean_shutdown:
+            raise CameraError(
+                "replay requires an intact, cleanly finalized Raw Session v2"
+            )
+        db_path = session_dir / "samples.sqlite"
+        try:
+            with sqlite3.connect(
+                f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
+            ) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT frame_number, capture_ns, arrival_ns,
+                           color_depth_skew_ms, calibration_version, frame_path
+                    FROM camera_samples
+                    WHERE role = ?
+                    GROUP BY frame_path
+                    ORDER BY capture_ns, frame_number, frame_path
+                    """,
+                    (self.role,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise CameraError(f"cannot read replay camera index: {exc}") from exc
+        if not rows:
+            raise CameraError(f"replay session has no frames for role {self.role!r}")
+        entries = tuple(
+            _ReplayEntry(
+                frame_number=int(row[0]),
+                capture_ns=int(row[1]),
+                arrival_ns=int(row[2]),
+                color_depth_skew_ms=float(row[3]),
+                calibration_version=str(row[4]),
+                frame_path=str(row[5]),
+            )
+            for row in rows
+        )
+        if any(entry.calibration_version != self.config.calibration_version for entry in entries):
+            raise CameraError(
+                f"replay role {self.role!r} calibration does not match the selected rig"
+            )
+        first_ns = entries[0].capture_ns
+        offsets = tuple(entry.capture_ns - first_ns for entry in entries)
+        if any(offset < 0 for offset in offsets):
+            raise CameraError("replay camera timestamps are not monotonic")
+        self._session_dir = session_dir
+        self._entries = entries
+        self._offsets_ns = offsets
+        self._started_ns = self._clock_ns()
+        self._cache_index = None
+        self._cache_frame = None
+
+    def stop(self) -> None:
+        self._started_ns = None
+        self._cache_index = None
+        self._cache_frame = None
+
+    def latest(
+        self,
+        *,
+        max_age_ms: int | None = None,
+        now_ns: int | None = None,
+    ) -> CameraFrame:
+        now_ns = self._clock_ns() if now_ns is None else now_ns
+        index = self._latest_available_index(now_ns)
+        frame = self._frame(index)
+        limit_ms = self.config.max_frame_age_ms if max_age_ms is None else max_age_ms
+        age_ms = (now_ns - frame.capture_time_ns) / 1e6
+        if age_ms < 0 or age_ms > limit_ms:
+            raise CameraError(f"latest replay {self.role} frame is stale ({age_ms:.1f} ms)")
+        return frame
+
+    def nearest(self, target_ns: int, *, max_skew_ms: int | None = None) -> CameraFrame:
+        now_ns = self._clock_ns()
+        last_index = self._latest_available_index(now_ns)
+        assert self._started_ns is not None
+        target_offset = target_ns - self._started_ns
+        insertion = bisect.bisect_left(self._offsets_ns, target_offset, 0, last_index + 1)
+        candidates = {min(insertion, last_index)}
+        if insertion > 0:
+            candidates.add(insertion - 1)
+        index = min(
+            candidates,
+            key=lambda candidate: abs(self._offsets_ns[candidate] - target_offset),
+        )
+        frame = self._frame(index)
+        limit_ms = self.config.max_sync_skew_ms if max_skew_ms is None else max_skew_ms
+        skew_ms = abs(frame.capture_time_ns - target_ns) / 1e6
+        if skew_ms > limit_ms:
+            raise CameraError(f"replay {self.role}/state skew is too large ({skew_ms:.1f} ms)")
+        return frame
+
+    def stats(self) -> CameraStats:
+        if self._started_ns is None:
+            frames = 0
+            runtime_s = 0.0
+        else:
+            now_ns = self._clock_ns()
+            runtime_s = max(0.0, (now_ns - self._started_ns) / 1e9)
+            frames = self._latest_available_index(now_ns) + 1
+        entries = self._entries[:frames]
+        dropped_frames = 0
+        last_number: int | None = None
+        for entry in entries:
+            if last_number is not None and entry.frame_number > last_number + 1:
+                dropped_frames += entry.frame_number - last_number - 1
+            last_number = entry.frame_number
+        latencies = np.asarray(
+            [(entry.arrival_ns - entry.capture_ns) / 1e6 for entry in entries],
+            dtype=np.float64,
+        )
+        skews = np.asarray(
+            [entry.color_depth_skew_ms for entry in entries], dtype=np.float64
+        )
+
+        def summary(values: np.ndarray) -> tuple[float, float, float]:
+            if values.size == 0:
+                return 0.0, 0.0, 0.0
+            return float(values.mean()), float(np.percentile(values, 95)), float(values.max())
+
+        latency_mean, latency_p95, latency_max = summary(latencies)
+        skew_mean, skew_p95, skew_max = summary(skews)
+        return CameraStats(
+            frames=frames,
+            dropped_frames=dropped_frames,
+            last_error=None,
+            runtime_s=runtime_s,
+            measured_fps=0.0 if runtime_s == 0 else frames / runtime_s,
+            mean_capture_latency_ms=latency_mean,
+            p95_capture_latency_ms=latency_p95,
+            max_capture_latency_ms=latency_max,
+            mean_color_depth_skew_ms=skew_mean,
+            p95_color_depth_skew_ms=skew_p95,
+            max_color_depth_skew_ms=skew_max,
+            device_clock_resets=0,
+        )
+
+    def _latest_available_index(self, now_ns: int) -> int:
+        if self._started_ns is None or not self._entries:
+            raise CameraError(f"replay camera {self.role!r} is not started")
+        elapsed_ns = now_ns - self._started_ns
+        if elapsed_ns < 0:
+            raise CameraError("replay clock moved backwards")
+        return max(0, bisect.bisect_right(self._offsets_ns, elapsed_ns) - 1)
+
+    def _frame(self, index: int) -> CameraFrame:
+        if self._cache_index == index and self._cache_frame is not None:
+            return self._cache_frame
+        assert self._started_ns is not None
+        entry = self._entries[index]
+        path = self._session_dir / entry.frame_path
+        try:
+            with np.load(path, allow_pickle=False) as archive:
+                color = archive["color_rgb"].copy()
+                depth_key = "depth_z16" if "depth_z16" in archive else (
+                    "depth" if "depth" in archive else None
+                )
+                depth = None if depth_key is None else archive[depth_key].copy()
+                device_timestamp_ms = float(archive["device_timestamp_ms"])
+                depth_device_timestamp_ms = (
+                    float(archive["depth_device_timestamp_ms"])
+                    if "depth_device_timestamp_ms" in archive
+                    else float("nan")
+                )
+                depth_frame_number = (
+                    int(archive["depth_frame_number"])
+                    if "depth_frame_number" in archive
+                    else 0
+                )
+                depth_scale_value = (
+                    float(archive["depth_scale"]) if "depth_scale" in archive else float("nan")
+                )
+        except (OSError, KeyError, ValueError) as exc:
+            raise CameraError(f"cannot load replay frame {entry.frame_path}: {exc}") from exc
+        if color.shape != (self.config.height, self.config.width, 3):
+            raise CameraError(
+                f"replay frame {entry.frame_path} does not match configured resolution"
+            )
+        capture_ns = self._started_ns + self._offsets_ns[index]
+        arrival_ns = capture_ns + max(0, entry.arrival_ns - entry.capture_ns)
+        frame = CameraFrame(
+            color=color,
+            depth=depth,
+            capture_time_ns=capture_ns,
+            arrival_time_ns=arrival_ns,
+            device_timestamp_ms=device_timestamp_ms,
+            frame_number=entry.frame_number,
+            depth_device_timestamp_ms=depth_device_timestamp_ms,
+            depth_frame_number=depth_frame_number,
+            color_depth_skew_ms=entry.color_depth_skew_ms,
+            role=self.role,
+            calibration_version=entry.calibration_version,
+            depth_scale=None if not np.isfinite(depth_scale_value) else depth_scale_value,
+        )
+        self._cache_index = index
+        self._cache_frame = frame
+        return frame
+
+
 class CameraManager:
     """Own cameras by stable logical role and provide synchronized snapshots."""
 
@@ -543,6 +809,7 @@ class CameraManager:
             "realsense": D435Camera,
             "opencv": OpenCVCamera,
             "fake": SyntheticCamera,
+            "replay": ReplayCamera,
         }
         if factories:
             builders.update(factories)

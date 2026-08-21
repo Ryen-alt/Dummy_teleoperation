@@ -17,7 +17,7 @@ from dummy_host.input_evdev import (
 )
 from dummy_host.recording import SessionRecorder
 from dummy_host.robot_driver import DummyRobot
-from dummy_host.schema import load_robot_config
+from dummy_host.schema import ConfigError, load_robot_config, validate_camera_rig_for_formal_collection
 from dummy_host.teleop import load_teleop_profile, validate_profile_for_robot
 from dummy_host.teleop_runtime import run_teleop_collection
 from dummy_host.transport_serial import SerialTransport
@@ -77,6 +77,11 @@ def main() -> None:
         parser.error("--execute requires at least one --allow-joint or --allow-gripper")
 
     config = load_robot_config(args.config, camera_rig_path=args.camera_rig)
+    if args.require_camera:
+        try:
+            validate_camera_rig_for_formal_collection(config.camera_rig)
+        except ConfigError as exc:
+            parser.error(str(exc))
     profile = load_teleop_profile(args.input_config)
     validate_profile_for_robot(profile, config)
     try:

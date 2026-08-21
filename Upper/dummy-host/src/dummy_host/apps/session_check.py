@@ -76,9 +76,30 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
     if unlisted:
         warnings.append(f"unlisted files: {', '.join(unlisted)}")
 
+    calibration_records = manifest.get("camera_calibrations", {})
+    if not isinstance(calibration_records, dict):
+        errors.append("manifest camera_calibrations must be a mapping")
+    else:
+        for role, value in calibration_records.items():
+            if not isinstance(role, str) or not isinstance(value, dict):
+                errors.append("manifest contains an invalid camera calibration record")
+                continue
+            archive_path = value.get("archive_path")
+            expected_hash = value.get("sha256")
+            if not isinstance(archive_path, str) or not isinstance(expected_hash, str):
+                errors.append(f"camera calibration {role} has no archive_path or sha256")
+                continue
+            path = session_dir / archive_path
+            if not path.is_file():
+                errors.append(f"missing archived camera calibration: {archive_path}")
+            elif _sha256(path) != expected_hash:
+                errors.append(f"camera calibration hash mismatch: {role}")
+
     db_path = session_dir / "samples.sqlite"
     try:
-        connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        connection = sqlite3.connect(
+            f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
+        )
         integrity_row = connection.execute("PRAGMA integrity_check").fetchone()
         integrity = "missing" if integrity_row is None else str(integrity_row[0])
         row = connection.execute(

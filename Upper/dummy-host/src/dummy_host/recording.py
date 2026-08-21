@@ -109,6 +109,31 @@ class SessionRecorder:
         self.events_path = self.session_dir / "events.jsonl"
         self.manifest_path = self.session_dir / "manifest.json"
         self.checksums_path = self.session_dir / "checksums.json"
+        archived_calibrations: dict[str, dict[str, object]] = {}
+        if robot_config.camera_rig.calibrations:
+            calibrations_dir = self.session_dir / "calibrations"
+            calibrations_dir.mkdir()
+            for role, calibration in robot_config.camera_rig.calibrations.items():
+                archive_path = calibrations_dir / f"{role}.yaml"
+                try:
+                    archive_path.write_bytes(Path(calibration.source_path).read_bytes())
+                except OSError as exc:
+                    raise RecorderError(
+                        f"cannot archive camera calibration for {role}: {exc}"
+                    ) from exc
+                archived_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+                if archived_hash != calibration.file_hash:
+                    raise RecorderError(
+                        f"camera calibration for {role} changed while the session was starting"
+                    )
+                archived_calibrations[role] = {
+                    "calibration_id": calibration.calibration_id,
+                    "sha256": calibration.file_hash,
+                    "archive_path": archive_path.relative_to(self.session_dir).as_posix(),
+                    "source_path": calibration.source_path,
+                    "calibrated_utc": calibration.calibrated_utc,
+                    "parent_frame": calibration.parent_frame,
+                }
         self._frame_segment_size = frame_segment_size
         self._frame_archive_factory = frame_archive_factory or (
             lambda session_dir: NpzFrameArchive(
@@ -139,6 +164,7 @@ class SessionRecorder:
             "camera_rig_id": robot_config.camera_rig.rig_id,
             "camera_rig_version": robot_config.camera_rig.version,
             "camera_rig_hash": robot_config.camera_rig.config_hash,
+            "camera_calibrations": archived_calibrations,
             "teleop_config_version": teleop_profile.version,
             "teleop_config_hash": teleop_profile.config_hash,
             "action_source": source,

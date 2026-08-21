@@ -95,7 +95,9 @@ class RawSession:
         recipe: ExportRecipe,
     ) -> Iterator[DatasetFrame]:
         db_path = self.session_dir / "samples.sqlite"
-        with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True) as connection:
+        with sqlite3.connect(
+            f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
+        ) as connection:
             rows = connection.execute(
                 """
                 SELECT sample_index, tick_ns, state_position, applied_action,
@@ -169,7 +171,10 @@ class RawSession:
                 frame_index += 1
 
     def sample_counts(self, episode: EpisodeWindow) -> tuple[int, int]:
-        with sqlite3.connect(self.session_dir / "samples.sqlite") as connection:
+        db_path = self.session_dir / "samples.sqlite"
+        with sqlite3.connect(
+            f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
+        ) as connection:
             row = connection.execute(
                 """
                 SELECT COUNT(*), COALESCE(SUM(CASE WHEN sample_valid = 0 THEN 1 ELSE 0 END), 0)

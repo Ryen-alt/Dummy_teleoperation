@@ -17,10 +17,11 @@ cameras:
     align_depth_to_color: true
     max_frame_age_ms: 100
     max_sync_skew_ms: 50
-    calibration_version: replace-with-wrist-calibration-id
-    color_exposure: null
-    color_white_balance: null
-    depth_exposure: null
+    calibration_version: example-wrist-calibration-v1
+    calibration_file: calibrations/wrist.example.yaml
+    color_exposure: 8500
+    color_white_balance: 4600
+    depth_exposure: 8500
   global:
     driver: opencv
     model: uvc-rgb
@@ -35,7 +36,8 @@ cameras:
     align_depth_to_color: false
     max_frame_age_ms: 100
     max_sync_skew_ms: 50
-    calibration_version: replace-with-global-calibration-id
-    color_exposure: null
-    color_white_balance: null
+    calibration_version: example-global-calibration-v1
+    calibration_file: calibrations/global.example.yaml
+    color_exposure: 100
+    color_white_balance: 4600
     depth_exposure: null

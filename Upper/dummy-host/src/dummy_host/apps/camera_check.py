@@ -7,7 +7,11 @@ import time
 from dataclasses import asdict
 
 from dummy_host.cameras import CameraError, CameraFrame, CameraManager
-from dummy_host.schema import load_robot_config
+from dummy_host.schema import (
+    ConfigError,
+    load_robot_config,
+    validate_camera_rig_for_formal_collection,
+)
 
 
 def wait_for_first_frames(
@@ -65,10 +69,20 @@ def main() -> None:
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--json-output")
+    parser.add_argument(
+        "--formal",
+        action="store_true",
+        help="require measured calibration files and fixed exposure before starting",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level.upper())
 
     config = load_robot_config(args.config, camera_rig_path=args.camera_rig)
+    if args.formal:
+        try:
+            validate_camera_rig_for_formal_collection(config.camera_rig)
+        except ConfigError as exc:
+            parser.error(str(exc))
     cameras = CameraManager.from_config(config.camera_rig)
     cameras.start()
     last_numbers: dict[str, int] = {}

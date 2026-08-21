@@ -54,6 +54,7 @@ def export_raw_session(
         "camera_rig_id": session.manifest.get("camera_rig_id"),
         "camera_rig_version": session.manifest.get("camera_rig_version"),
         "camera_rig_hash": session.manifest.get("camera_rig_hash"),
+        "camera_calibrations": session.manifest.get("camera_calibrations", {}),
     }
     result = sink.finalize(metadata=metadata)
     return ExportReport(

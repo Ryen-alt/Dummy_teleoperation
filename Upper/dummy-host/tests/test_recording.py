@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,13 @@ import numpy as np
 from dummy_host.cameras import CameraFrame
 from dummy_host.apps.session_check import check_session
 from dummy_host.recording import SessionRecorder
-from dummy_host.schema import AppliedAction, ControlMode, RobotConfig, RobotState
+from dummy_host.schema import (
+    AppliedAction,
+    ControlMode,
+    RobotConfig,
+    RobotState,
+    load_camera_rig_config,
+)
 from dummy_host.teleop import KeyboardMapper, load_teleop_profile
 
 
@@ -113,3 +120,24 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
     assert report.samples == 2
     assert report.camera_files == 2
     assert report.camera_frames_referenced == 2
+
+
+def test_session_archives_camera_calibration_files(config: RobotConfig, tmp_path: Path) -> None:
+    project = Path(__file__).parents[1]
+    profile = load_teleop_profile(project / "configs" / "teleop_inputs.yaml")
+    rig = load_camera_rig_config(project / "configs" / "camera_rig_dual.example.yaml")
+    recorder = SessionRecorder(
+        tmp_path,
+        replace(config, camera_rig=rig),
+        profile,
+        source="keyboard",
+        session_name="session_calibrations",
+    )
+    recorder.close()
+    manifest = json.loads(recorder.manifest_path.read_text(encoding="utf-8"))
+    assert set(manifest["camera_calibrations"]) == {"wrist", "global"}
+    for role, record in manifest["camera_calibrations"].items():
+        archived = recorder.session_dir / record["archive_path"]
+        assert archived.is_file(), role
+        assert record["sha256"] == rig.calibrations[role].file_hash
+    assert check_session(recorder.session_dir).ok

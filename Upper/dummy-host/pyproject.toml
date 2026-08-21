@@ -30,6 +30,7 @@ dummy-host-list-inputs = "dummy_host.input_evdev:main"
 dummy-host-gamepad-test = "dummy_host.apps.gamepad_mapping_test:main"
 dummy-host-teleop-collect = "dummy_host.apps.teleop_collect:main"
 dummy-host-session-check = "dummy_host.apps.session_check:main"
+dummy-host-session-qa = "dummy_host.apps.session_qa:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -37,4 +38,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
-

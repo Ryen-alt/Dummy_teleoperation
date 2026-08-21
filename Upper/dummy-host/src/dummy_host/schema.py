@@ -17,6 +17,25 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
+class CameraCalibration:
+    schema_version: int
+    calibration_id: str
+    calibrated_utc: str
+    camera_model: str
+    device_serial: str
+    width: int
+    height: int
+    intrinsic_matrix: np.ndarray
+    distortion_model: str
+    distortion_coefficients: np.ndarray
+    parent_frame: str
+    translation_m: np.ndarray
+    rotation_xyzw: np.ndarray
+    source_path: str
+    file_hash: str
+
+
+@dataclass(frozen=True)
 class CameraConfig:
     name: str
     model: str
@@ -33,6 +52,8 @@ class CameraConfig:
     color_exposure: float | None = None
     color_white_balance: float | None = None
     depth_exposure: float | None = None
+    calibration_file: str | None = None
+    calibration_hash: str | None = None
     driver: str = "realsense"
     enabled: bool = True
     required: bool = True
@@ -43,6 +64,7 @@ class CameraRigConfig:
     rig_id: str
     version: int
     cameras: Mapping[str, CameraConfig]
+    calibrations: Mapping[str, CameraCalibration] = field(compare=False)
     config_hash: str
 
 
@@ -109,6 +131,90 @@ def _canonical_hash(raw: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as exc:
+        raise ConfigError(f"cannot read calibration file {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def _finite_vector(raw: Mapping[str, Any], key: str, length: int) -> np.ndarray:
+    value = _array(raw, key, length, dtype=np.float64)
+    return value
+
+
+def load_camera_calibration(path: str | Path) -> CameraCalibration:
+    path = Path(path)
+    raw = _read_yaml_mapping(path)
+    if raw.get("schema_version") != 1:
+        raise ConfigError("camera calibration schema_version must be 1")
+    calibration_id = raw.get("calibration_id")
+    calibrated_utc = raw.get("calibrated_utc")
+    camera = raw.get("camera")
+    intrinsics = raw.get("intrinsics")
+    extrinsics = raw.get("extrinsics")
+    if not isinstance(calibration_id, str) or not calibration_id.strip():
+        raise ConfigError("camera calibration_id must be a non-empty string")
+    if not isinstance(calibrated_utc, str) or not calibrated_utc.strip():
+        raise ConfigError("camera calibrated_utc must be a non-empty string")
+    if not isinstance(camera, dict):
+        raise ConfigError("camera calibration camera must be a mapping")
+    if not isinstance(intrinsics, dict):
+        raise ConfigError("camera calibration intrinsics must be a mapping")
+    if not isinstance(extrinsics, dict):
+        raise ConfigError("camera calibration extrinsics must be a mapping")
+    model = camera.get("model")
+    device_serial = camera.get("device_serial")
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError("camera calibration model must be a non-empty string")
+    if not isinstance(device_serial, str) or not device_serial.strip():
+        raise ConfigError("camera calibration device_serial must be a non-empty string")
+    width = _positive_int(camera, "width")
+    height = _positive_int(camera, "height")
+    matrix = _finite_vector(intrinsics, "matrix", 9).reshape(3, 3)
+    if matrix[0, 0] <= 0 or matrix[1, 1] <= 0 or abs(matrix[2, 2] - 1.0) > 1e-6:
+        raise ConfigError("camera intrinsic matrix has invalid focal length or homogeneous row")
+    distortion_model = intrinsics.get("distortion_model")
+    coefficients_raw = intrinsics.get("coefficients")
+    if not isinstance(distortion_model, str) or not distortion_model.strip():
+        raise ConfigError("camera distortion_model must be a non-empty string")
+    if not isinstance(coefficients_raw, list) or not coefficients_raw:
+        raise ConfigError("camera distortion coefficients must be a non-empty list")
+    coefficients = np.asarray(coefficients_raw, dtype=np.float64)
+    if coefficients.ndim != 1 or not np.isfinite(coefficients).all():
+        raise ConfigError("camera distortion coefficients must be a finite vector")
+    coefficients.setflags(write=False)
+    parent_frame = extrinsics.get("parent_frame")
+    if not isinstance(parent_frame, str) or not parent_frame.strip():
+        raise ConfigError("camera extrinsics parent_frame must be a non-empty string")
+    translation = _finite_vector(extrinsics, "translation_m", 3)
+    rotation = _finite_vector(extrinsics, "rotation_xyzw", 4)
+    rotation_norm = float(np.linalg.norm(rotation))
+    if abs(rotation_norm - 1.0) > 1e-3:
+        raise ConfigError("camera extrinsic rotation_xyzw must be a unit quaternion")
+    return CameraCalibration(
+        schema_version=1,
+        calibration_id=calibration_id,
+        calibrated_utc=calibrated_utc,
+        camera_model=model,
+        device_serial=device_serial,
+        width=width,
+        height=height,
+        intrinsic_matrix=matrix,
+        distortion_model=distortion_model,
+        distortion_coefficients=coefficients,
+        parent_frame=parent_frame,
+        translation_m=translation,
+        rotation_xyzw=rotation,
+        source_path=str(path.resolve()),
+        file_hash=_file_hash(path),
+    )
+
+
 def _robot_config_hash(raw: Mapping[str, Any]) -> str:
     # Cameras have their own version/hash and must not force a firmware rebuild.
     camera_keys = {"camera_rig_id", "camera_rig_version", "cameras"}
@@ -126,7 +232,7 @@ def _read_yaml_mapping(path: str | Path) -> dict[str, Any]:
     return raw
 
 
-def _parse_camera_rig(raw: Mapping[str, Any]) -> CameraRigConfig:
+def _parse_camera_rig(raw: Mapping[str, Any], *, base_dir: Path) -> CameraRigConfig:
     rig_id = raw.get("camera_rig_id")
     if not isinstance(rig_id, str) or not rig_id.strip():
         raise ConfigError("camera_rig_id must be a non-empty string")
@@ -135,6 +241,7 @@ def _parse_camera_rig(raw: Mapping[str, Any]) -> CameraRigConfig:
     if not isinstance(cameras_raw, dict) or not cameras_raw:
         raise ConfigError("cameras must be a non-empty mapping of logical roles")
     cameras: dict[str, CameraConfig] = {}
+    calibrations: dict[str, CameraCalibration] = {}
     for role, cam_raw in cameras_raw.items():
         if not isinstance(role, str) or not role or not role.replace("_", "").isalnum():
             raise ConfigError(f"invalid camera role {role!r}")
@@ -159,6 +266,18 @@ def _parse_camera_rig(raw: Mapping[str, Any]) -> CameraRigConfig:
             )
         if required and not enabled:
             raise ConfigError(f"required camera {role} cannot be disabled")
+        calibration_file_raw = cam_raw.get("calibration_file")
+        if calibration_file_raw is not None and (
+            not isinstance(calibration_file_raw, str) or not calibration_file_raw.strip()
+        ):
+            raise ConfigError(f"camera {role} calibration_file must be null or a path")
+        calibration: CameraCalibration | None = None
+        calibration_path: Path | None = None
+        if isinstance(calibration_file_raw, str):
+            calibration_path = Path(calibration_file_raw)
+            if not calibration_path.is_absolute():
+                calibration_path = base_dir / calibration_path
+            calibration = load_camera_calibration(calibration_path)
         camera = CameraConfig(
             name=role,
             model=model,
@@ -175,6 +294,8 @@ def _parse_camera_rig(raw: Mapping[str, Any]) -> CameraRigConfig:
             color_exposure=cam_raw.get("color_exposure"),
             color_white_balance=cam_raw.get("color_white_balance"),
             depth_exposure=cam_raw.get("depth_exposure"),
+            calibration_file=None if calibration_path is None else str(calibration_path.resolve()),
+            calibration_hash=None if calibration is None else calibration.file_hash,
             driver=driver,
             enabled=enabled,
             required=required,
@@ -187,6 +308,17 @@ def _parse_camera_rig(raw: Mapping[str, Any]) -> CameraRigConfig:
             raise ConfigError(f"OpenCV camera {role} depth_format must be none")
         if not camera.calibration_version:
             raise ConfigError(f"camera {role} calibration_version is required")
+        if calibration is not None:
+            if calibration.calibration_id != camera.calibration_version:
+                raise ConfigError(
+                    f"camera {role} calibration ID does not match calibration_version"
+                )
+            if calibration.camera_model != camera.model:
+                raise ConfigError(f"camera {role} calibration model does not match rig")
+            if calibration.device_serial != camera.device_serial:
+                raise ConfigError(f"camera {role} calibration device_serial does not match rig")
+            if (calibration.width, calibration.height) != (camera.width, camera.height):
+                raise ConfigError(f"camera {role} calibration resolution does not match rig")
         for option_name in ("color_exposure", "color_white_balance", "depth_exposure"):
             option_value = getattr(camera, option_name)
             if option_value is not None and (
@@ -196,17 +328,53 @@ def _parse_camera_rig(raw: Mapping[str, Any]) -> CameraRigConfig:
             ):
                 raise ConfigError(f"camera {role} {option_name} must be null or finite")
         cameras[role] = camera
+        if calibration is not None:
+            calibrations[role] = calibration
     camera_rig_raw = {
         "camera_rig_id": rig_id,
         "camera_rig_version": rig_version,
         "cameras": cameras_raw,
+        "calibration_sha256": {
+            role: calibration.file_hash for role, calibration in sorted(calibrations.items())
+        },
     }
-    return CameraRigConfig(rig_id, rig_version, cameras, _canonical_hash(camera_rig_raw))
+    return CameraRigConfig(
+        rig_id,
+        rig_version,
+        cameras,
+        calibrations,
+        _canonical_hash(camera_rig_raw),
+    )
 
 
 def load_camera_rig_config(path: str | Path) -> CameraRigConfig:
     """Load an independently versioned camera rig without changing robot safety identity."""
-    return _parse_camera_rig(_read_yaml_mapping(path))
+    path = Path(path)
+    return _parse_camera_rig(_read_yaml_mapping(path), base_dir=path.parent)
+
+
+def validate_camera_rig_for_formal_collection(rig: CameraRigConfig) -> None:
+    """Reject smoke-test camera metadata at the formal Raw Session boundary."""
+    errors: list[str] = []
+    for role, camera in rig.cameras.items():
+        if not camera.enabled or not camera.required:
+            continue
+        if camera.calibration_version.lower().startswith("uncalibrated"):
+            errors.append(f"{role}: calibration_version is uncalibrated")
+        if camera.calibration_version.lower().startswith("example-"):
+            errors.append(f"{role}: example calibration must be replaced with measured data")
+        if camera.calibration_file is None or camera.calibration_hash is None:
+            errors.append(f"{role}: versioned calibration_file is required")
+        if camera.color_exposure is None:
+            errors.append(f"{role}: fixed color_exposure is required")
+        if camera.color_white_balance is None:
+            errors.append(f"{role}: fixed color_white_balance is required")
+        if camera.driver == "realsense" and camera.depth_exposure is None:
+            errors.append(f"{role}: fixed depth_exposure is required")
+    if errors:
+        raise ConfigError(
+            "camera rig is not ready for formal collection: " + "; ".join(errors)
+        )
 
 
 def load_robot_config(
@@ -252,7 +420,7 @@ def load_robot_config(
     camera_rig = (
         load_camera_rig_config(camera_rig_path)
         if camera_rig_path is not None
-        else _parse_camera_rig(raw)
+        else _parse_camera_rig(raw, base_dir=Path(path).parent)
     )
 
     verified = raw.get("hardware_parameters_verified")

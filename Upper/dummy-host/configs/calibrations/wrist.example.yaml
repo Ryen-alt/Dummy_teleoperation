@@ -1,0 +1,17 @@
+# Schema example only. Replace every measured value and ID before formal collection.
+schema_version: 1
+calibration_id: example-wrist-calibration-v1
+calibrated_utc: "2000-01-01T00:00:00Z"
+camera:
+  model: D435
+  device_serial: REPLACE_WITH_D435_SERIAL
+  width: 640
+  height: 480
+intrinsics:
+  matrix: [600.0, 0.0, 320.0, 0.0, 600.0, 240.0, 0.0, 0.0, 1.0]
+  distortion_model: brown_conrady
+  coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+extrinsics:
+  parent_frame: tool0
+  translation_m: [0.0, 0.0, 0.0]
+  rotation_xyzw: [0.0, 0.0, 0.0, 1.0]

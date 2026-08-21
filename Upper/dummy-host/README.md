@@ -7,9 +7,9 @@ USB CDC 串口、`DummyRobot`、动作安全过滤、20 Hz 调度、单关节 br
 
 ## 安全状态
 
-`configs/robot_config.yaml` 版本 3 以 URDF 关节角为上位机和二进制协议的统一坐标，
+`configs/robot_config.yaml` 版本 4 以 URDF 关节角为上位机和二进制协议的统一坐标，
 并在 MCU 协议边界映射到旧固件坐标。方向、零点、减速比、限位和夹爪映射已经由
-`dummy_v2_001-arm-gripper-20260811-v1` 标定基线冻结。真实控制仍要求上位机与固件
+`dummy_v2_001-arm-gripper-20260821-v2` 标定基线冻结。真实控制仍要求上位机与固件
 配置哈希完全一致，并同时满足控制租约、dead-man、TTL 和状态有效性门禁。
 
 `allow_unverified_hardware=True` 只保留给无电机协议台架和单元测试，生产配置不使用。
@@ -35,6 +35,11 @@ RobotConfig/固件哈希不变；双相机模板见 `configs/camera_rig_dual.exa
 dummy-host-camera --config configs/robot_config.yaml \
   --camera-rig configs/camera_rig_dual.example.yaml --seconds 30
 ```
+
+正式带相机采集还要求每个必需角色引用版本化标定 YAML。标定文件绑定设备序列号、
+型号、分辨率、内参、畸变、相对 `base_link`/`tool0` 的外参和 SHA-256；模板位于
+`configs/calibrations/`。`--require-camera` 会拒绝 `uncalibrated-v0`、示例标定、
+缺少固定曝光或标定身份不匹配的 rig。每次 Raw Session 会复制标定原文件并校验哈希。
 
 由唯一 YAML 生成并检查固件配置头：
 
@@ -125,6 +130,19 @@ dummy-host-teleop-collect \
 启用 `--with-cameras --require-camera` 后，必需相机缺帧或同步超限同样会停止采集并进入 HOLD。
 完成后使用 `dummy-host-session-check --session /path/to/session_dir` 实际复算校验和、
 运行 SQLite 完整性检查并汇总 sent/received/applied 序号。
+进一步的自动 QA 会统计采样频率、调度间隔、Episode 结果、故障/裁剪样本、每个相机
+角色的帧号缺口、捕获延迟和同步偏差，并生成不依赖 GUI 的 HTML 轨迹报告：
+
+```bash
+dummy-host-session-qa --session /path/to/session_dir \
+  --json-output /tmp/session_qa.json \
+  --html-output /tmp/session_qa.html
+```
+
+Raw Session v2 也可通过 `ReplayCamera` 走相同的 Camera/CameraManager 接口。回放 rig
+将 `driver` 设为 `replay`，`device_serial` 填 clean session 目录，并保持角色、分辨率和
+`calibration_version` 与源记录一致；回放时间戳会重基到当前单调时钟，因此过期帧和
+同步门禁仍然生效。
 真实 `--execute` 还必须显式指定 `--allow-joint` 或 `--allow-gripper`，并继续受
 硬件参数和固件执行门禁约束。详细验收步骤见真机指南第 17 节。
 

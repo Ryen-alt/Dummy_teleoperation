@@ -4,7 +4,13 @@ from pathlib import Path
 
 import yaml
 
-from dummy_host.schema import ConfigError, load_camera_rig_config, load_robot_config
+from dummy_host.schema import (
+    ConfigError,
+    load_camera_calibration,
+    load_camera_rig_config,
+    load_robot_config,
+    validate_camera_rig_for_formal_collection,
+)
 
 
 def test_config_is_deterministic_and_calibrated(config) -> None:
@@ -76,3 +82,49 @@ def test_external_camera_rig_overrides_cameras_without_changing_robot_hash() -> 
     assert overridden.camera_rig == rig
     assert overridden.config_hash == embedded.config_hash
     assert overridden.camera_rig.config_hash != embedded.camera_rig.config_hash
+    assert set(rig.calibrations) == {"wrist", "global"}
+    assert rig.cameras["wrist"].calibration_hash == rig.calibrations["wrist"].file_hash
+
+
+def test_versioned_camera_calibration_loads_and_matches_rig() -> None:
+    root = Path(__file__).parents[1]
+    calibration = load_camera_calibration(
+        root / "configs" / "calibrations" / "wrist.example.yaml"
+    )
+    assert calibration.schema_version == 1
+    assert calibration.intrinsic_matrix.shape == (3, 3)
+    assert calibration.rotation_xyzw.tolist() == [0.0, 0.0, 0.0, 1.0]
+    assert len(calibration.file_hash) == 64
+
+
+def test_camera_calibration_identity_mismatch_is_rejected(tmp_path) -> None:
+    root = Path(__file__).parents[1]
+    raw = yaml.safe_load(
+        (root / "configs" / "camera_rig_dual.example.yaml").read_text(encoding="utf-8")
+    )
+    raw["cameras"]["wrist"]["device_serial"] = "wrong-device"
+    raw["cameras"]["wrist"]["calibration_file"] = str(
+        root / "configs" / "calibrations" / "wrist.example.yaml"
+    )
+    raw["cameras"]["global"]["calibration_file"] = str(
+        root / "configs" / "calibrations" / "global.example.yaml"
+    )
+    path = tmp_path / "bad-rig.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    try:
+        load_camera_rig_config(path)
+    except ConfigError as exc:
+        assert "device_serial" in str(exc)
+    else:
+        raise AssertionError("mismatched calibration identity was accepted")
+
+
+def test_formal_collection_rejects_uncalibrated_embedded_rig(config) -> None:
+    try:
+        validate_camera_rig_for_formal_collection(config.camera_rig)
+    except ConfigError as exc:
+        assert "uncalibrated" in str(exc)
+        assert "calibration_file" in str(exc)
+        assert "fixed color_exposure" in str(exc)
+    else:
+        raise AssertionError("uncalibrated smoke-test rig was accepted for formal collection")
