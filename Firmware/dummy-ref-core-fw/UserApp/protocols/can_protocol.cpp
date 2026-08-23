@@ -1,5 +1,7 @@
 ﻿#include "common_inc.h"
 
+#include "feedback_runtime.hpp"
+
 extern DummyRobot robot;
 
 
@@ -35,13 +37,17 @@ void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* d
                 float position;
                 memcpy(&position, data, sizeof(position));
                 actuator->UpdateAngleCallback(position, data[4] != 0);
+                dummy::protocol::RecordPositionFeedbackResponse(id);
                 if (armJointResponse)
                     robot.UpdateJointAnglesCallback();
             }
             break;
         case 0x25:
             if (rxHeader->DLC >= 4)
+            {
                 memcpy(&actuator->temperature, data, sizeof(actuator->temperature));
+                dummy::protocol::RecordTemperatureFeedbackResponse(id, actuator->temperature);
+            }
             break;
         default:
             break;

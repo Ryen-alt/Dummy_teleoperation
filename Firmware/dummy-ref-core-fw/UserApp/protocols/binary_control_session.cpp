@@ -48,7 +48,7 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
         return Hello(request);
     if (message_type == MessageType::EmergencyStop)
     {
-        SetFault(0x0001U);
+        SetFault(kFaultEmergencyStop);
         ProcessResult result = Ack(request);
         result.emergency_stop_requested = true;
         result.entered_hold = true;
@@ -56,7 +56,7 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
     }
     if (message_type == MessageType::Hold)
     {
-        EnterHold();
+        EnterHold(kHoldReasonOperator);
         ProcessResult result = Ack(request);
         result.entered_hold = true;
         return result;
@@ -87,6 +87,7 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
         lease_duration_ms_ = payload.lease_ms;
         lease_active_ = true;
         mode_ = ControlMode::Hold;
+        hold_reason_bits_ = 0;
         active_target_ = {};
         ExtendLease(now_us);
         return Ack(request);
@@ -103,7 +104,7 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
         {
             if (request.header.payload_length != 0)
                 return Ack(request, ResultCode::BadLength);
-            EnterHold();
+            EnterHold(kHoldReasonOperator);
             lease_active_ = false;
             ProcessResult result = Ack(request);
             result.entered_hold = true;
@@ -122,6 +123,8 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
                 return Ack(request, ResultCode::FaultActive);
             active_target_ = {};
             mode_ = requested_mode;
+            hold_reason_bits_ = requested_mode == ControlMode::Hold
+                ? kHoldReasonOperator : 0;
             ExtendLease(now_us);
             ProcessResult result = Ack(request);
             result.entered_hold = requested_mode == ControlMode::Hold;
@@ -171,13 +174,13 @@ bool ControlSession::Tick(uint64_t now_us)
 {
     if (lease_active_ && now_us >= lease_deadline_us_)
     {
-        EnterHold();
+        EnterHold(kHoldReasonLeaseTimeout);
         lease_active_ = false;
         return true;
     }
     if (active_target_.valid && now_us >= active_target_.deadline_us)
     {
-        EnterHold();
+        EnterHold(kHoldReasonTargetTimeout);
         return true;
     }
     return false;
@@ -197,19 +200,28 @@ void ControlSession::SetFault(uint16_t fault_bits)
     active_target_ = {};
 }
 
+void ControlSession::RequestSafetyHold(uint16_t hold_reason_bits)
+{
+    if (hold_reason_bits == 0 || fault_bits_ != 0)
+        return;
+    EnterHold(hold_reason_bits);
+}
+
 bool ControlSession::ClearFault(bool hardware_safe)
 {
     if (!hardware_safe)
         return false;
     fault_bits_ = 0;
     mode_ = ControlMode::Hold;
+    hold_reason_bits_ = 0;
     active_target_ = {};
     return true;
 }
 
 StatePayload ControlSession::MakeState(const std::array<float, 7>& position,
                                        const std::array<float, 7>& velocity,
-                                       uint8_t validity, uint64_t now_us) const
+                                       uint8_t validity, uint64_t now_us,
+                                       const FeedbackSafetyOutput& safety) const
 {
     StatePayload state{};
     state.mcu_time_us = now_us;
@@ -223,6 +235,24 @@ StatePayload ControlSession::MakeState(const std::array<float, 7>& position,
     if (active_target_.valid && now_us >= active_target_.received_time_us)
         state.target_age_ms = static_cast<uint32_t>((now_us - active_target_.received_time_us) / 1000U);
     std::copy(config_.config_sha256.begin(), config_.config_sha256.end(), state.config_sha256);
+    std::copy(safety.following_error.begin(), safety.following_error.end(),
+              state.following_error);
+    std::copy(safety.following_error_duration_ms.begin(),
+              safety.following_error_duration_ms.end(),
+              state.following_error_duration_ms);
+    std::copy(safety.feedback_age_ms.begin(), safety.feedback_age_ms.end(),
+              state.feedback_age_ms);
+    std::copy(safety.feedback_loss_count.begin(), safety.feedback_loss_count.end(),
+              state.feedback_loss_count);
+    std::copy(safety.consecutive_feedback_loss.begin(),
+              safety.consecutive_feedback_loss.end(),
+              state.consecutive_feedback_loss);
+    std::copy(safety.node_fault_bits.begin(), safety.node_fault_bits.end(),
+              state.node_fault_bits);
+    std::copy(safety.node_validity.begin(), safety.node_validity.end(),
+              state.node_validity);
+    state.hold_reason_bits = hold_reason_bits_;
+    state.telemetry_validity = safety.telemetry_validity;
     return state;
 }
 
@@ -316,9 +346,10 @@ ResultCode ControlSession::ValidateTarget(const JointTargetPayload& target) cons
     return ResultCode::Ok;
 }
 
-void ControlSession::EnterHold()
+void ControlSession::EnterHold(uint16_t hold_reason_bits)
 {
     mode_ = fault_bits_ == 0 ? ControlMode::Hold : ControlMode::Fault;
+    hold_reason_bits_ |= hold_reason_bits;
     active_target_ = {};
 }
 
@@ -328,4 +359,3 @@ void ControlSession::ExtendLease(uint64_t now_us)
 }
 
 } // namespace dummy::protocol
-

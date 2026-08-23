@@ -1,5 +1,6 @@
 #include "ctrl_step.hpp"
 #include "communication.hpp"
+#include "protocols/feedback_runtime.hpp"
 
 
 CtrlStepMotor::CtrlStepMotor(CAN_HandleTypeDef* _hcan, uint8_t _id, bool _inverse,
@@ -230,11 +231,12 @@ void CtrlStepMotor::Reboot()
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
 
-uint32_t CtrlStepMotor::GetTemp()
+float CtrlStepMotor::GetTemp()
 {
     uint8_t mode = 0x25;
     txHeader.StdId = nodeID << 7 | mode;
 
+    dummy::protocol::RecordTemperatureFeedbackRequest(nodeID);
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
     return temperature;
 }
@@ -269,6 +271,7 @@ void CtrlStepMotor::UpdateAngle()
     uint8_t mode = 0x23;
     txHeader.StdId = nodeID << 7 | mode;
 
+    dummy::protocol::RecordPositionFeedbackRequest(nodeID);
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
 

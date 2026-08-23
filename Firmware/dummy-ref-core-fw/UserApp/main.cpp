@@ -2,6 +2,8 @@
 #include "configurations/robot_config_generated.hpp"
 #include "protocols/binary_control_bridge.hpp"
 #include "protocols/external_target_executor.hpp"
+#include "protocols/feedback_runtime.hpp"
+#include "protocols/feedback_safety_supervisor.hpp"
 #include "protocols/joint_space_mapping.hpp"
 
 #include <algorithm>
@@ -28,11 +30,35 @@ dummy::protocol::ExecutorConfig MakeExternalExecutorConfig()
 {
     dummy::protocol::ExecutorConfig config{};
     config.max_acceleration_rad_s2 = dummy::generated_config::kMaxAccelerationRadS2;
+    config.gripper_max_velocity_per_s =
+        dummy::generated_config::kGripperVelocityLimitPerS;
+    config.gripper_max_acceleration_per_s2 =
+        dummy::generated_config::kGripperAccelerationLimitPerS2;
     config.loop_rate_hz = dummy::generated_config::kFirmwareLoopHz;
     return config;
 }
 
 dummy::protocol::ExternalTargetExecutor external_target_executor(MakeExternalExecutorConfig());
+
+dummy::protocol::FeedbackSafetyConfig MakeFeedbackSafetyConfig()
+{
+    dummy::protocol::FeedbackSafetyConfig config{};
+    std::copy(dummy::generated_config::kJointFollowingErrorLimitRad.begin(),
+              dummy::generated_config::kJointFollowingErrorLimitRad.end(),
+              config.following_error_limit.begin());
+    config.following_error_limit[6] =
+        dummy::generated_config::kGripperFollowingErrorLimit;
+    config.following_error_hold_ms = dummy::generated_config::kFollowingErrorHoldMs;
+    config.feedback_hold_ms = dummy::generated_config::kFeedbackHoldMs;
+    config.feedback_fault_ms = dummy::generated_config::kFeedbackFaultMs;
+    config.temperature_max_age_ms = dummy::generated_config::kTemperatureMaxAgeMs;
+    config.temperature_fault_c = dummy::generated_config::kTemperatureFaultC;
+    config.temperature_fault_ms = dummy::generated_config::kTemperatureFaultMs;
+    return config;
+}
+
+dummy::protocol::FeedbackSafetySupervisor feedback_safety_supervisor(
+    MakeFeedbackSafetyConfig());
 }
 
 
@@ -57,8 +83,8 @@ void ThreadControlLoopFixUpdate(void* argument)
                     (robot.hand->angle - robot.hand->openedAngle) / travel, 0.0F, 1.0F);
         }
 
-        const auto binary_snapshot = dummy::protocol::ReadBinaryControlSnapshot(
-            dummy::protocol::BinaryControlMonotonicMicros());
+        const uint64_t now_us = dummy::protocol::BinaryControlMonotonicMicros();
+        const auto binary_snapshot = dummy::protocol::ReadBinaryControlSnapshot(now_us);
         const bool binary_motion_mode =
             binary_snapshot.mode == dummy::protocol::ControlMode::Teleop ||
             binary_snapshot.mode == dummy::protocol::ControlMode::Policy;
@@ -66,17 +92,36 @@ void ThreadControlLoopFixUpdate(void* argument)
             external_target_executor.active() ||
             binary_snapshot.mode == dummy::protocol::ControlMode::Fault;
 
+        dummy::protocol::ExecutorStep step{};
         if (binary_context_active)
         {
-            const auto step = external_target_executor.Step(
+            step = external_target_executor.Step(
                 binary_snapshot.target,
                 binary_snapshot.lease_active && binary_motion_mode,
                 measured_position);
-            if (step.entered_hold)
+        }
+
+        dummy::protocol::FeedbackSafetyInput safety_input{};
+        safety_input.now_us = now_us;
+        safety_input.control_active = binary_snapshot.lease_active;
+        safety_input.following_active = step.command_valid;
+        safety_input.commanded_position = step.command_valid
+            ? step.position : external_target_executor.commanded_position();
+        safety_input.measured_position = measured_position;
+        safety_input.feedback = dummy::protocol::ReadCanFeedbackStatus(
+            static_cast<uint32_t>(now_us));
+        const auto safety = feedback_safety_supervisor.Update(safety_input);
+        dummy::protocol::ApplyBinarySafetyOutcome(safety);
+        const bool safety_stop = safety.hold_reason_bits != 0 || safety.fault_bits != 0;
+
+        if (binary_context_active)
+        {
+            if (step.entered_hold || safety_stop)
                 robot.HoldCurrentPosition();
-            if (binary_snapshot.mode == dummy::protocol::ControlMode::Fault)
+            if (binary_snapshot.mode == dummy::protocol::ControlMode::Fault ||
+                safety.fault_bits != 0)
                 robot.commandHandler.EmergencyStop();
-            else if (step.command_valid)
+            else if (step.command_valid && !safety_stop)
             {
                 if (!robot.IsEnabled())
                     robot.SetEnable(true);
@@ -107,6 +152,13 @@ void ThreadControlLoopFixUpdate(void* argument)
             // Just update Joint states
             robot.UpdateJointAngles();
             robot.UpdateJointPose6D();
+        }
+
+        static uint32_t temperature_poll_ticks = 0;
+        if (++temperature_poll_ticks >= dummy::generated_config::kFirmwareLoopHz)
+        {
+            temperature_poll_ticks = 0;
+            robot.motorJ[ALL]->GetTemp();
         }
     }
 }
@@ -275,4 +327,3 @@ void Main(void)
     Respond(*uart4StreamOutputPtr, "[sys] Heap remain: %d Bytes\n", xPortGetMinimumEverFreeHeapSize());
     pwm.SetDuty(PWM::CH_A1, 0.5);
 }
-

@@ -9,7 +9,7 @@ namespace dummy::protocol
 {
 
 constexpr uint16_t kMagic = 0x4459;
-constexpr uint8_t kProtocolVersion = 1;
+constexpr uint8_t kProtocolVersion = 2;
 constexpr size_t kMaxDecodedFrame = 512;
 constexpr size_t kCrcSize = 4;
 
@@ -137,13 +137,23 @@ struct StatePayload
     uint16_t fault_bits;
     uint32_t target_age_ms;
     uint8_t config_sha256[32];
+    float following_error[7];
+    uint32_t following_error_duration_ms[7];
+    uint32_t feedback_age_ms[7];
+    uint32_t feedback_loss_count[7];
+    uint16_t consecutive_feedback_loss[7];
+    uint16_t node_fault_bits[7];
+    uint8_t node_validity[7];
+    uint8_t reserved;
+    uint16_t hold_reason_bits;
+    uint16_t telemetry_validity;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(float) == 4, "protocol requires IEEE-754 binary32 floats");
 static_assert(sizeof(PacketHeader) == 24, "PacketHeader layout changed");
 static_assert(sizeof(JointTargetPayload) == 56, "JointTargetPayload layout changed");
-static_assert(sizeof(StatePayload) == 112, "StatePayload layout changed");
+static_assert(sizeof(StatePayload) == 264, "StatePayload layout changed");
 
 constexpr size_t kMaxPayload = kMaxDecodedFrame - sizeof(PacketHeader) - kCrcSize;
 
@@ -186,4 +196,3 @@ private:
 } // namespace dummy::protocol
 
 #endif // DUMMY_BINARY_PROTOCOL_HPP
-

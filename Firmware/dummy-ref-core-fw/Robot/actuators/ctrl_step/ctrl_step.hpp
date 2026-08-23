@@ -24,7 +24,7 @@ public:
     float angle = 0;
     float angleLimitMax;
     float angleLimitMin;
-    uint32_t temperature = 0.0;
+    float temperature = 0.0F;
     bool inverseDirection;
     uint8_t reduction;
     State state = STOP;
@@ -51,7 +51,7 @@ public:
     void SetEnableOnBoot(bool _enable);
     void SetEnableStallProtect(bool _enable);
     void Reboot();
-    uint32_t GetTemp();
+    float GetTemp();
     void EraseConfigs();
 
     void UpdateAngle();

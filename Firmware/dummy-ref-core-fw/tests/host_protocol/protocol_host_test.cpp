@@ -4,6 +4,8 @@
 #include "joint_space_mapping.hpp"
 #include "monotonic_micros.hpp"
 #include "measured_state_estimator.hpp"
+#include "can_feedback_monitor.hpp"
+#include "feedback_safety_supervisor.hpp"
 #include "robot_config_generated.hpp"
 
 #include <array>
@@ -72,9 +74,9 @@ SessionConfig MakeConfig(bool verified)
 Packet DecodeHelloVector()
 {
     const auto wire = FromHex(
-        "06594401012401013944332211887766550807060504030201"
+        "06594402012401013944332211887766550807060504030201"
         "cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d"
-        "40421a73f5043d4a5a5aa5a5279ae55400");
+        "40421a73f5043d4a5a5aa5a5ca8f978e00");
     Packet packet{};
     const DecodeStatus status = DecodePacket(wire.data(), wire.size(), packet);
     if (status != DecodeStatus::Ok)
@@ -96,9 +98,9 @@ void TestCodecVectors()
     std::array<uint8_t, 600> output{};
     const size_t length = EncodePacket(hello, output.data(), output.size());
     const auto expected = FromHex(
-        "06594401012401013944332211887766550807060504030201"
+        "06594402012401013944332211887766550807060504030201"
         "cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d"
-        "40421a73f5043d4a5a5aa5a5279ae55400");
+        "40421a73f5043d4a5a5aa5a5ca8f978e00");
     assert(length == expected.size());
     assert(std::equal(expected.begin(), expected.end(), output.begin()));
 
@@ -107,10 +109,10 @@ void TestCodecVectors()
     assert(DecodePacket(output.data(), length, invalid) == DecodeStatus::BadCrc);
 
     const auto target_wire = FromHex(
-        "06594401063801012544332211897766551007060504030201"
+        "06594402063801012544332211897766551007060504030201"
         "cdcccc3dcdcc4c3e9a9999bf9a99993ecdccccbe0101023f01"
         "0f403f3333b33e3333b33e3333b33e0101023f0101073f33"
-        "33333f64020305cfbc590700");
+        "33333f64020305a0621ac500");
     Packet target_packet{};
     assert(DecodePacket(target_wire.data(), target_wire.size(), target_packet) == DecodeStatus::Ok);
     assert(target_packet.header.message_type == static_cast<uint8_t>(MessageType::SetJointTarget));
@@ -170,6 +172,103 @@ void TestMeasuredVelocityUsesOnlyValidMonotonicIntervals()
     assert(!estimator.Update(position, 300000U, true).valid);
     position[0] = 0.03F;
     assert(estimator.Update(position, 350000U, true).valid);
+}
+
+void TestCanFeedbackMonitorTracksAgeAndLossWithoutInventingFaultSources()
+{
+    CanFeedbackMonitor monitor;
+    monitor.OnPositionRequest(0, 1000U);
+    for (uint8_t node = 1; node <= 7; ++node)
+    {
+        if (node != 3)
+            monitor.OnPositionResponse(node, 2000U);
+    }
+    monitor.OnPositionRequest(0, 6000U);
+    auto status = monitor.Snapshot(7000U);
+    assert(status[0].position_seen);
+    assert(status[0].position_age_ms == 5U);
+    assert(!status[2].position_seen);
+    assert(status[2].position_age_ms == kFeedbackAgeUnknown);
+    assert(status[2].total_position_losses == 1U);
+    assert(status[2].consecutive_position_losses == 1U);
+
+    monitor.OnPositionResponse(3, 7500U);
+    monitor.OnTemperatureRequest(0, 8000U);
+    monitor.OnTemperatureResponse(3, 9000U, 42.5F);
+    status = monitor.Snapshot(10000U);
+    assert(status[2].position_age_ms == 2U);
+    assert(status[2].consecutive_position_losses == 0U);
+    assert(status[2].temperature_seen);
+    assert(std::fabs(status[2].temperature_c - 42.5F) < 1e-6F);
+}
+
+FeedbackSafetyConfig MakeSafetyConfig()
+{
+    FeedbackSafetyConfig config{};
+    config.following_error_limit.fill(0.1F);
+    config.following_error_hold_ms = 50U;
+    config.feedback_hold_ms = 100U;
+    config.feedback_fault_ms = 300U;
+    config.temperature_max_age_ms = 1000U;
+    config.temperature_fault_c = 70.0F;
+    config.temperature_fault_ms = 100U;
+    return config;
+}
+
+FeedbackSafetyInput MakeFreshSafetyInput(uint64_t now_us)
+{
+    FeedbackSafetyInput input{};
+    input.now_us = now_us;
+    input.control_active = true;
+    input.following_active = true;
+    for (auto& node : input.feedback)
+    {
+        node.position_seen = true;
+        node.position_age_ms = 0U;
+        node.temperature_seen = true;
+        node.temperature_age_ms = 0U;
+        node.temperature_c = 35.0F;
+    }
+    return input;
+}
+
+void TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault()
+{
+    FeedbackSafetySupervisor following_supervisor(MakeSafetyConfig());
+    auto input = MakeFreshSafetyInput(1000U);
+    input.commanded_position[1] = 0.2F;
+    auto output = following_supervisor.Update(input);
+    assert(output.hold_reason_bits == 0U);
+    input.now_us += 50000U;
+    output = following_supervisor.Update(input);
+    assert((output.hold_reason_bits & kHoldReasonFollowingError) != 0U);
+    assert(output.fault_bits == 0U);
+    assert(output.following_error_duration_ms[1] == 50U);
+
+    FeedbackSafetySupervisor feedback_supervisor(MakeSafetyConfig());
+    input = MakeFreshSafetyInput(1000U);
+    input.feedback[4].position_age_ms = 120U;
+    output = feedback_supervisor.Update(input);
+    assert((output.hold_reason_bits & kHoldReasonFeedbackStale) != 0U);
+    assert(output.fault_bits == 0U);
+    input.now_us = 401000U;
+    input.feedback[4].position_age_ms = 400U;
+    output = feedback_supervisor.Update(input);
+    assert((output.fault_bits & kFaultFeedbackLost) != 0U);
+
+    FeedbackSafetySupervisor temperature_supervisor(MakeSafetyConfig());
+    input = MakeFreshSafetyInput(1000U);
+    input.feedback[2].temperature_c = 80.0F;
+    assert(temperature_supervisor.Update(input).fault_bits == 0U);
+    input.now_us = 101000U;
+    input.control_active = false;
+    output = temperature_supervisor.Update(input);
+    assert((output.fault_bits & kFaultOverTemperature) != 0U);
+    // No encoder/stall/current source is advertised by the current motor CAN
+    // response, so those validity and fault bits stay clear.
+    assert((output.node_validity[2] & kNodeEncoderFaultSourceValid) == 0U);
+    assert((output.node_fault_bits[2] &
+            (kNodeFaultEncoder | kNodeFaultStall | kNodeFaultOverCurrent)) == 0U);
 }
 
 void TestUnverifiedConfigurationCannotAcquire()
@@ -328,6 +427,8 @@ void TestLatestTargetExecutorIsBoundedAndHolds()
 {
     ExecutorConfig config{};
     config.max_acceleration_rad_s2.fill(1.0F);
+    config.gripper_max_velocity_per_s = 0.2F;
+    config.gripper_max_acceleration_per_s2 = 0.8F;
     config.loop_rate_hz = 200;
     ExternalTargetExecutor executor(config);
 
@@ -344,7 +445,8 @@ void TestLatestTargetExecutorIsBoundedAndHolds()
     assert(first.sequence == 10);
     assert(first.position[0] > 0.0F);
     assert(first.position[0] <= 0.0000251F);
-    assert(std::fabs(first.position[6] - 0.75F) < 1e-6F);
+    assert(first.position[6] > 0.0F);
+    assert(first.position[6] <= 0.0000201F);
 
     // A newer target replaces the old target immediately, while acceleration
     // limiting prevents an instantaneous velocity reversal.
@@ -367,6 +469,8 @@ void TestExecutorRejectsInvalidRuntimeLimits()
 {
     ExecutorConfig config{};
     config.max_acceleration_rad_s2.fill(1.0F);
+    config.gripper_max_velocity_per_s = 0.2F;
+    config.gripper_max_acceleration_per_s2 = 0.8F;
     ExternalTargetExecutor executor(config);
     std::array<float, 7> measured{};
     ExecutorTarget target{};
@@ -455,6 +559,8 @@ int main()
     TestCodecVectors();
     TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap();
     TestMeasuredVelocityUsesOnlyValidMonotonicIntervals();
+    TestCanFeedbackMonitorTracksAgeAndLossWithoutInventingFaultSources();
+    TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();

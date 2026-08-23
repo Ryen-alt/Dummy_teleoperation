@@ -62,6 +62,7 @@ public:
     explicit StepHand(CAN_HandleTypeDef* _hcan, uint8_t _id);
 
     void SetPercent(float _percent);
+    void SetNormalizedPosition(float normalized, float max_velocity_per_s);
     void SetGripCurrent(float _current);
     void DriveWithCurrent(float _direction);
     void HandCalibration();

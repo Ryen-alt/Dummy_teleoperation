@@ -85,6 +85,9 @@ void DummyRobot::Init()
 {
     SetCommandMode(DEFAULT_COMMAND_MODE);
     SetJointSpeed(DEFAULT_JOINT_SPEED);
+    // Motor firmware only updates its temperature measurement when this flag
+    // is enabled. Node 0 broadcasts to the six arm joints and gripper node.
+    motorJ[ALL]->SetEnableTemp(true);
 }
 
 
@@ -118,7 +121,8 @@ void DummyRobot::ApplyExternalUrdfTargetRad(const std::array<float, 7>& target)
         // acceleration. Send its incremental absolute target directly.
         motorJ[index + 1]->SetAngle(target_degrees - initPose.a[index]);
     }
-    hand->SetPercent(target[6] * 100.0F);
+    hand->SetNormalizedPosition(
+        target[6], dummy::generated_config::kGripperVelocityLimitPerS);
 }
 
 
@@ -127,6 +131,17 @@ void DummyRobot::HoldCurrentPosition()
     targetJoints = currentJoints;
     for (int index = 0; index < 6; ++index)
         motorJ[index + 1]->SetAngle(currentJoints.a[index] - initPose.a[index]);
+    if (hand != nullptr)
+    {
+        const float travel = hand->closedAngle - hand->openedAngle;
+        if (fabsf(travel) > 1e-6F)
+        {
+            const float normalized = std::clamp(
+                (hand->angle - hand->openedAngle) / travel, 0.0F, 1.0F);
+            hand->SetNormalizedPosition(
+                normalized, dummy::generated_config::kGripperVelocityLimitPerS);
+        }
+    }
 }
 
 
@@ -413,8 +428,26 @@ void StepHand::SetPercent(float _percent)
     if (_percent < 0.0f)_percent = 0.0f;
     else if (_percent > 100.0f)_percent = 100.0f;
 
-    const float targetAngle = openedAngle + (_percent / 100.0f) * (closedAngle - openedAngle);
-    SetAngleWithVelocityLimit(targetAngle, 65.0f);
+    SetNormalizedPosition(
+        _percent / 100.0F, dummy::generated_config::kGripperVelocityLimitPerS);
+}
+
+
+void StepHand::SetNormalizedPosition(float normalized, float max_velocity_per_s)
+{
+    if (normalized < 0.0F) normalized = 0.0F;
+    else if (normalized > 1.0F) normalized = 1.0F;
+    if (max_velocity_per_s <= 0.0F)
+        return;
+
+    const float travel_degrees = closedAngle - openedAngle;
+    const float target_angle = openedAngle + normalized * travel_degrees;
+    // CtrlStep velocity uses motor revolutions per second. Convert from the
+    // configured normalized gripper travel per second.
+    const float motor_velocity =
+        fabsf(travel_degrees) / 360.0F * static_cast<float>(reduction) *
+        max_velocity_per_s;
+    SetAngleWithVelocityLimit(target_angle, motor_velocity);
 }
 
 

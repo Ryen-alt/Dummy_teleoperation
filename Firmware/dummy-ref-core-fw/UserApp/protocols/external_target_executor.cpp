@@ -33,11 +33,15 @@ ExecutorStep ExternalTargetExecutor::Step(const ExecutorTarget& target, bool mot
     active_ = true;
 
     const float dt = 1.0F / static_cast<float>(config_.loop_rate_hz);
-    for (size_t index = 0; index < 6; ++index)
+    for (size_t index = 0; index < 7; ++index)
     {
         const float error = target.position[index] - commanded_position_[index];
-        const float acceleration = config_.max_acceleration_rad_s2[index];
-        const float velocity_limit = target.max_velocity_rad_s[index];
+        const float acceleration = index < 6
+            ? config_.max_acceleration_rad_s2[index]
+            : config_.gripper_max_acceleration_per_s2;
+        const float velocity_limit = index < 6
+            ? target.max_velocity_rad_s[index]
+            : config_.gripper_max_velocity_per_s;
         if (!std::isfinite(error) || !std::isfinite(acceleration) ||
             !std::isfinite(velocity_limit) || acceleration <= 0.0F || velocity_limit <= 0.0F)
         {
@@ -68,9 +72,6 @@ ExecutorStep ExternalTargetExecutor::Step(const ExecutorTarget& target, bool mot
         }
     }
 
-    // The current protocol has no independent gripper velocity/acceleration
-    // limit. Its mapping stays gated by hardware verification.
-    commanded_position_[6] = target.position[6];
     output.position = commanded_position_;
     output.sequence = target.sequence;
     output.command_valid = true;

@@ -13,14 +13,14 @@ namespace dummy::generated_config
 {
 constexpr char kRobotId[] = "dummy_v2_001";
 constexpr char kRobotCalibrationId[] = "dummy_v2_001-arm-gripper-20260821-v2";
-constexpr uint32_t kConfigVersion = 4U;
+constexpr uint32_t kConfigVersion = 5U;
 constexpr bool kHardwareParametersVerified = true;
 constexpr bool kExternalTargetExecutionReady = true;
 constexpr std::array<uint8_t, 32> kConfigSha256 = {
-    0x3a, 0xc2, 0x0a, 0x54, 0x76, 0xb6, 0x6f, 0x10,
-    0x49, 0x29, 0x32, 0x19, 0xd8, 0x3f, 0x78, 0x7e,
-    0x2a, 0xe5, 0x93, 0x16, 0xd3, 0x40, 0x96, 0x27,
-    0x01, 0xa8, 0x03, 0x7b, 0x5d, 0xa5, 0xef, 0x1f,
+    0x4a, 0x88, 0x66, 0x80, 0x3e, 0x32, 0x28, 0x08,
+    0xe3, 0x5a, 0x6c, 0x2c, 0xaa, 0x33, 0x56, 0x2c,
+    0xd4, 0x38, 0xe3, 0xd3, 0x8f, 0xb8, 0x0b, 0x00,
+    0x63, 0x2e, 0xea, 0x69, 0x5d, 0xd5, 0xd0, 0x40,
 };
 
 constexpr std::array<float, 6> kJointZeroOffsetRad = {0.0F, -1.2740901F, 3.141593F, 0.0F, 0.0F, 0.0F};
@@ -33,6 +33,16 @@ constexpr std::array<float, 6> kMaxVelocityRadS = {0.34999999F, 0.34999999F, 0.3
 constexpr std::array<float, 6> kMaxAccelerationRadS2 = {0.69999999F, 0.69999999F, 0.69999999F, 1.0F, 1.0F, 1.4F};
 constexpr std::array<float, 2> kGripperRange = {0.0F, 1.0F};
 constexpr bool kGripperStateFeedback = true;
+constexpr float kGripperVelocityLimitPerS = 0.2F;
+constexpr float kGripperAccelerationLimitPerS2 = 0.8F;
+constexpr std::array<float, 6> kJointFollowingErrorLimitRad = {0.12F, 0.12F, 0.12F, 0.15000001F, 0.15000001F, 0.18000001F};
+constexpr float kGripperFollowingErrorLimit = 0.15F;
+constexpr uint32_t kFollowingErrorHoldMs = 250U;
+constexpr uint32_t kFeedbackHoldMs = 100U;
+constexpr uint32_t kFeedbackFaultMs = 500U;
+constexpr uint32_t kTemperatureMaxAgeMs = 2500U;
+constexpr float kTemperatureFaultC = 75.0F;
+constexpr uint32_t kTemperatureFaultMs = 1000U;
 constexpr uint32_t kHostControlRateHz = 20U;
 constexpr uint32_t kFirmwareLoopHz = 200U;
 constexpr uint32_t kMaxStateAgeMs = 200U;
@@ -43,6 +53,7 @@ constexpr float kMaxTargetOvershootRad = 0.1F;
 static_assert(kFirmwareLoopHz == 200U, "firmware loop contract changed");
 static_assert(kTargetTtlMs > 0U, "target TTL must be positive");
 static_assert(kLeaseTimeoutMs >= kTargetTtlMs, "lease must not expire before target TTL");
+static_assert(kFeedbackFaultMs > kFeedbackHoldMs, "feedback FAULT must persist beyond HOLD");
 
 } // namespace dummy::generated_config
 

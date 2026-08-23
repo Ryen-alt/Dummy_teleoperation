@@ -118,7 +118,8 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.5");
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.6");
+dummy::protocol::FeedbackSafetyOutput binary_safety_telemetry{};
 dummy::protocol::MonotonicMicros32 binary_monotonic_micros;
 uint64_t binary_last_state_us = 0;
 uint32_t binary_state_sequence = 0;
@@ -165,6 +166,25 @@ void MarkBinaryTargetApplied(uint32_t sequence)
     taskENTER_CRITICAL();
     binary_session.MarkTargetApplied(sequence);
     taskEXIT_CRITICAL();
+}
+
+void ApplyBinarySafetyOutcome(const FeedbackSafetyOutput& safety)
+{
+    taskENTER_CRITICAL();
+    binary_safety_telemetry = safety;
+    if (safety.fault_bits != 0)
+        binary_session.SetFault(safety.fault_bits);
+    else if (safety.hold_reason_bits != 0)
+        binary_session.RequestSafetyHold(safety.hold_reason_bits);
+    taskEXIT_CRITICAL();
+}
+
+FeedbackSafetyOutput ReadBinarySafetyTelemetry()
+{
+    taskENTER_CRITICAL();
+    const FeedbackSafetyOutput output = binary_safety_telemetry;
+    taskEXIT_CRITICAL();
+    return output;
 }
 
 bool BinaryControlLeaseActive()
@@ -216,7 +236,8 @@ void MaybeSendBinaryState(uint64_t now_us)
     uint8_t validity = 0;
     ReadRobotStateForBinaryProtocol(position.data(), velocity.data(), &validity, now_us);
     taskENTER_CRITICAL();
-    const auto state = binary_session.MakeState(position, velocity, validity, now_us);
+    const auto state = binary_session.MakeState(
+        position, velocity, validity, now_us, binary_safety_telemetry);
     taskEXIT_CRITICAL();
     dummy::protocol::Packet packet{};
     packet.header.message_type = static_cast<uint8_t>(dummy::protocol::MessageType::State);

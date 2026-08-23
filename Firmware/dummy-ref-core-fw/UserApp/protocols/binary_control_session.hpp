@@ -2,6 +2,7 @@
 #define DUMMY_BINARY_CONTROL_SESSION_HPP
 
 #include "binary_protocol.hpp"
+#include "feedback_safety_supervisor.hpp"
 
 #include <array>
 #include <cstdint>
@@ -59,11 +60,14 @@ public:
 
     void MarkTargetApplied(uint32_t sequence);
     void SetFault(uint16_t fault_bits);
+    void RequestSafetyHold(uint16_t hold_reason_bits);
     bool ClearFault(bool hardware_safe);
+    uint16_t hold_reason_bits() const { return hold_reason_bits_; }
 
     StatePayload MakeState(const std::array<float, 7>& position,
                            const std::array<float, 7>& velocity,
-                           uint8_t validity, uint64_t now_us) const;
+                           uint8_t validity, uint64_t now_us,
+                           const FeedbackSafetyOutput& safety) const;
 
 private:
     ProcessResult Ack(const Packet& request, ResultCode result = ResultCode::Ok,
@@ -71,7 +75,7 @@ private:
     ProcessResult Hello(const Packet& request);
     bool ValidateSessionAndSequence(const Packet& request, ProcessResult& result);
     ResultCode ValidateTarget(const JointTargetPayload& target) const;
-    void EnterHold();
+    void EnterHold(uint16_t hold_reason_bits);
     void ExtendLease(uint64_t now_us);
 
     SessionConfig config_;
@@ -89,6 +93,7 @@ private:
     uint32_t lease_duration_ms_ = 0;
     uint64_t lease_deadline_us_ = 0;
     uint16_t fault_bits_ = 0;
+    uint16_t hold_reason_bits_ = 0;
 };
 
 } // namespace dummy::protocol

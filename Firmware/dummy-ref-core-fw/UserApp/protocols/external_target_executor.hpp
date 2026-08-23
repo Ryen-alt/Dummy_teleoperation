@@ -10,6 +10,8 @@ namespace dummy::protocol
 struct ExecutorConfig
 {
     std::array<float, 6> max_acceleration_rad_s2{};
+    float gripper_max_velocity_per_s = 0.0F;
+    float gripper_max_acceleration_per_s2 = 0.0F;
     uint32_t loop_rate_hz = 200;
 };
 
@@ -43,12 +45,12 @@ public:
 
     bool active() const { return active_; }
     const std::array<float, 7>& commanded_position() const { return commanded_position_; }
-    const std::array<float, 6>& commanded_velocity() const { return commanded_velocity_; }
+    const std::array<float, 7>& commanded_velocity() const { return commanded_velocity_; }
 
 private:
     ExecutorConfig config_{};
     std::array<float, 7> commanded_position_{};
-    std::array<float, 6> commanded_velocity_{};
+    std::array<float, 7> commanded_velocity_{};
     bool initialized_ = false;
     bool active_ = false;
 };

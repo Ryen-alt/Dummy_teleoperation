@@ -3,6 +3,7 @@
 
 #include "binary_protocol.hpp"
 #include "external_target_executor.hpp"
+#include "feedback_safety_supervisor.hpp"
 
 #include <cstdint>
 
@@ -22,6 +23,8 @@ struct BinaryControlSnapshot
 uint64_t BinaryControlMonotonicMicros();
 BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us);
 void MarkBinaryTargetApplied(uint32_t sequence);
+void ApplyBinarySafetyOutcome(const FeedbackSafetyOutput& safety);
+FeedbackSafetyOutput ReadBinarySafetyTelemetry();
 bool BinaryControlLeaseActive();
 
 } // namespace dummy::protocol
