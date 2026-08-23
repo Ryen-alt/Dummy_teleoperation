@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "communication.hpp"
 #include "dummy_robot.h"
 #include "../../UserApp/protocols/joint_space_mapping.hpp"
