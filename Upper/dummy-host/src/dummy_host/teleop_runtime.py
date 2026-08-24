@@ -248,10 +248,31 @@ def run_teleop_collection(
                     raise TeleopError(
                         "valid joint and gripper feedback are required before teleoperation"
                     )
-                integrator.reset(initial_state)
+                # ACQUIRE_CONTROL, SET_MODE and the first TELEOP STATE are
+                # synchronous communication work, not an operator control
+                # period. Rebase after that work and do not integrate the old
+                # input sample across an arbitrarily long acquisition delay.
+                acquired_ns = clock_ns()
+                integrator.reset(initial_state, now_ns=acquired_ns)
                 recorder.record_event(
-                    "deadman_acquired", monotonic_ns=now_ns, payload={"source": command.source}
+                    "deadman_acquired",
+                    monotonic_ns=acquired_ns,
+                    payload={"source": command.source},
                 )
+                final_state = initial_state
+                frames, camera_error = _cameras_for_state(robot, initial_state)
+                if require_camera and camera_error is not None:
+                    final_state = release_to_hold("camera_invalid", acquired_ns)
+                recorder.record_sample(
+                    command,
+                    initial_state,
+                    camera_frames=frames,
+                    valid=not require_camera or camera_error is None,
+                    invalid_reason=camera_error if require_camera else None,
+                )
+                if require_camera and camera_error is not None:
+                    raise TeleopError(f"required camera observation is invalid: {camera_error}")
+                return
 
             state_before = robot.read_state()
             requested = integrator.step(command, state_before, now_ns)

@@ -17,18 +17,21 @@ FeedbackPollScheduler::FeedbackPollScheduler(uint32_t temperature_slot_interval)
 
 FeedbackPollRequest FeedbackPollScheduler::Next()
 {
+    const uint8_t actuator_node_id = next_actuator_node_;
+    next_actuator_node_ = NextNode(next_actuator_node_);
+
     if (temperature_slot_interval_ != 0U &&
         ++slots_since_temperature_ >= temperature_slot_interval_)
     {
         slots_since_temperature_ = 0;
         const uint8_t node_id = next_temperature_node_;
         next_temperature_node_ = NextNode(next_temperature_node_);
-        return {FeedbackPollKind::Temperature, node_id};
+        return {FeedbackPollKind::Temperature, node_id, actuator_node_id};
     }
 
     const uint8_t node_id = next_position_node_;
     next_position_node_ = NextNode(next_position_node_);
-    return {FeedbackPollKind::Position, node_id};
+    return {FeedbackPollKind::Position, node_id, actuator_node_id};
 }
 
 void FeedbackPollScheduler::Reset()
@@ -36,34 +39,39 @@ void FeedbackPollScheduler::Reset()
     slots_since_temperature_ = 0;
     next_position_node_ = 1;
     next_temperature_node_ = 1;
+    next_actuator_node_ = 1;
 }
 
-ActuatorCommandScheduler::ActuatorCommandScheduler(uint32_t control_tick_divisor)
-    : control_tick_divisor_(control_tick_divisor == 0U ? 1U : control_tick_divisor)
+bool ActuatorApplicationTracker::RecordTransmission(uint32_t sequence, uint8_t node_id,
+                                                    bool transmitted)
 {
-}
-
-bool ActuatorCommandScheduler::ShouldTransmit(bool command_valid)
-{
-    if (!command_valid)
+    if (!sequence_active_ || sequence != sequence_)
     {
-        Reset();
-        return false;
+        sequence_ = sequence;
+        transmitted_nodes_ = 0U;
+        sequence_active_ = true;
+        completion_reported_ = false;
     }
 
-    if (ticks_until_transmit_ == 0U)
+    if (transmitted && node_id >= 1U && node_id <= kActuatorNodeCount)
+        transmitted_nodes_ |= static_cast<uint8_t>(1U << (node_id - 1U));
+
+    constexpr uint8_t kAllActuatorNodes =
+        static_cast<uint8_t>((1U << kActuatorNodeCount) - 1U);
+    if (transmitted_nodes_ == kAllActuatorNodes && !completion_reported_)
     {
-        ticks_until_transmit_ = control_tick_divisor_ - 1U;
+        completion_reported_ = true;
         return true;
     }
-
-    --ticks_until_transmit_;
     return false;
 }
 
-void ActuatorCommandScheduler::Reset()
+void ActuatorApplicationTracker::Reset()
 {
-    ticks_until_transmit_ = 0U;
+    sequence_ = 0U;
+    transmitted_nodes_ = 0U;
+    sequence_active_ = false;
+    completion_reported_ = false;
 }
 
 } // namespace dummy::protocol

@@ -461,11 +461,15 @@ void TestFeedbackPollSchedulerUsesOneRequestPerSlot()
     FeedbackPollScheduler scheduler(kTemperatureSlotInterval);
     std::array<uint32_t, kActuatorNodeCount> position_counts{};
     std::array<uint32_t, kActuatorNodeCount> temperature_counts{};
+    std::array<uint32_t, kActuatorNodeCount> actuator_counts{};
 
     for (uint32_t slot = 0; slot < 700; ++slot)
     {
         const FeedbackPollRequest request = scheduler.Next();
         assert(request.node_id >= 1 && request.node_id <= kActuatorNodeCount);
+        assert(request.actuator_node_id >= 1 &&
+               request.actuator_node_id <= kActuatorNodeCount);
+        ++actuator_counts[request.actuator_node_id - 1U];
         if (request.kind == FeedbackPollKind::Position)
             ++position_counts[request.node_id - 1U];
         else
@@ -476,6 +480,7 @@ void TestFeedbackPollSchedulerUsesOneRequestPerSlot()
     {
         assert(position_counts[index] == 99U);
         assert(temperature_counts[index] == 1U);
+        assert(actuator_counts[index] == 100U);
     }
 
     scheduler.Reset();
@@ -484,23 +489,26 @@ void TestFeedbackPollSchedulerUsesOneRequestPerSlot()
         const FeedbackPollRequest request = scheduler.Next();
         assert(request.kind == FeedbackPollKind::Position);
         assert(request.node_id == expected_node);
+        assert(request.actuator_node_id == expected_node);
     }
 }
 
-void TestActuatorCommandSchedulerIsDeterministicAndResets()
+void TestActuatorApplicationTrackerRequiresEverySuccessfulNode()
 {
-    ActuatorCommandScheduler scheduler(2U);
-    const std::array<bool, 6> expected = {true, false, true, false, true, false};
-    for (const bool should_transmit : expected)
-        assert(scheduler.ShouldTransmit(true) == should_transmit);
+    ActuatorApplicationTracker tracker;
+    for (uint8_t node_id = 1U; node_id <= 6U; ++node_id)
+        assert(!tracker.RecordTransmission(10U, node_id, true));
+    assert(!tracker.RecordTransmission(10U, 7U, false));
+    assert(tracker.RecordTransmission(10U, 7U, true));
+    assert(!tracker.RecordTransmission(10U, 7U, true));
 
-    assert(!scheduler.ShouldTransmit(false));
-    assert(scheduler.ShouldTransmit(true));
-    assert(!scheduler.ShouldTransmit(true));
+    assert(!tracker.RecordTransmission(11U, 7U, true));
+    for (uint8_t node_id = 1U; node_id <= 5U; ++node_id)
+        assert(!tracker.RecordTransmission(11U, node_id, true));
+    assert(tracker.RecordTransmission(11U, 6U, true));
 
-    ActuatorCommandScheduler invalid_divisor(0U);
-    assert(invalid_divisor.ShouldTransmit(true));
-    assert(invalid_divisor.ShouldTransmit(true));
+    tracker.Reset();
+    assert(!tracker.RecordTransmission(11U, 1U, true));
 }
 
 void TestLatestTargetExecutorIsBoundedAndHolds()
@@ -644,7 +652,7 @@ int main()
     TestStateValidityBitsComeFromOneFeedbackSnapshot();
     TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault();
     TestFeedbackPollSchedulerUsesOneRequestPerSlot();
-    TestActuatorCommandSchedulerIsDeterministicAndResets();
+    TestActuatorApplicationTrackerRequiresEverySuccessfulNode();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();

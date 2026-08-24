@@ -86,7 +86,9 @@ def test_keyboard_fake_mcu_collection_closes_in_hold(
         duration_s=0.31,
     )
     recorder_stats = recorder.close()
-    assert result.actions_sent >= 2
+    # Poll 2 performs the synchronous control acquisition and rebases timing;
+    # only polls 3 and 4 may become motion actions.
+    assert result.actions_sent == 2
     assert result.hold_transitions >= 1
     assert result.episode_events == 1
     assert result.final_mode == "HOLD"

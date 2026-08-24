@@ -63,6 +63,7 @@ public:
 
     void SetPercent(float _percent);
     void SetNormalizedPosition(float normalized, float max_velocity_per_s);
+    bool SetStreamingNormalizedPosition(float normalized, float max_velocity_per_s);
     void SetGripCurrent(float _current);
     void DriveWithCurrent(float _direction);
     void HandCalibration();
@@ -91,6 +92,8 @@ public:
     }
 
 private:
+    bool SendNormalizedPosition(float normalized, float max_velocity_per_s,
+                                bool streaming);
     bool isCalibrating = false;
 };
 
@@ -172,7 +175,8 @@ public:
     bool MoveL(float _x, float _y, float _z, float _a, float _b, float _c);
     void MoveJoints(DOF6Kinematic::Joint6D_t _joints);
     // The binary host-facing target is expressed in URDF joint coordinates.
-    void ApplyExternalUrdfTargetRad(const std::array<float, 7>& target);
+    bool ApplyExternalUrdfTargetNodeRad(uint8_t node_id,
+                                       const std::array<float, 7>& target);
     void HoldCurrentPosition();
     void SetJointSpeed(float _speed);
     void SetJointAcceleration(float _acc);

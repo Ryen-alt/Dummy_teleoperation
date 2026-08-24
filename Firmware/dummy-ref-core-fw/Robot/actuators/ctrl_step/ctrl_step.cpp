@@ -108,11 +108,11 @@ void CtrlStepMotor::SetVelocitySetPoint(float _val)
 
 void CtrlStepMotor::SetPositionSetPoint(float _val)
 {
-    SendPositionSetPoint(_val, true);
+    (void) SendPositionSetPoint(_val, true);
 }
 
 
-void CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack)
+bool CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack)
 {
     uint8_t mode = 0x05;
     txHeader.StdId = nodeID << 7 | mode;
@@ -126,11 +126,17 @@ void CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack)
     canBuf[6] = 0U;
     canBuf[7] = 0U;
 
-    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+    return CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
 
 
 void CtrlStepMotor::SetPositionWithVelocityLimit(float _pos, float _vel)
+{
+    (void) SendPositionWithVelocityLimit(_pos, _vel);
+}
+
+
+bool CtrlStepMotor::SendPositionWithVelocityLimit(float _pos, float _vel)
 {
     uint8_t mode = 0x07;
     txHeader.StdId = nodeID << 7 | mode;
@@ -143,7 +149,7 @@ void CtrlStepMotor::SetPositionWithVelocityLimit(float _pos, float _vel)
     for (int i = 4; i < 8; i++)
         canBuf[i] = *(b + i - 4);
 
-    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+    return CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
 
 
@@ -284,11 +290,11 @@ void CtrlStepMotor::SetAngle(float _angle)
 }
 
 
-void CtrlStepMotor::SetStreamingAngle(float _angle)
+bool CtrlStepMotor::SetStreamingAngle(float _angle)
 {
     _angle = inverseDirection ? -_angle : _angle;
     const float stepMotorCnt = _angle / 360.0f * (float) reduction;
-    SendPositionSetPoint(stepMotorCnt, false);
+    return SendPositionSetPoint(stepMotorCnt, false);
 }
 
 
@@ -297,6 +303,14 @@ void CtrlStepMotor::SetAngleWithVelocityLimit(float _angle, float _vel)
     _angle = inverseDirection ? -_angle : _angle;
     float stepMotorCnt = _angle / 360.0f * (float) reduction;
     SetPositionWithVelocityLimit(stepMotorCnt, _vel);
+}
+
+
+bool CtrlStepMotor::SetStreamingAngleWithVelocityLimit(float _angle, float _vel)
+{
+    _angle = inverseDirection ? -_angle : _angle;
+    const float stepMotorCnt = _angle / 360.0f * (float) reduction;
+    return SendPositionWithVelocityLimit(stepMotorCnt, _vel);
 }
 
 

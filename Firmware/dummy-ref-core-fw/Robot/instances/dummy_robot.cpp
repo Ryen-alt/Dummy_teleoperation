@@ -110,22 +110,24 @@ void DummyRobot::MoveJoints(DOF6Kinematic::Joint6D_t _joints)
 }
 
 
-void DummyRobot::ApplyExternalUrdfTargetRad(const std::array<float, 7>& target)
+bool DummyRobot::ApplyExternalUrdfTargetNodeRad(
+    uint8_t node_id, const std::array<float, 7>& target)
 {
     constexpr float kRadiansToDegrees = 57.295779513082320876F;
-    for (int index = 0; index < 6; ++index)
+    if (node_id >= 1U && node_id <= 6U)
     {
+        const size_t index = node_id - 1U;
         const float target_degrees =
             dummy::protocol::UrdfRadiansToLegacyFirmwareRadians(target[index], index) *
             kRadiansToDegrees;
         targetJoints.a[index] = target_degrees;
-        // The 200 Hz executor has already bounded position, velocity and
-        // acceleration. This streaming path intentionally suppresses the
-        // per-target motor ACK; position feedback remains independently polled.
-        motorJ[index + 1]->SetStreamingAngle(target_degrees - initPose.a[index]);
+        return motorJ[node_id]->SetStreamingAngle(
+            target_degrees - initPose.a[index]);
     }
-    hand->SetNormalizedPosition(
-        target[6], dummy::generated_config::kGripperVelocityLimitPerS);
+    if (node_id == 7U && hand != nullptr)
+        return hand->SetStreamingNormalizedPosition(
+            target[6], dummy::generated_config::kGripperVelocityLimitPerS);
+    return false;
 }
 
 
@@ -450,10 +452,24 @@ void StepHand::SetPercent(float _percent)
 
 void StepHand::SetNormalizedPosition(float normalized, float max_velocity_per_s)
 {
+    (void) SendNormalizedPosition(normalized, max_velocity_per_s, false);
+}
+
+
+bool StepHand::SetStreamingNormalizedPosition(float normalized,
+                                              float max_velocity_per_s)
+{
+    return SendNormalizedPosition(normalized, max_velocity_per_s, true);
+}
+
+
+bool StepHand::SendNormalizedPosition(float normalized, float max_velocity_per_s,
+                                      bool streaming)
+{
     if (normalized < 0.0F) normalized = 0.0F;
     else if (normalized > 1.0F) normalized = 1.0F;
     if (max_velocity_per_s <= 0.0F)
-        return;
+        return false;
 
     const float travel_degrees = closedAngle - openedAngle;
     const float target_angle = openedAngle + normalized * travel_degrees;
@@ -462,7 +478,10 @@ void StepHand::SetNormalizedPosition(float normalized, float max_velocity_per_s)
     const float motor_velocity =
         fabsf(travel_degrees) / 360.0F * static_cast<float>(reduction) *
         max_velocity_per_s;
+    if (streaming)
+        return SetStreamingAngleWithVelocityLimit(target_angle, motor_velocity);
     SetAngleWithVelocityLimit(target_angle, motor_velocity);
+    return true;
 }
 
 

@@ -70,15 +70,51 @@ static_assert(kTemperatureSlotInterval > 0U,
 dummy::protocol::FeedbackPollScheduler feedback_poll_scheduler(
     kTemperatureSlotInterval);
 
-constexpr uint32_t kActuatorCommandHz = 100U;
-static_assert(dummy::generated_config::kFirmwareLoopHz % kActuatorCommandHz == 0U,
-              "actuator command rate must divide the control loop rate");
-dummy::protocol::ActuatorCommandScheduler actuator_command_scheduler(
-    dummy::generated_config::kFirmwareLoopHz / kActuatorCommandHz);
-bool actuator_hold_latched = false;
-bool actuator_fault_latched = false;
+enum class ScheduledActuatorMode : uint8_t
+{
+    Idle,
+    Stream,
+    Hold,
+    Fault,
+};
 
-constexpr uint32_t kFeedbackPollStackBytes = 768U;
+struct ScheduledActuatorRequest
+{
+    ScheduledActuatorMode mode = ScheduledActuatorMode::Idle;
+    std::array<float, 7> position{};
+    uint32_t sequence = 0;
+};
+
+ScheduledActuatorRequest scheduled_actuator_request{};
+
+void PublishStreamingActuatorTarget(const std::array<float, 7>& position,
+                                    uint32_t sequence)
+{
+    taskENTER_CRITICAL();
+    scheduled_actuator_request.position = position;
+    scheduled_actuator_request.sequence = sequence;
+    scheduled_actuator_request.mode = ScheduledActuatorMode::Stream;
+    taskEXIT_CRITICAL();
+}
+
+void PublishActuatorMode(ScheduledActuatorMode mode)
+{
+    taskENTER_CRITICAL();
+    scheduled_actuator_request.mode = mode;
+    taskEXIT_CRITICAL();
+}
+
+ScheduledActuatorRequest ReadScheduledActuatorRequest()
+{
+    taskENTER_CRITICAL();
+    const ScheduledActuatorRequest request = scheduled_actuator_request;
+    taskEXIT_CRITICAL();
+    return request;
+}
+
+// This task now owns enable/HOLD/FAULT and per-node target writes in addition
+// to feedback polling, so give it the same reviewed stack budget as control.
+constexpr uint32_t kFeedbackPollStackBytes = 2000U;
 static_assert(kFeedbackPollStackBytes % sizeof(StackType_t) == 0U,
               "feedback task stack must be word aligned");
 StaticTask_t feedback_poll_task_control_block{};
@@ -90,6 +126,10 @@ StackType_t feedback_poll_task_stack[kFeedbackPollStackBytes / sizeof(StackType_
 osThreadId_t controlLoopFixUpdateHandle;
 void ThreadControlLoopFixUpdate(void* argument)
 {
+    // Once the binary safety session has taken ownership, never fall back to
+    // the legacy 200 Hz whole-arm writer after a lease release. That fallback
+    // would silently reintroduce 1,200 command frames/s while the host is idle.
+    bool binary_actuator_owner_latched = false;
     for (;;)
     {
         // Suspended here until got Notification.
@@ -140,6 +180,7 @@ void ThreadControlLoopFixUpdate(void* argument)
 
         if (binary_context_active)
         {
+            binary_actuator_owner_latched = true;
             const bool fault_requested =
                 binary_snapshot.mode == dummy::protocol::ControlMode::Fault ||
                 safety.fault_bits != 0;
@@ -147,46 +188,31 @@ void ThreadControlLoopFixUpdate(void* argument)
 
             if (fault_requested)
             {
-                actuator_command_scheduler.Reset();
-                actuator_hold_latched = false;
-                if (!actuator_fault_latched)
-                    robot.commandHandler.EmergencyStop();
-                actuator_fault_latched = true;
+                PublishActuatorMode(ScheduledActuatorMode::Fault);
+            }
+            else if (hold_requested || !step.command_valid)
+            {
+                // The CAN task owns all binary-mode actuator writes. Keeping
+                // HOLD latched in this mailbox prevents a delayed CAN task from
+                // missing a one-control-tick transition during lease release.
+                PublishActuatorMode(ScheduledActuatorMode::Hold);
             }
             else
             {
-                actuator_fault_latched = false;
-                if (hold_requested)
-                {
-                    actuator_command_scheduler.Reset();
-                    if (!actuator_hold_latched)
-                        robot.HoldCurrentPosition();
-                    actuator_hold_latched = true;
-                }
-                else if (step.command_valid)
-                {
-                    actuator_hold_latched = false;
-                    if (actuator_command_scheduler.ShouldTransmit(true))
-                    {
-                        if (!robot.IsEnabled())
-                            robot.SetEnable(true);
-                        robot.ApplyExternalUrdfTargetRad(step.position);
-                        dummy::protocol::MarkBinaryTargetApplied(step.sequence);
-                    }
-                }
-                else
-                {
-                    actuator_command_scheduler.Reset();
-                }
+                // Latest-value mailbox: the 200 Hz executor may overwrite an
+                // intermediate point before a node's 100 Hz slot. No stale
+                // backlog is ever replayed onto the actuator bus.
+                PublishStreamingActuatorTarget(step.position, step.sequence);
             }
             robot.UpdateJointPose6D();
         }
         else
         {
-            actuator_command_scheduler.Reset();
-            actuator_hold_latched = false;
-            actuator_fault_latched = false;
-            if (robot.IsEnabled())
+            if (binary_actuator_owner_latched)
+            {
+                robot.UpdateJointPose6D();
+            }
+            else if (robot.IsEnabled())
             {
                 // Send control command to Motors & update Joint states
                 switch (robot.commandMode)
@@ -216,12 +242,59 @@ osThreadId_t feedbackPollTaskHandle;
 void ThreadFeedbackPoll(void* argument)
 {
     (void) argument;
+    ScheduledActuatorMode processed_mode = ScheduledActuatorMode::Idle;
+    dummy::protocol::ActuatorApplicationTracker application_tracker;
     for (;;)
     {
         // Clear any accumulated notifications so a delayed task never emits a
         // catch-up burst onto CAN. A missed slot remains visible as feedback age.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         const auto request = feedback_poll_scheduler.Next();
+
+        const ScheduledActuatorRequest scheduled = ReadScheduledActuatorRequest();
+        if (scheduled.mode == ScheduledActuatorMode::Stream)
+        {
+            if (processed_mode != ScheduledActuatorMode::Stream)
+            {
+                application_tracker.Reset();
+                if (!robot.IsEnabled())
+                    robot.SetEnable(true);
+                processed_mode = ScheduledActuatorMode::Stream;
+            }
+
+            // Re-read after a possible enable burst. If the realtime safety
+            // task published HOLD/FAULT meanwhile, skip this stale target and
+            // process the transition in the next (<= 1.43 ms) CAN slot.
+            const ScheduledActuatorRequest latest = ReadScheduledActuatorRequest();
+            if (latest.mode == ScheduledActuatorMode::Stream)
+            {
+                const bool transmitted = robot.ApplyExternalUrdfTargetNodeRad(
+                    request.actuator_node_id, latest.position);
+                if (application_tracker.RecordTransmission(
+                        latest.sequence, request.actuator_node_id, transmitted))
+                    dummy::protocol::MarkBinaryTargetApplied(latest.sequence);
+            }
+            else
+            {
+                application_tracker.Reset();
+            }
+        }
+        else
+        {
+            application_tracker.Reset();
+            if (scheduled.mode != processed_mode)
+            {
+                if (scheduled.mode == ScheduledActuatorMode::Hold)
+                    robot.HoldCurrentPosition();
+                else if (scheduled.mode == ScheduledActuatorMode::Fault)
+                    robot.commandHandler.EmergencyStop();
+                processed_mode = scheduled.mode;
+            }
+        }
+
+        // The target frame above has completed before this request can acquire
+        // the single-flight CAN token. Each slot therefore has deterministic
+        // target-then-feedback ordering without a seven-frame command burst.
         if (request.kind == dummy::protocol::FeedbackPollKind::Position)
             robot.RequestPositionFeedback(request.node_id);
         else
