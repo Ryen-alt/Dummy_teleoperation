@@ -1,5 +1,6 @@
 #include "binary_control_session.hpp"
 #include "binary_protocol.hpp"
+#include "binary_state_bridge.hpp"
 #include "external_target_executor.hpp"
 #include "joint_space_mapping.hpp"
 #include "monotonic_micros.hpp"
@@ -222,6 +223,15 @@ void TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap()
         1, std::numeric_limits<uint32_t>::max() - 499U);
     status = monitor.Snapshot(500U);
     assert(status[0].position_age_ms == 1U);
+}
+
+void TestStateValidityBitsComeFromOneFeedbackSnapshot()
+{
+    assert(PositionFeedbackValidityBits(false, false) == 0U);
+    assert(PositionFeedbackValidityBits(true, false) == kStatePositionValid);
+    assert(PositionFeedbackValidityBits(false, true) == kStateGripperValid);
+    assert(PositionFeedbackValidityBits(true, true) ==
+        (kStatePositionValid | kStateGripperValid));
 }
 
 FeedbackSafetyConfig MakeSafetyConfig()
@@ -615,6 +625,7 @@ int main()
     TestMeasuredVelocityUsesOnlyValidMonotonicIntervals();
     TestCanFeedbackMonitorTracksAgeAndLossWithoutInventingFaultSources();
     TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap();
+    TestStateValidityBitsComeFromOneFeedbackSnapshot();
     TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault();
     TestFeedbackPollSchedulerUsesOneRequestPerSlot();
     TestUrdfJointSpaceMapping();

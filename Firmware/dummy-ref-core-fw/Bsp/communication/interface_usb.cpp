@@ -7,13 +7,11 @@
 #include "protocols/binary_control_session.hpp"
 #include "protocols/binary_control_bridge.hpp"
 #include "protocols/binary_protocol.hpp"
+#include "protocols/binary_state_bridge.hpp"
 #include "protocols/monotonic_micros.hpp"
 #include "configurations/robot_config_generated.hpp"
 
 #include <cstring>
-
-extern "C" void ReadRobotStateForBinaryProtocol(float position[7], float velocity[7],
-                                                  uint8_t* validity, uint64_t now_us);
 
 osThreadId_t usbServerTaskHandle;
 USBStats_t usb_stats_ = {0};
@@ -118,7 +116,7 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.8");
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.9");
 dummy::protocol::FeedbackSafetyOutput binary_safety_telemetry{};
 dummy::protocol::MonotonicMicros32 binary_monotonic_micros;
 uint64_t binary_last_state_us = 0;
@@ -231,13 +229,13 @@ void MaybeSendBinaryState(uint64_t now_us)
         now_us - binary_last_state_us < kStatePeriodUs)
         return;
     binary_last_state_us = now_us;
-    std::array<float, 7> position{};
-    std::array<float, 7> velocity{};
-    uint8_t validity = 0;
-    ReadRobotStateForBinaryProtocol(position.data(), velocity.data(), &validity, now_us);
+    const auto safety = dummy::protocol::ReadBinarySafetyTelemetry();
+    const auto measurement = dummy::protocol::ReadRobotStateForBinaryProtocol(
+        now_us, safety);
     taskENTER_CRITICAL();
     const auto state = binary_session.MakeState(
-        position, velocity, validity, now_us, binary_safety_telemetry);
+        measurement.position, measurement.velocity, measurement.validity,
+        now_us, safety);
     taskEXIT_CRITICAL();
     dummy::protocol::Packet packet{};
     packet.header.message_type = static_cast<uint8_t>(dummy::protocol::MessageType::State);
