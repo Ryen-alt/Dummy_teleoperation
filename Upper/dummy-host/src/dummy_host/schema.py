@@ -80,6 +80,7 @@ class RobotConfig:
     action_semantics: str
     control_rate_hz: int
     firmware_loop_hz: int
+    feedback_poll_hz: int
     joint_zero_offset_rad: np.ndarray
     joint_sign: np.ndarray
     joint_reduction: np.ndarray
@@ -90,6 +91,16 @@ class RobotConfig:
     initial_pose_rad: np.ndarray
     gripper_range: tuple[float, float]
     gripper_state_feedback: bool
+    gripper_velocity_limit_per_s: float
+    gripper_acceleration_limit_per_s2: float
+    joint_following_error_limit_rad: np.ndarray
+    gripper_following_error_limit: float
+    following_error_hold_ms: int
+    feedback_hold_ms: int
+    feedback_fault_ms: int
+    temperature_max_age_ms: int
+    temperature_fault_c: float
+    temperature_fault_ms: int
     max_state_age_ms: int
     target_ttl_ms: int
     lease_timeout_ms: int
@@ -124,6 +135,18 @@ def _positive_int(raw: Mapping[str, Any], key: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ConfigError(f"{key} must be a positive integer")
     return value
+
+
+def _positive_float(raw: Mapping[str, Any], key: str) -> float:
+    value = raw.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not np.isfinite(value)
+        or value <= 0
+    ):
+        raise ConfigError(f"{key} must be a positive finite number")
+    return float(value)
 
 
 def _canonical_hash(raw: Mapping[str, Any]) -> str:
@@ -445,6 +468,19 @@ def load_robot_config(
     if not isinstance(gripper_feedback, bool):
         raise ConfigError("gripper_state_feedback must be boolean")
 
+    following_limits = _array(raw, "joint_following_error_limit_rad", 6)
+    if np.any(following_limits <= 0):
+        raise ConfigError("joint_following_error_limit_rad must be positive")
+    feedback_hold_ms = _positive_int(raw, "feedback_hold_ms")
+    feedback_fault_ms = _positive_int(raw, "feedback_fault_ms")
+    if feedback_fault_ms <= feedback_hold_ms:
+        raise ConfigError("feedback_fault_ms must be greater than feedback_hold_ms")
+    feedback_poll_hz = _positive_int(raw, "feedback_poll_hz")
+    if feedback_poll_hz < len(expected_order) or feedback_poll_hz > 1000:
+        raise ConfigError("feedback_poll_hz must be between 7 and 1000 Hz")
+    if feedback_poll_hz % len(expected_order) != 0:
+        raise ConfigError("feedback_poll_hz must divide evenly across seven nodes")
+
     return RobotConfig(
         robot_id=robot_id,
         config_version=_positive_int(raw, "config_version"),
@@ -456,6 +492,7 @@ def load_robot_config(
         action_semantics="absolute_joint_position",
         control_rate_hz=_positive_int(raw, "control_rate_hz"),
         firmware_loop_hz=_positive_int(raw, "firmware_loop_hz"),
+        feedback_poll_hz=feedback_poll_hz,
         joint_zero_offset_rad=_array(raw, "joint_zero_offset_rad", 6),
         joint_sign=signs,
         joint_reduction=reduction,
@@ -466,6 +503,22 @@ def load_robot_config(
         initial_pose_rad=initial,
         gripper_range=(gripper[0], gripper[1]),
         gripper_state_feedback=gripper_feedback,
+        gripper_velocity_limit_per_s=_positive_float(
+            raw, "gripper_velocity_limit_per_s"
+        ),
+        gripper_acceleration_limit_per_s2=_positive_float(
+            raw, "gripper_acceleration_limit_per_s2"
+        ),
+        joint_following_error_limit_rad=following_limits,
+        gripper_following_error_limit=_positive_float(
+            raw, "gripper_following_error_limit"
+        ),
+        following_error_hold_ms=_positive_int(raw, "following_error_hold_ms"),
+        feedback_hold_ms=feedback_hold_ms,
+        feedback_fault_ms=feedback_fault_ms,
+        temperature_max_age_ms=_positive_int(raw, "temperature_max_age_ms"),
+        temperature_fault_c=_positive_float(raw, "temperature_fault_c"),
+        temperature_fault_ms=_positive_int(raw, "temperature_fault_ms"),
         max_state_age_ms=_positive_int(raw, "max_state_age_ms"),
         target_ttl_ms=_positive_int(raw, "target_ttl_ms"),
         lease_timeout_ms=_positive_int(raw, "lease_timeout_ms"),

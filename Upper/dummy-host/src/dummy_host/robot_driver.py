@@ -301,6 +301,12 @@ class DummyRobot:
                 "last_received_sequence": state.last_received_sequence,
                 "last_applied_sequence": state.last_applied_sequence,
                 "target_age_ms": state.target_age_ms,
+                "hold_reason_bits": state.hold_reason_bits,
+                "telemetry_validity": state.telemetry_validity,
+                "following_error": state.following_error.tolist(),
+                "feedback_age_ms": state.feedback_age_ms.tolist(),
+                "feedback_loss_count": state.feedback_loss_count.tolist(),
+                "node_fault_bits": state.node_fault_bits.tolist(),
             },
         )
 

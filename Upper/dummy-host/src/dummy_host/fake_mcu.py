@@ -12,11 +12,19 @@ from .protocol import (
     MessageType,
     Packet,
     ResultCode,
+    StreamDecoder,
     pack_ack,
     pack_hello_ack,
     pack_state,
     unpack_hello,
     unpack_joint_target,
+)
+from .domain.models import (
+    FaultBits,
+    HoldReasonBits,
+    NodeFaultBits,
+    NodeValidityBits,
+    TelemetryValidityBits,
 )
 from .schema import ControlMode, RobotConfig, RobotState
 from .transport_serial import TransportClosed
@@ -36,14 +44,24 @@ class FakeMcuTransport:
         self.config = config
         self.clock_ns = clock_ns
         self._rx: queue.Queue[Packet] = queue.Queue(128)
+        self._raw_decoder = StreamDecoder()
         self._open = False
         self._lease = False
         self._session = 0
         self._mode = ControlMode.HOLD
+        self._fault_bits = 0
+        self._hold_reason_bits = 0
         self._last_received = 0
         self._last_applied = 0
         self._position = np.concatenate((config.initial_pose_rad, np.asarray([0.0], dtype=np.float32)))
         self._velocity = np.zeros(7, dtype=np.float32)
+        self._feedback_age_ms = np.zeros(7, dtype=np.uint32)
+        self._feedback_loss_count = np.zeros(7, dtype=np.uint32)
+        self._consecutive_feedback_loss = np.zeros(7, dtype=np.uint16)
+        self._node_fault_bits = np.zeros(7, dtype=np.uint16)
+        self._node_validity = np.full(
+            7, int(NodeValidityBits.POSITION), dtype=np.uint8
+        )
         self._lease_duration_ms = 0
         self._lease_deadline_ns: int | None = None
         self._target_deadline_ns: int | None = None
@@ -56,6 +74,29 @@ class FakeMcuTransport:
     def close(self) -> None:
         self._open = False
         self._next_state_ns = None
+
+    def inject_feedback_interruption(self, *, severe: bool = False, node: int = 1) -> None:
+        """Deterministically expose the firmware HOLD/FAULT telemetry contract."""
+        if not 1 <= node <= 7:
+            raise ValueError("node must be in 1..7")
+        index = node - 1
+        age = self.config.feedback_fault_ms if severe else self.config.feedback_hold_ms
+        self._feedback_age_ms[index] = age
+        self._feedback_loss_count[index] += 1
+        self._consecutive_feedback_loss[index] += 1
+        self._node_fault_bits[index] |= int(NodeFaultBits.FEEDBACK_STALE)
+        self._node_validity[index] = int(self._node_validity[index]) & (
+            0xFF ^ int(NodeValidityBits.POSITION)
+        )
+        self._mode = ControlMode.FAULT if severe else ControlMode.HOLD
+        self._hold_reason_bits |= int(HoldReasonBits.FEEDBACK_STALE)
+        if severe:
+            self._fault_bits |= int(FaultBits.FEEDBACK_LOST)
+            self._lease = False
+            self._lease_deadline_ns = None
+            self._target_deadline_ns = None
+        if self._open:
+            self._emit_state(self._last_received)
 
     def receive(self, timeout: float | None = None) -> Packet | None:
         if not self._open:
@@ -92,12 +133,13 @@ class FakeMcuTransport:
                 self._response(
                     packet,
                     MessageType.HELLO_ACK,
-                    pack_hello_ack(self.config.config_hash_bytes, 0, "fake-mcu-v1"),
+                    pack_hello_ack(self.config.config_hash_bytes, 0, "fake-mcu-v2"),
                 )
             )
             return
         if packet.message_type == MessageType.ESTOP:
             self._mode = ControlMode.FAULT
+            self._fault_bits |= int(FaultBits.EMERGENCY_STOP)
             self._lease = False
             self._lease_deadline_ns = None
             self._target_deadline_ns = None
@@ -106,6 +148,7 @@ class FakeMcuTransport:
             return
         if packet.message_type == MessageType.HOLD:
             self._mode = ControlMode.HOLD
+            self._hold_reason_bits |= int(HoldReasonBits.OPERATOR)
             self._target_deadline_ns = None
             self._ack(packet)
             self._emit_state(packet.sequence)
@@ -121,6 +164,7 @@ class FakeMcuTransport:
             self._lease = True
             self._session = packet.session_id
             self._lease_duration_ms = lease_ms
+            self._hold_reason_bits = 0
             self._extend_lease()
             self._ack(packet)
             self._emit_state(packet.sequence)
@@ -141,6 +185,11 @@ class FakeMcuTransport:
                 self._nack(packet, ResultCode.BAD_MODE)
                 return
             self._mode = requested_mode
+            self._hold_reason_bits = (
+                int(HoldReasonBits.OPERATOR)
+                if requested_mode == ControlMode.HOLD
+                else 0
+            )
             self._target_deadline_ns = None
             self._extend_lease()
             self._ack(packet)
@@ -176,6 +225,7 @@ class FakeMcuTransport:
                 return
             self._last_received = packet.sequence
             self._last_applied = packet.sequence
+            self._hold_reason_bits = 0
             self._velocity = (action - self._position) * self.config.control_rate_hz
             self._position = action
             self._target_deadline_ns = self.clock_ns() + valid_for_ms * 1_000_000
@@ -189,12 +239,29 @@ class FakeMcuTransport:
             return
         if packet.message_type == MessageType.RELEASE_CONTROL:
             self._mode = ControlMode.HOLD
+            self._hold_reason_bits |= int(HoldReasonBits.OPERATOR)
             self._lease = False
             self._lease_deadline_ns = None
             self._target_deadline_ns = None
             self._ack(packet)
             return
         self._nack(packet, ResultCode.UNSUPPORTED)
+
+    def send_raw_frame_for_fault_injection(self, frame: bytes) -> int:
+        """Pass one bounded wire frame through the Fake MCU receive boundary.
+
+        The normal host path remains packet based. This deliberately narrow entry
+        point exists only so the gated fault tool can prove that malformed wire
+        frames are discarded before they reach the command dispatcher.
+        """
+        if not self._open:
+            raise TransportClosed("fake MCU is closed")
+        if not frame or not frame.endswith(b"\x00") or len(frame) > 600:
+            raise ValueError("fault-injection frame must be bounded and zero-delimited")
+        dropped_before = self._raw_decoder.dropped_frames
+        for packet in self._raw_decoder.feed(frame):
+            self.send(packet)
+        return self._raw_decoder.dropped_frames - dropped_before
 
     def _response(self, request: Packet, message_type: MessageType, payload: bytes) -> Packet:
         return Packet(message_type, request.session_id, request.sequence, self.clock_ns() // 1_000, payload)
@@ -214,7 +281,7 @@ class FakeMcuTransport:
             monotonic_ns=now_ns,
             mcu_time_us=now_ns // 1_000,
             mode=self._mode,
-            fault_bits=1 if self._mode == ControlMode.FAULT else 0,
+            fault_bits=self._fault_bits,
             position_valid=True,
             velocity_valid=True,
             gripper_valid=self.config.gripper_state_feedback,
@@ -228,6 +295,18 @@ class FakeMcuTransport:
                 - int((self._target_deadline_ns - now_ns) / 1e6),
             ),
             config_hash=self.config.config_hash,
+            following_error=np.zeros(7, dtype=np.float32),
+            following_error_duration_ms=np.zeros(7, dtype=np.uint32),
+            feedback_age_ms=self._feedback_age_ms.copy(),
+            feedback_loss_count=self._feedback_loss_count.copy(),
+            consecutive_feedback_loss=self._consecutive_feedback_loss.copy(),
+            node_fault_bits=self._node_fault_bits.copy(),
+            node_validity=self._node_validity.copy(),
+            hold_reason_bits=self._hold_reason_bits,
+            telemetry_validity=int(
+                TelemetryValidityBits.FOLLOWING_ERROR
+                | TelemetryValidityBits.CAN_FEEDBACK
+            ),
         )
         self._rx.put(
             Packet(
@@ -264,9 +343,11 @@ class FakeMcuTransport:
             self._lease_deadline_ns = None
             self._target_deadline_ns = None
             self._mode = ControlMode.HOLD
+            self._hold_reason_bits |= int(HoldReasonBits.LEASE_TIMEOUT)
             self._emit_state(self._last_received)
             return
         if self._target_deadline_ns is not None and now_ns >= self._target_deadline_ns:
             self._target_deadline_ns = None
             self._mode = ControlMode.HOLD
+            self._hold_reason_bits |= int(HoldReasonBits.TARGET_TIMEOUT)
             self._emit_state(self._last_received)

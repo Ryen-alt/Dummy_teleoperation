@@ -93,20 +93,23 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
     assert stats.camera_frames == 2
     with sqlite3.connect(recorder.db_path) as connection:
         row = connection.execute(
-            "SELECT COUNT(*), action_sequence, length(applied_action), last_applied_sequence "
+            "SELECT COUNT(*), action_sequence, length(applied_action), last_applied_sequence, "
+            "length(state_following_error), length(feedback_age_ms), "
+            "length(node_fault_bits), state_hold_reason_bits "
             "FROM samples"
         ).fetchone()
         camera_rows = connection.execute(
             "SELECT role, COUNT(*), COUNT(DISTINCT frame_path) "
             "FROM camera_samples GROUP BY role ORDER BY role"
         ).fetchall()
-    assert row == (2, 7, 28, 7)
+    assert row == (2, 7, 28, 7, 28, 28, 14, 0)
     assert camera_rows == [("global", 2, 1), ("wrist", 2, 1)]
     manifest = json.loads(recorder.manifest_path.read_text(encoding="utf-8"))
     assert manifest["clean_shutdown"] is True
     assert manifest["firmware_version"] == "fake-mcu-v1"
     assert manifest["robot_config_hash"] == config.config_hash
     assert manifest["schema_version"] == 2
+    assert manifest["state_telemetry_version"] == 2
     assert manifest["camera_rig_hash"] == config.camera_rig.config_hash
     frame_files = list((recorder.session_dir / "frames").rglob("*.npz"))
     assert len(frame_files) == 2

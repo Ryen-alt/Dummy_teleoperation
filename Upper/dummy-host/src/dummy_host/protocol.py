@@ -9,7 +9,7 @@ import numpy as np
 from .schema import ControlMode, RobotState
 
 MAGIC = 0x4459
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_DECODED_FRAME = 512
 HEADER = struct.Struct("<HBBHHIIQ")
 CRC = struct.Struct("<I")
@@ -19,7 +19,7 @@ ACQUIRE_CONTROL = struct.Struct("<I")
 SET_MODE = struct.Struct("<B")
 JOINT_TARGET = struct.Struct("<7f6fHH")
 ACK = struct.Struct("<BBH")
-STATE = struct.Struct("<Q7f7fIIBBHI32s")
+STATE = struct.Struct("<Q7f7fIIBBHI32s7f7I7I7I7H7H7BBHH")
 
 
 class ProtocolError(ValueError):
@@ -283,6 +283,16 @@ def pack_state(state: RobotState) -> bytes:
         state.fault_bits,
         state.target_age_ms,
         hash_bytes,
+        *state.following_error.astype(np.float32),
+        *(int(value) for value in state.following_error_duration_ms),
+        *(int(value) for value in state.feedback_age_ms),
+        *(int(value) for value in state.feedback_loss_count),
+        *(int(value) for value in state.consecutive_feedback_loss),
+        *(int(value) for value in state.node_fault_bits),
+        *(int(value) for value in state.node_validity),
+        0,
+        state.hold_reason_bits,
+        state.telemetry_validity,
     )
 
 
@@ -292,7 +302,12 @@ def unpack_state(payload: bytes, monotonic_ns: int) -> RobotState:
     values = STATE.unpack(payload)
     position = np.asarray(values[1:8], dtype=np.float32)
     velocity = np.asarray(values[8:15], dtype=np.float32)
-    if not np.isfinite(position).all() or not np.isfinite(velocity).all():
+    following_error = np.asarray(values[22:29], dtype=np.float32)
+    if (
+        not np.isfinite(position).all()
+        or not np.isfinite(velocity).all()
+        or not np.isfinite(following_error).all()
+    ):
         raise ProtocolError("STATE contains NaN or Inf")
     validity = values[18]
     try:
@@ -313,6 +328,15 @@ def unpack_state(payload: bytes, monotonic_ns: int) -> RobotState:
         last_applied_sequence=values[16],
         target_age_ms=values[20],
         config_hash=values[21].hex(),
+        following_error=following_error,
+        following_error_duration_ms=np.asarray(values[29:36], dtype=np.uint32),
+        feedback_age_ms=np.asarray(values[36:43], dtype=np.uint32),
+        feedback_loss_count=np.asarray(values[43:50], dtype=np.uint32),
+        consecutive_feedback_loss=np.asarray(values[50:57], dtype=np.uint16),
+        node_fault_bits=np.asarray(values[57:64], dtype=np.uint16),
+        node_validity=np.asarray(values[64:71], dtype=np.uint8),
+        hold_reason_bits=values[72],
+        telemetry_validity=values[73],
     )
 
 

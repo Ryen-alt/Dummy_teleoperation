@@ -242,11 +242,24 @@ def run_real_bringup(
                     "last_applied_sequence": final_state.last_applied_sequence,
                     "state_position": final_state.position.tolist(),
                     "state_velocity": final_state.velocity.tolist(),
+                    "following_error": final_state.following_error.tolist(),
+                    "following_error_duration_ms": (
+                        final_state.following_error_duration_ms.tolist()
+                    ),
+                    "feedback_age_ms": final_state.feedback_age_ms.tolist(),
+                    "feedback_loss_count": final_state.feedback_loss_count.tolist(),
+                    "consecutive_feedback_loss": (
+                        final_state.consecutive_feedback_loss.tolist()
+                    ),
+                    "node_fault_bits": final_state.node_fault_bits.tolist(),
+                    "node_validity": final_state.node_validity.tolist(),
                     "position_valid": final_state.position_valid,
                     "velocity_valid": final_state.velocity_valid,
                     "gripper_valid": final_state.gripper_valid,
                     "state_age_ms": (time.monotonic_ns() - state_before.monotonic_ns) / 1e6,
                     "fault_bits": final_state.fault_bits,
+                    "hold_reason_bits": final_state.hold_reason_bits,
+                    "telemetry_validity": final_state.telemetry_validity,
                     "mode": final_state.mode.name,
                     "firmware_version": robot.firmware_version,
                     "reasons": list(applied.reasons),

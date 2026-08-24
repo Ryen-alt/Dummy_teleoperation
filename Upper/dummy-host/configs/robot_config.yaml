@@ -1,5 +1,5 @@
 robot_id: dummy_v2_001
-config_version: 4
+config_version: 6
 # Operator-confirmed arm/gripper calibration baseline. Changing a robot-safety
 # value changes the robot hash and requires regenerating/reflashing firmware.
 # Camera fields have their own rig hash and may be overridden by --camera-rig.
@@ -12,6 +12,10 @@ joint_unit: rad
 action_semantics: absolute_joint_position
 control_rate_hz: 20
 firmware_loop_hz: 200
+# Dedicated time-slotted CAN feedback scheduler. One unicast request is issued
+# per slot; seven temperature slots per second leave 693 position polls/s,
+# exactly 99 Hz per arm/gripper node without broadcast response bursts.
+feedback_poll_hz: 700
 
 # 以下值已经过逐关节真机复核，并由上面的 calibration ID 冻结。
 # 2026-08-21 操作者真机复测确认 J1～J6 的正确减速比均为 50。
@@ -32,6 +36,21 @@ initial_pose_rad: [0.0, 0.052359878, 0.0, 0.0, 0.0, 0.0]
 
 gripper_range: [0.0, 1.0]
 gripper_state_feedback: true
+# 夹爪使用归一化行程单位；固件 200 Hz 执行器独立限速/限加速度。
+gripper_velocity_limit_per_s: 0.20
+gripper_acceleration_limit_per_s2: 0.80
+
+# 步骤 8 反馈安全监督器。前六项单位为 rad，夹爪阈值为归一化行程。
+# 一般跟随超差或短时反馈陈旧进入 HOLD；反馈持续丢失和过温进入锁存 FAULT。
+joint_following_error_limit_rad: [0.12, 0.12, 0.12, 0.15, 0.15, 0.18]
+gripper_following_error_limit: 0.15
+following_error_hold_ms: 250
+feedback_hold_ms: 100
+feedback_fault_ms: 500
+temperature_max_age_ms: 2500
+temperature_fault_c: 75.0
+temperature_fault_ms: 1000
+
 max_state_age_ms: 200
 target_ttl_ms: 100
 lease_timeout_ms: 500

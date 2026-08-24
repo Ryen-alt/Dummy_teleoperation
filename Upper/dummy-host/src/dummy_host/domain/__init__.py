@@ -7,9 +7,14 @@ from .models import (
     ActionSpace,
     AppliedAction,
     ControlMode,
+    FaultBits,
+    HoldReasonBits,
+    NodeFaultBits,
+    NodeValidityBits,
     ObservationBundle,
     RobotHealth,
     RobotState,
+    TelemetryValidityBits,
 )
 
 __all__ = [
@@ -17,12 +22,17 @@ __all__ = [
     "ActionSpace",
     "AppliedAction",
     "ControlMode",
+    "FaultBits",
+    "HoldReasonBits",
     "EpisodeError",
     "EpisodeManager",
     "EpisodeSnapshot",
     "EpisodeStatus",
     "ObservationBundle",
+    "NodeFaultBits",
+    "NodeValidityBits",
     "RobotBackend",
     "RobotHealth",
     "RobotState",
+    "TelemetryValidityBits",
 ]

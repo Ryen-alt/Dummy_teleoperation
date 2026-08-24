@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import IntEnum, StrEnum
+from enum import IntEnum
 from types import MappingProxyType
 from typing import Mapping
 
 import numpy as np
+
+from .._compat import StrEnum
 
 
 class ControlMode(IntEnum):
@@ -15,6 +17,47 @@ class ControlMode(IntEnum):
     POLICY = 4
     GRAVITY = 5
     FAULT = 6
+
+
+class HoldReasonBits(IntEnum):
+    TARGET_TIMEOUT = 1 << 0
+    LEASE_TIMEOUT = 1 << 1
+    FOLLOWING_ERROR = 1 << 2
+    FEEDBACK_STALE = 1 << 3
+    OPERATOR = 1 << 4
+    RUNTIME_LIMIT = 1 << 5
+
+
+class FaultBits(IntEnum):
+    EMERGENCY_STOP = 1 << 0
+    FEEDBACK_LOST = 1 << 1
+    OVER_TEMPERATURE = 1 << 2
+    ENCODER = 1 << 3
+    STALL = 1 << 4
+    OVER_CURRENT = 1 << 5
+
+
+class TelemetryValidityBits(IntEnum):
+    FOLLOWING_ERROR = 1 << 0
+    CAN_FEEDBACK = 1 << 1
+    TEMPERATURE = 1 << 2
+
+
+class NodeFaultBits(IntEnum):
+    FEEDBACK_STALE = 1 << 0
+    FOLLOWING_ERROR = 1 << 1
+    OVER_TEMPERATURE = 1 << 2
+    ENCODER = 1 << 3
+    STALL = 1 << 4
+    OVER_CURRENT = 1 << 5
+
+
+class NodeValidityBits(IntEnum):
+    POSITION = 1 << 0
+    TEMPERATURE = 1 << 1
+    ENCODER_FAULT_SOURCE = 1 << 2
+    STALL_SOURCE = 1 << 3
+    CURRENT_SOURCE = 1 << 4
 
 
 class ActionSpace(StrEnum):
@@ -53,10 +96,44 @@ class RobotState:
     last_applied_sequence: int
     target_age_ms: int
     config_hash: str
+    following_error: np.ndarray = field(
+        default_factory=lambda: np.zeros(7, dtype=np.float32)
+    )
+    following_error_duration_ms: np.ndarray = field(
+        default_factory=lambda: np.zeros(7, dtype=np.uint32)
+    )
+    feedback_age_ms: np.ndarray = field(
+        default_factory=lambda: np.full(7, np.iinfo(np.uint32).max, dtype=np.uint32)
+    )
+    feedback_loss_count: np.ndarray = field(
+        default_factory=lambda: np.zeros(7, dtype=np.uint32)
+    )
+    consecutive_feedback_loss: np.ndarray = field(
+        default_factory=lambda: np.zeros(7, dtype=np.uint16)
+    )
+    node_fault_bits: np.ndarray = field(
+        default_factory=lambda: np.zeros(7, dtype=np.uint16)
+    )
+    node_validity: np.ndarray = field(
+        default_factory=lambda: np.zeros(7, dtype=np.uint8)
+    )
+    hold_reason_bits: int = 0
+    telemetry_validity: int = 0
 
     def __post_init__(self) -> None:
         position = _frozen_array(self.position, shape=(7,), name="robot position")
         velocity = _frozen_array(self.velocity, shape=(7,), name="robot velocity")
+        following_error = _frozen_array(
+            self.following_error, shape=(7,), name="following error"
+        )
+        integer_fields = (
+            ("following_error_duration_ms", self.following_error_duration_ms, np.uint32),
+            ("feedback_age_ms", self.feedback_age_ms, np.uint32),
+            ("feedback_loss_count", self.feedback_loss_count, np.uint32),
+            ("consecutive_feedback_loss", self.consecutive_feedback_loss, np.uint16),
+            ("node_fault_bits", self.node_fault_bits, np.uint16),
+            ("node_validity", self.node_validity, np.uint8),
+        )
         if (
             self.monotonic_ns < 0
             or self.mcu_time_us < 0
@@ -64,6 +141,8 @@ class RobotState:
             or self.last_received_sequence < 0
             or self.last_applied_sequence < 0
             or self.target_age_ms < 0
+            or self.hold_reason_bits < 0
+            or self.telemetry_validity < 0
         ):
             raise ValueError("robot timestamps, faults, sequences and ages must be non-negative")
         try:
@@ -74,6 +153,14 @@ class RobotState:
             raise ValueError("robot config_hash must contain 32 bytes")
         object.__setattr__(self, "position", position)
         object.__setattr__(self, "velocity", velocity)
+        object.__setattr__(self, "following_error", following_error)
+        for name, value, dtype in integer_fields:
+            array = np.asarray(value)
+            if array.shape != (7,) or array.dtype != dtype:
+                raise ValueError(f"{name} must have shape (7,) and dtype {dtype}")
+            frozen = array.copy()
+            frozen.flags.writeable = False
+            object.__setattr__(self, name, frozen)
 
 
 @dataclass(frozen=True)

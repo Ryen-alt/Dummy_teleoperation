@@ -9,6 +9,7 @@ from dummy_host.fake_mcu import FakeMcuTransport
 from dummy_host.protocol import MessageType, Packet, pack_hello
 from dummy_host.robot_driver import DummyRobot, RobotError
 from dummy_host.schema import ControlMode
+from dummy_host.domain.models import FaultBits, HoldReasonBits
 
 
 class DropFirstHelloTransport(FakeMcuTransport):
@@ -34,7 +35,7 @@ class HelloAckWithoutStateTransport(FakeMcuTransport):
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
     robot = DummyRobot(config, FakeMcuTransport(config))
     with robot:
-        assert robot.firmware_version == "fake-mcu-v1"
+        assert robot.firmware_version == "fake-mcu-v2"
         robot.acquire_control(ControlMode.TELEOP)
         deadline = time.monotonic() + 0.5
         while robot.read_state().mode != ControlMode.TELEOP and time.monotonic() < deadline:
@@ -120,3 +121,29 @@ def test_fake_mcu_emits_periodic_state_while_idle(config) -> None:
     assert state.message_type == MessageType.STATE
     assert state.session_id == 7
 
+
+def test_fake_mcu_feedback_interruption_is_visible_to_host(config) -> None:
+    transport = FakeMcuTransport(config)
+    robot = DummyRobot(config, transport)
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        transport.inject_feedback_interruption(severe=False, node=4)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            state = robot.read_state()
+            if state.hold_reason_bits & int(HoldReasonBits.FEEDBACK_STALE):
+                break
+            time.sleep(0.005)
+        assert state.mode == ControlMode.HOLD
+        assert state.feedback_loss_count[3] == 1
+        assert state.node_fault_bits[3] != 0
+
+        transport.inject_feedback_interruption(severe=True, node=4)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            state = robot.read_state()
+            if state.fault_bits & int(FaultBits.FEEDBACK_LOST):
+                break
+            time.sleep(0.005)
+        assert state.mode == ControlMode.FAULT
+        assert state.fault_bits & int(FaultBits.FEEDBACK_LOST)

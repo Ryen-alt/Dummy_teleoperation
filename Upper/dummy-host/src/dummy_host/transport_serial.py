@@ -119,6 +119,17 @@ class SerialTransport:
         except queue.Full as exc:
             raise TransportError("serial write queue is full; refusing stale command buildup") from exc
 
+    def send_raw_frame_for_fault_injection(self, frame: bytes) -> None:
+        """Queue one pre-encoded frame for the explicitly gated fault tool only."""
+        if self._serial is None or self._stop.is_set():
+            raise TransportClosed("serial transport is not open")
+        if not frame or not frame.endswith(b"\x00") or len(frame) > 600:
+            raise ValueError("fault-injection frame must be bounded and zero-delimited")
+        try:
+            self._tx.put_nowait(bytes(frame))
+        except queue.Full as exc:
+            raise TransportError("serial write queue is full") from exc
+
     def receive(self, timeout: float | None = None) -> Packet | None:
         try:
             item = self._rx.get(timeout=timeout)

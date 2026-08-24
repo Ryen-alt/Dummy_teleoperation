@@ -19,11 +19,42 @@ def test_config_is_deterministic_and_calibrated(config) -> None:
     assert len(config.config_hash) == 64
     assert tuple(config.cameras) == ("wrist",)
     assert config.cameras["wrist"].model == "D435"
-    assert config.config_version == 4
+    assert config.config_version == 6
+    assert config.feedback_poll_hz == 700
+    assert config.feedback_fault_ms > config.feedback_hold_ms
+    assert config.gripper_velocity_limit_per_s == 0.2
     assert config.robot_calibration_id == "dummy_v2_001-arm-gripper-20260821-v2"
     assert config.joint_reduction.tolist() == [50.0] * 6
     assert config.hardware_parameters_verified
     assert config.external_target_execution_ready
+
+
+def test_feedback_poll_rate_outside_reviewed_range_is_rejected(tmp_path) -> None:
+    source = Path(__file__).parents[1] / "configs" / "robot_config.yaml"
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    raw["feedback_poll_hz"] = 1001
+    bad = tmp_path / "bad-feedback-rate.yaml"
+    bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    try:
+        load_robot_config(bad)
+    except ConfigError as exc:
+        assert "feedback_poll_hz" in str(exc)
+    else:
+        raise AssertionError("unsafe feedback polling rate was accepted")
+
+
+def test_feedback_poll_rate_must_divide_evenly_across_nodes(tmp_path) -> None:
+    source = Path(__file__).parents[1] / "configs" / "robot_config.yaml"
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    raw["feedback_poll_hz"] = 699
+    bad = tmp_path / "uneven-feedback-rate.yaml"
+    bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    try:
+        load_robot_config(bad)
+    except ConfigError as exc:
+        assert "divide evenly" in str(exc)
+    else:
+        raise AssertionError("uneven feedback polling rate was accepted")
 
 
 def test_wrong_joint_order_is_rejected(tmp_path, config) -> None:

@@ -18,7 +18,12 @@ from dummy_host.protocol import (
     encode_packet,
     pack_joint_target,
     unpack_joint_target,
+    pack_state,
+    unpack_state,
+    PROTOCOL_VERSION,
+    STATE,
 )
+from dummy_host.schema import ControlMode, RobotState
 
 
 def test_crc32c_standard_vector() -> None:
@@ -61,6 +66,8 @@ def test_joint_target_payload() -> None:
 
 def test_shared_wire_vectors() -> None:
     vectors = json.loads((Path(__file__).parents[1] / "protocol_vectors.json").read_text())
+    assert vectors["protocol_version"] == PROTOCOL_VERSION
+    assert vectors["decoded_sizes"]["state_payload"] == STATE.size
     hello = vectors["vectors"][0]
     config_hash = bytes.fromhex(vectors["config_hash"])
     from dummy_host.protocol import pack_hello
@@ -88,3 +95,36 @@ def test_shared_wire_vectors() -> None:
         ),
     )
     assert encode_packet(packet).hex() == target["wire_hex"]
+
+
+def test_state_v2_safety_telemetry_round_trip(config) -> None:
+    state = RobotState(
+        position=np.arange(7, dtype=np.float32) / 10,
+        velocity=np.arange(7, dtype=np.float32) / 100,
+        monotonic_ns=123_000,
+        mcu_time_us=123,
+        mode=ControlMode.HOLD,
+        fault_bits=2,
+        position_valid=True,
+        velocity_valid=True,
+        gripper_valid=True,
+        last_received_sequence=7,
+        last_applied_sequence=6,
+        target_age_ms=12,
+        config_hash=config.config_hash,
+        following_error=np.arange(7, dtype=np.float32) / 1000,
+        following_error_duration_ms=np.arange(7, dtype=np.uint32),
+        feedback_age_ms=np.arange(7, dtype=np.uint32) + 10,
+        feedback_loss_count=np.arange(7, dtype=np.uint32) + 20,
+        consecutive_feedback_loss=np.arange(7, dtype=np.uint16),
+        node_fault_bits=np.arange(7, dtype=np.uint16),
+        node_validity=np.ones(7, dtype=np.uint8),
+        hold_reason_bits=8,
+        telemetry_validity=7,
+    )
+    restored = unpack_state(pack_state(state), state.monotonic_ns)
+    np.testing.assert_array_equal(restored.following_error, state.following_error)
+    np.testing.assert_array_equal(restored.feedback_age_ms, state.feedback_age_ms)
+    np.testing.assert_array_equal(restored.node_fault_bits, state.node_fault_bits)
+    assert restored.hold_reason_bits == 8
+    assert restored.telemetry_validity == 7
