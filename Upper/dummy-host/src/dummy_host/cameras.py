@@ -804,6 +804,7 @@ class CameraManager:
         rig: CameraRigConfig,
         *,
         factories: Mapping[str, Callable[[CameraConfig], Camera]] | None = None,
+        roles: set[str] | None = None,
     ) -> "CameraManager":
         builders: dict[str, Callable[[CameraConfig], Camera]] = {
             "realsense": D435Camera,
@@ -815,12 +816,20 @@ class CameraManager:
             builders.update(factories)
         cameras: dict[str, Camera] = {}
         for role, config in rig.cameras.items():
+            if roles is not None and role not in roles:
+                continue
             if not config.enabled:
                 continue
             builder = builders.get(config.driver)
             if builder is None:
                 raise CameraError(f"no camera factory registered for driver {config.driver!r}")
             cameras[role] = builder(config)
+        if roles is not None:
+            missing = roles - cameras.keys()
+            if missing:
+                raise CameraError(
+                    f"requested camera role(s) are not enabled/configured: {sorted(missing)}"
+                )
         return cls(cameras)
 
     @property

@@ -1,0 +1,287 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<robot name="dummy_robot">
+  <!--
+    Geometry is expressed in metres.  The zero-position joint axes encode the
+    following dimensions (derived from the supplied CAD assembly):
+      L_BASE=0.15475, D_BASE=0.035, L_ARM=0.146005,
+      D_ELBOW=0.051998, L_FOREARM=0.115455, L_WRIST=0.098993.
+    Visual meshes keep the original assembly coordinate system; their origins
+    rebase them into the corresponding link frames.
+  -->
+  <material name="gray">
+    <color rgba="0.3 0.3 0.3 1.0"/>
+  </material>
+  <material name="white">
+    <color rgba="0.75 0.75 0.75 1.0"/>
+  </material>
+  <material name="deepgray">
+    <color rgba="0.15 0.15 0.15 1"/>
+  </material>
+  <material name="black">
+    <color rgba="0.08 0.08 0.08 1"/>
+  </material>
+  <material name="red">
+    <color rgba="0.4 0 0 1.0"/>
+  </material>
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="gray"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </visual>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/light.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="red"/>
+      <origin xyz="0 -0.001 0" rpy="0 0 0"/>
+    </visual>
+    <collision name="base_body_collision">
+      <geometry>
+        <mesh filename="dummy_stl_low/Base.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </collision>
+    <collision name="baseboard_collision">
+      <geometry>
+        <mesh filename="dummy_stl_low/baseboard.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="0.000011 -0.015221 0.042123" rpy="0 0 0"/>
+      <mass value="3.091929"/>
+      <inertia ixx="0.01097" ixy="-0.000001" ixz="0.00026" iyy="0.01064" iyz="-0.001431" izz="0.0124"/>
+    </inertial>
+  </link>
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/>
+    <child link="J1"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.967059728" upper="2.967059728" effort="50.0" velocity="1.0"/>
+  </joint>
+  <link name="J1">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="white"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="dummy_stl_low/J1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="-0.009794 -0.010032 0.133407" rpy="0 0 0"/>
+      <mass value="0.057677"/>
+      <inertia ixx="3.34e-05" ixy="-1.08e-05" ixz="6.33e-06" iyy="2.72e-05" iyz="9.88e-06" izz="4.04e-05"/>
+    </inertial>
+  </link>
+  <joint name="joint_2" type="revolute">
+    <parent link="J1"/>
+    <child link="J23"/>
+    <origin xyz="0 -0.035 0.15475" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0.052359878" upper="3.019419606" effort="50.0" velocity="1.0"/>
+  </joint>
+  <link name="J23">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="deepgray"/>
+      <origin xyz="0 0.035 -0.15475" rpy="0 0 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="dummy_stl_low/J23.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 0.035 -0.15475" rpy="0 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="-0.000946 0.069772 0.018084" rpy="0 0 0"/>
+      <mass value="0.667158"/>
+      <inertia ixx="0.001915" ixy="0.000122" ixz="0.000033" iyy="0.000432" iyz="-0.000429" izz="0.001908"/>
+    </inertial>
+  </link>
+  <joint name="joint_3" type="revolute">
+    <parent link="J23"/>
+    <child link="J4"/>
+    <origin xyz="0 0.14103 0.03779" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-2.617993878" upper="0" effort="50.0" velocity="1.0"/>
+  </joint>
+  <link name="J4">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link3.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="white"/>
+      <origin xyz="0 -0.10603 -0.19254" rpy="0 0 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="dummy_stl_low/J4.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 -0.10603 -0.19254" rpy="0 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="0.002113 0.005453 0.051002" rpy="0 0 0"/>
+      <mass value="0.258306"/>
+      <inertia ixx="0.000187" ixy="4.72e-06" ixz="2.13e-05" iyy="0.000124" iyz="-2.74e-05" izz="0.000148"/>
+    </inertial>
+  </link>
+  <joint name="joint_4" type="revolute">
+    <parent link="J4"/>
+    <child link="J5"/>
+    <origin xyz="0 -0.02602 0.04686" rpy="0.2618 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.141592654" upper="3.141592654" effort="50.0" velocity="1.0"/>
+  </joint>
+  <link name="J5">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link4.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="deepgray"/>
+      <origin xyz="0 -0.139245133648 -0.210534445769" rpy="-0.2618 0 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="dummy_stl_low/J5.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 -0.139245133648 -0.210534445769" rpy="-0.2618 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="0.001435 -0.063937467 -0.000629166" rpy="0 0 0"/>
+      <mass value="0.205755"/>
+      <inertia ixx="0.000226" ixy="6.958282891e-06" ixz="8.184869137e-08" iyy="5.448495486e-05" iyz="-1.066699286e-07" izz="0.0002405150451"/>
+    </inertial>
+  </link>
+  <joint name="joint_5" type="revolute">
+    <parent link="J5"/>
+    <child link="J6"/>
+    <origin xyz="0 -0.10245 0" rpy="-0.2618 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1.570796327" upper="1.570796327" effort="50.0" velocity="1.0"/>
+  </joint>
+  <link name="J6">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link5.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="white"/>
+      <origin xyz="0 0.018949084670 -0.212883928246" rpy="0 0 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="dummy_stl_low/J6.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 0.018949084670 -0.212883928246" rpy="0 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="-0.004732 -0.051886915 -0.014528928" rpy="0 0 0"/>
+      <mass value="0.17716"/>
+      <inertia ixx="0.000124" ixy="1.97e-05" ixz="5.12e-06" iyy="0.000056" iyz="-2.22e-05" izz="0.000132"/>
+    </inertial>
+  </link>
+  <joint name="joint_6" type="revolute">
+    <parent link="J6"/>
+    <child link="hand_base"/>
+    <origin xyz="0 -0.09562 -0.02562" rpy="0.2618 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.490658504" upper="6.283185307" effort="30.0" velocity="1.0"/>
+  </joint>
+  <!-- hand_base is the physical J6/gripper-base frame. -->
+  <link name="hand_base">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/handbase.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="deepgray"/>
+      <origin xyz="0 0.062197637796 -0.210535763796" rpy="-0.2618 0 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="dummy_stl_low/HandBase.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 0.062197637796 -0.210535763796" rpy="-0.2618 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="-0.000152 -0.021773109 -0.000584538" rpy="0 0 0"/>
+      <mass value="0.120102"/>
+      <inertia ixx="1.70e-05" ixy="1.503111001e-08" ixz="-5.672314988e-08" iyy="1.83537114e-05" iyz="-2.754682468e-08" izz="1.73462886e-05"/>
+    </inertial>
+  </link>
+  <!--
+    Canonical calibration/end-effector frame.  The identity fixed transform is
+    deliberate: it gives hand-eye calibration a stable ROS-style tool0 name
+    without changing the validated hand_base geometry or joint coordinates.
+  -->
+  <joint name="tool0_fixed" type="fixed">
+    <parent link="hand_base"/>
+    <child link="tool0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="tool0"/>
+  <joint name="joint_finger_left" type="prismatic">
+    <parent link="hand_base"/>
+    <child link="finger_left"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="0.025" effort="10.0" velocity="0.5"/>
+  </joint>
+  <link name="finger_left">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/finger_left.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="black"/>
+      <origin xyz="0 0.062197637796 -0.210535763796" rpy="-0.2618 0 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="dummy_stl_low/finger_left.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 0.062197637796 -0.210535763796" rpy="-0.2618 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="0.007631 -0.054307024 -0.017624756" rpy="0 0 0"/>
+      <mass value="0.020"/>
+      <inertia ixx="3.063229e-05" ixy="3.661518497e-07" ixz="-7.371551583e-07" iyy="2.343722709e-05" iyz="1.288819333e-05" izz="1.116127291e-05"/>
+    </inertial>
+  </link>
+  <joint name="joint_finger_right" type="prismatic">
+    <parent link="hand_base"/>
+    <child link="finger_right"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="0" upper="0.025" effort="10.0" velocity="0.5"/>
+  </joint>
+  <link name="finger_right">
+    <visual>
+      <geometry>
+        <mesh filename="meshes/finger_right.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="black"/>
+      <origin xyz="0 0.062197637796 -0.210535763796" rpy="-0.2618 0 0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="dummy_stl_low/finger_right.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <origin xyz="0 0.062197637796 -0.210535763796" rpy="-0.2618 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="-0.007648 -0.054292615 -0.013769106" rpy="0 0 0"/>
+      <mass value="0.020"/>
+      <inertia ixx="3.289585e-05" ixy="-3.895939986e-07" ixz="-4.83542304e-07" iyy="2.586923939e-05" iyz="1.279832594e-05" izz="1.125082061e-05"/>
+    </inertial>
+  </link>
+</robot>
