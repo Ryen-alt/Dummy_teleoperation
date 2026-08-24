@@ -233,11 +233,13 @@ void CtrlStepMotor::Reboot()
 
 float CtrlStepMotor::GetTemp()
 {
-    uint8_t mode = 0x25;
-    txHeader.StdId = nodeID << 7 | mode;
+    constexpr uint8_t mode = 0x25;
+    CAN_TxHeaderTypeDef request_header = txHeader;
+    request_header.StdId = nodeID << 7 | mode;
+    uint8_t request_data[8] = {};
 
     dummy::protocol::RecordTemperatureFeedbackRequest(nodeID);
-    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+    CanSendMessage(get_can_ctx(hcan), request_data, &request_header);
     return temperature;
 }
 
@@ -268,11 +270,13 @@ void CtrlStepMotor::SetAngleWithVelocityLimit(float _angle, float _vel)
 
 void CtrlStepMotor::UpdateAngle()
 {
-    uint8_t mode = 0x23;
-    txHeader.StdId = nodeID << 7 | mode;
+    constexpr uint8_t mode = 0x23;
+    CAN_TxHeaderTypeDef request_header = txHeader;
+    request_header.StdId = nodeID << 7 | mode;
+    uint8_t request_data[8] = {};
 
     dummy::protocol::RecordPositionFeedbackRequest(nodeID);
-    CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
+    CanSendMessage(get_can_ctx(hcan), request_data, &request_header);
 }
 
 

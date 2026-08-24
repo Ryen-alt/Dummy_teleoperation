@@ -13,6 +13,7 @@ add_executable(dummy_protocol_host_test
     ../../UserApp/protocols/measured_state_estimator.cpp
     ../../UserApp/protocols/can_feedback_monitor.cpp
     ../../UserApp/protocols/feedback_safety_supervisor.cpp
+    ../../UserApp/protocols/feedback_poll_scheduler.cpp
 )
 target_include_directories(dummy_protocol_host_test PRIVATE
     ../../UserApp/protocols

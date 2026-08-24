@@ -237,9 +237,21 @@ bool DummyRobot::MoveL(float _x, float _y, float _z, float _a, float _b, float _
     return false;
 }
 
-void DummyRobot::UpdateJointAngles()
+void DummyRobot::RequestPositionFeedback(uint8_t node_id)
 {
-    motorJ[ALL]->UpdateAngle();
+    if (node_id >= 1U && node_id <= 6U)
+        motorJ[node_id]->UpdateAngle();
+    else if (hand != nullptr && node_id == hand->nodeID)
+        hand->UpdateAngle();
+}
+
+
+void DummyRobot::RequestTemperatureFeedback(uint8_t node_id)
+{
+    if (node_id >= 1U && node_id <= 6U)
+        motorJ[node_id]->GetTemp();
+    else if (hand != nullptr && node_id == hand->nodeID)
+        hand->GetTemp();
 }
 
 

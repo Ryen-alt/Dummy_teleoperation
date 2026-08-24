@@ -2,6 +2,7 @@
 **/.pytest_cache/
 *.py[cod]
 **/.venv/
+**/.venv-*/
 **/*.egg-info/
 **/.mypy_cache/
 **/.ruff_cache/
@@ -22,7 +23,9 @@ build/
 *~
 .DS_Store
 
-/Dummy_URDF/
+# Keep the kinematic URDF in Git; the large local CAD/mesh bundle remains local.
+/Dummy_URDF/*
+!/Dummy_URDF/dummy.urdf
 
 # Local STM32CubeIDE/CMake/VS Code state for the Dummy firmware projects.
 /.vscode/
@@ -40,4 +43,6 @@ build/
 /Upper/dummy-host/logs/
 /Upper/dummy-host/sessions/
 /Upper/dummy-host/configs/teleop_inputs_*.yaml
-
+/Upper/lerobot-robot-dummy/datasets/
+/Upper/lerobot-robot-dummy/outputs/
+/Upper/lerobot-robot-dummy/.hf-cache/

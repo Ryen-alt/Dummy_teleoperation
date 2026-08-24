@@ -4,6 +4,7 @@
 #include "protocols/external_target_executor.hpp"
 #include "protocols/feedback_runtime.hpp"
 #include "protocols/feedback_safety_supervisor.hpp"
+#include "protocols/feedback_poll_scheduler.hpp"
 #include "protocols/joint_space_mapping.hpp"
 
 #include <algorithm>
@@ -17,6 +18,7 @@ SSD1306 oled(&hi2c0);
 MPU6050 mpu6050(&hi2c1);
 // 5 User-Timers, can choose from htim7/htim10/htim11/htim13/htim14
 Timer timerCtrlLoop(&htim7, 200);
+Timer timerFeedbackPoll(&htim10, dummy::generated_config::kFeedbackPollHz);
 // 2x2-channel PWMs, used htim9 & htim12, each has 2-channel outputs
 PWM pwm(21000, 21000);
 
@@ -59,6 +61,20 @@ dummy::protocol::FeedbackSafetyConfig MakeFeedbackSafetyConfig()
 
 dummy::protocol::FeedbackSafetySupervisor feedback_safety_supervisor(
     MakeFeedbackSafetyConfig());
+
+constexpr uint32_t kTemperatureSlotInterval =
+    dummy::generated_config::kFeedbackPollHz /
+    static_cast<uint32_t>(dummy::protocol::kActuatorNodeCount);
+static_assert(kTemperatureSlotInterval > 0U,
+              "feedback scheduler requires temperature slots");
+dummy::protocol::FeedbackPollScheduler feedback_poll_scheduler(
+    kTemperatureSlotInterval);
+
+constexpr uint32_t kFeedbackPollStackBytes = 768U;
+static_assert(kFeedbackPollStackBytes % sizeof(StackType_t) == 0U,
+              "feedback task stack must be word aligned");
+StaticTask_t feedback_poll_task_control_block{};
+StackType_t feedback_poll_task_stack[kFeedbackPollStackBytes / sizeof(StackType_t)]{};
 }
 
 
@@ -128,7 +144,6 @@ void ThreadControlLoopFixUpdate(void* argument)
                 robot.ApplyExternalUrdfTargetRad(step.position);
                 dummy::protocol::MarkBinaryTargetApplied(step.sequence);
             }
-            robot.UpdateJointAngles();
             robot.UpdateJointPose6D();
         }
         else if (robot.IsEnabled())
@@ -150,16 +165,26 @@ void ThreadControlLoopFixUpdate(void* argument)
         } else
         {
             // Just update Joint states
-            robot.UpdateJointAngles();
             robot.UpdateJointPose6D();
         }
+    }
+}
 
-        static uint32_t temperature_poll_ticks = 0;
-        if (++temperature_poll_ticks >= dummy::generated_config::kFirmwareLoopHz)
-        {
-            temperature_poll_ticks = 0;
-            robot.motorJ[ALL]->GetTemp();
-        }
+
+osThreadId_t feedbackPollTaskHandle;
+void ThreadFeedbackPoll(void* argument)
+{
+    (void) argument;
+    for (;;)
+    {
+        // Clear any accumulated notifications so a delayed task never emits a
+        // catch-up burst onto CAN. A missed slot remains visible as feedback age.
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const auto request = feedback_poll_scheduler.Next();
+        if (request.kind == dummy::protocol::FeedbackPollKind::Position)
+            robot.RequestPositionFeedback(request.node_id);
+        else
+            robot.RequestTemperatureFeedback(request.node_id);
     }
 }
 
@@ -243,6 +268,14 @@ void OnTimer7Callback()
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
+void OnTimer10FeedbackPollCallback()
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    vTaskNotifyGiveFromISR(TaskHandle_t(feedbackPollTaskHandle), &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
 osThreadId_t rgbTaskHandle;
 void ThreadRGBUpdate(void* argument) {
     for (;;) {
@@ -297,6 +330,19 @@ void Main(void)
     controlLoopFixUpdateHandle = osThreadNew(ThreadControlLoopFixUpdate, nullptr,
                                              &controlLoopTask_attributes);
 
+    const osThreadAttr_t feedbackPollTask_attributes = {
+        .name = "FeedbackPollTask",
+        .cb_mem = &feedback_poll_task_control_block,
+        .cb_size = sizeof(feedback_poll_task_control_block),
+        .stack_mem = feedback_poll_task_stack,
+        .stack_size = kFeedbackPollStackBytes,
+        .priority = (osPriority_t) osPriorityHigh,
+    };
+    feedbackPollTaskHandle = osThreadNew(ThreadFeedbackPoll, nullptr,
+                                         &feedbackPollTask_attributes);
+    if (feedbackPollTaskHandle == nullptr)
+        Error_Handler();
+
     const osThreadAttr_t ControlLoopUpdateTask_attributes = {
         .name = "ControlLoopUpdateTask",
         .stack_size = 2000,
@@ -321,7 +367,9 @@ void Main(void)
 
     // Start Timer Callbacks.
     timerCtrlLoop.SetCallback(OnTimer7Callback);
+    timerFeedbackPoll.SetCallback(OnTimer10FeedbackPollCallback);
     timerCtrlLoop.Start();
+    timerFeedbackPoll.Start();
 
     // System started, light switch-led up.
     Respond(*uart4StreamOutputPtr, "[sys] Heap remain: %d Bytes\n", xPortGetMinimumEverFreeHeapSize());

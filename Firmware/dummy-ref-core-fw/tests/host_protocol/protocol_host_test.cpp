@@ -6,6 +6,7 @@
 #include "measured_state_estimator.hpp"
 #include "can_feedback_monitor.hpp"
 #include "feedback_safety_supervisor.hpp"
+#include "feedback_poll_scheduler.hpp"
 #include "robot_config_generated.hpp"
 
 #include <array>
@@ -423,6 +424,38 @@ void TestUrdfJointSpaceMapping()
                      (dummy::generated_config::kJointZeroOffsetRad[5] - kProbe)) < 1e-6F);
 }
 
+void TestFeedbackPollSchedulerUsesOneRequestPerSlot()
+{
+    constexpr uint32_t kTemperatureSlotInterval = 100;
+    FeedbackPollScheduler scheduler(kTemperatureSlotInterval);
+    std::array<uint32_t, kActuatorNodeCount> position_counts{};
+    std::array<uint32_t, kActuatorNodeCount> temperature_counts{};
+
+    for (uint32_t slot = 0; slot < 700; ++slot)
+    {
+        const FeedbackPollRequest request = scheduler.Next();
+        assert(request.node_id >= 1 && request.node_id <= kActuatorNodeCount);
+        if (request.kind == FeedbackPollKind::Position)
+            ++position_counts[request.node_id - 1U];
+        else
+            ++temperature_counts[request.node_id - 1U];
+    }
+
+    for (size_t index = 0; index < kActuatorNodeCount; ++index)
+    {
+        assert(position_counts[index] == 99U);
+        assert(temperature_counts[index] == 1U);
+    }
+
+    scheduler.Reset();
+    for (uint8_t expected_node = 1; expected_node <= 7; ++expected_node)
+    {
+        const FeedbackPollRequest request = scheduler.Next();
+        assert(request.kind == FeedbackPollKind::Position);
+        assert(request.node_id == expected_node);
+    }
+}
+
 void TestLatestTargetExecutorIsBoundedAndHolds()
 {
     ExecutorConfig config{};
@@ -561,6 +594,7 @@ int main()
     TestMeasuredVelocityUsesOnlyValidMonotonicIntervals();
     TestCanFeedbackMonitorTracksAgeAndLossWithoutInventingFaultSources();
     TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault();
+    TestFeedbackPollSchedulerUsesOneRequestPerSlot();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();

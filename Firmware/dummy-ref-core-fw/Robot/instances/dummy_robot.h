@@ -176,7 +176,8 @@ public:
     void HoldCurrentPosition();
     void SetJointSpeed(float _speed);
     void SetJointAcceleration(float _acc);
-    void UpdateJointAngles();
+    void RequestPositionFeedback(uint8_t node_id);
+    void RequestTemperatureFeedback(uint8_t node_id);
     void UpdateJointAnglesCallback();
     void UpdateJointPose6D();
     void Reboot();

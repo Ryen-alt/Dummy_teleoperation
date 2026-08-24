@@ -13,14 +13,14 @@ namespace dummy::generated_config
 {
 constexpr char kRobotId[] = "dummy_v2_001";
 constexpr char kRobotCalibrationId[] = "dummy_v2_001-arm-gripper-20260821-v2";
-constexpr uint32_t kConfigVersion = 5U;
+constexpr uint32_t kConfigVersion = 6U;
 constexpr bool kHardwareParametersVerified = true;
 constexpr bool kExternalTargetExecutionReady = true;
 constexpr std::array<uint8_t, 32> kConfigSha256 = {
-    0x4a, 0x88, 0x66, 0x80, 0x3e, 0x32, 0x28, 0x08,
-    0xe3, 0x5a, 0x6c, 0x2c, 0xaa, 0x33, 0x56, 0x2c,
-    0xd4, 0x38, 0xe3, 0xd3, 0x8f, 0xb8, 0x0b, 0x00,
-    0x63, 0x2e, 0xea, 0x69, 0x5d, 0xd5, 0xd0, 0x40,
+    0x4b, 0xa2, 0x77, 0x32, 0xf4, 0x24, 0x27, 0x02,
+    0x81, 0x70, 0xe8, 0xfb, 0xd9, 0x56, 0x90, 0xa2,
+    0xb1, 0xfe, 0xc6, 0x0e, 0x70, 0x6f, 0xd4, 0x15,
+    0xf4, 0xd1, 0x1f, 0x29, 0xa3, 0x30, 0xf2, 0x58,
 };
 
 constexpr std::array<float, 6> kJointZeroOffsetRad = {0.0F, -1.2740901F, 3.141593F, 0.0F, 0.0F, 0.0F};
@@ -45,12 +45,15 @@ constexpr float kTemperatureFaultC = 75.0F;
 constexpr uint32_t kTemperatureFaultMs = 1000U;
 constexpr uint32_t kHostControlRateHz = 20U;
 constexpr uint32_t kFirmwareLoopHz = 200U;
+constexpr uint32_t kFeedbackPollHz = 700U;
 constexpr uint32_t kMaxStateAgeMs = 200U;
 constexpr uint16_t kTargetTtlMs = 100U;
 constexpr uint32_t kLeaseTimeoutMs = 500U;
 constexpr float kMaxTargetOvershootRad = 0.1F;
 
 static_assert(kFirmwareLoopHz == 200U, "firmware loop contract changed");
+static_assert(kFeedbackPollHz >= 7U && kFeedbackPollHz <= 1000U, "feedback poll rate is outside the reviewed range");
+static_assert(kFeedbackPollHz % 7U == 0U, "feedback poll rate must divide evenly across seven nodes");
 static_assert(kTargetTtlMs > 0U, "target TTL must be positive");
 static_assert(kLeaseTimeoutMs >= kTargetTtlMs, "lease must not expire before target TTL");
 static_assert(kFeedbackFaultMs > kFeedbackHoldMs, "feedback FAULT must persist beyond HOLD");

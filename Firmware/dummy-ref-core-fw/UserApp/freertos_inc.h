@@ -25,6 +25,7 @@ extern osThreadId_t uartServerTaskHandle;   // Usage: 2048 Bytes stack
 /*---------------------------------- User Tasks --------------------------------------*/
 extern osThreadId_t oledTaskHandle;         // Usage: 4000 Bytes stack
 extern osThreadId_t controlLoopFixUpdateHandle;  // Usage: 4000 Bytes stack
+extern osThreadId_t feedbackPollTaskHandle;      // Usage: 768 Bytes stack
 
 /*---------------- 60K (used) / 64K (for FreeRTOS on ccram) ------------------*/
 
