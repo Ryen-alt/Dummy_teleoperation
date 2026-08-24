@@ -45,6 +45,28 @@ static CAN_context* ctxs = nullptr;
 static CAN_RxHeaderTypeDef headerRx;
 static uint8_t data[8];
 
+namespace
+{
+constexpr uint32_t kCanTxWaitTicks = 5U;
+constexpr uint32_t kCanTxRecoveryWaitTicks = 2U;
+
+osSemaphoreId TxSemaphore(CAN_HandleTypeDef* hcan)
+{
+    if (hcan->Instance == CAN1)
+        return sem_can1_tx;
+    if (hcan->Instance == CAN2)
+        return sem_can2_tx;
+    return nullptr;
+}
+
+void ReleaseTxToken(CAN_HandleTypeDef* hcan)
+{
+    const osSemaphoreId semaphore = TxSemaphore(hcan);
+    if (semaphore != nullptr)
+        (void) osSemaphoreRelease(semaphore);
+}
+}
+
 
 struct CAN_context* get_can_ctx(CAN_HandleTypeDef* hcan)
 {
@@ -118,22 +140,32 @@ void tx_complete_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
 //    CAN_context* ctx = get_can_ctx(hcan);
 //    if (!ctx) return;
 //    ctx->tx_msg_cnt++;
-
-    if (hcan->Instance == CAN1)
-        osSemaphoreRelease(sem_can1_tx);
-    else if (hcan->Instance == CAN2)
-        osSemaphoreRelease(sem_can2_tx);
+    (void) mailbox_idx;
+    ReleaseTxToken(hcan);
 }
 
 void tx_aborted_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
 {
-    if (!get_can_ctx(hcan))
+    CAN_context* ctx = get_can_ctx(hcan);
+    if (ctx == nullptr)
         return;
-    get_can_ctx(hcan)->TxMailboxAbortCallbackCnt++;
+    (void) mailbox_idx;
+    ctx->TxMailboxAbortCallbackCnt++;
+    // An aborted transfer never reaches a mailbox-complete callback. Return
+    // the single-flight token so a transient CAN error cannot deadlock every
+    // subsequent feedback and motion command.
+    ReleaseTxToken(hcan);
 }
 
 void tx_error(CAN_context* ctx, uint8_t mailbox_idx)
 {
+    if (ctx == nullptr || ctx->handle == nullptr)
+        return;
+    ctx->unexpected_errors++;
+    (void) HAL_CAN_AbortTxRequest(ctx->handle, 1UL << mailbox_idx);
+    // Auto retransmission is disabled. A transmit error therefore has no
+    // successful completion callback to restore the single-flight token.
+    ReleaseTxToken(ctx->handle);
 }
 
 void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef* hcan)
@@ -236,15 +268,47 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* hcan)
 
 void CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader)
 {
-    osStatus semaphore_status;
-    if (canCtx->handle->Instance == CAN1)
-        semaphore_status = osSemaphoreAcquire(sem_can1_tx, osWaitForever);
-    else if (canCtx->handle->Instance == CAN2)
-        semaphore_status = osSemaphoreAcquire(sem_can2_tx, osWaitForever);
-    else
+    if (canCtx == nullptr || canCtx->handle == nullptr || txData == nullptr ||
+        txHeader == nullptr)
         return;
 
-    if (semaphore_status == osOK)
-        HAL_CAN_AddTxMessage(canCtx->handle, txHeader, txData, &canCtx->last_heartbeat_mailbox);
-}
+    const osSemaphoreId semaphore = TxSemaphore(canCtx->handle);
+    if (semaphore == nullptr)
+        return;
 
+    osStatus semaphore_status = osSemaphoreAcquire(semaphore, kCanTxWaitTicks);
+    if (semaphore_status != osOK)
+    {
+        // A normal 1 Mbit/s frame completes far sooner than this timeout. If
+        // the token is still absent, recover a mailbox whose error/abort path
+        // failed to signal completion instead of blocking the realtime control
+        // task forever.
+        canCtx->unexpected_errors++;
+        constexpr uint32_t kAllMailboxes =
+            CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2;
+        if (HAL_CAN_GetTxMailboxesFreeLevel(canCtx->handle) < 3U)
+            (void) HAL_CAN_AbortTxRequest(canCtx->handle, kAllMailboxes);
+        else
+            ReleaseTxToken(canCtx->handle);
+
+        semaphore_status = osSemaphoreAcquire(semaphore, kCanTxRecoveryWaitTicks);
+        if (semaphore_status != osOK &&
+            HAL_CAN_GetTxMailboxesFreeLevel(canCtx->handle) == 3U)
+        {
+            ReleaseTxToken(canCtx->handle);
+            semaphore_status = osSemaphoreAcquire(semaphore, 0U);
+        }
+        if (semaphore_status != osOK)
+            return;
+    }
+
+    const HAL_StatusTypeDef send_status = HAL_CAN_AddTxMessage(
+        canCtx->handle, txHeader, txData, &canCtx->last_heartbeat_mailbox);
+    if (send_status != HAL_OK)
+    {
+        // No completion interrupt will be generated when the frame was never
+        // queued, so restore the token immediately.
+        canCtx->unexpected_errors++;
+        ReleaseTxToken(canCtx->handle);
+    }
+}
