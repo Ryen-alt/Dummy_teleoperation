@@ -8,38 +8,36 @@
 namespace dummy::protocol
 {
 
-enum class FeedbackPollKind : uint8_t
+enum class CanSlotKind : uint8_t
 {
-    Position,
-    Temperature,
+    ActuatorTarget,
+    PositionFeedback,
+    TemperatureFeedback,
 };
 
-struct FeedbackPollRequest
+struct CanSlotRequest
 {
-    FeedbackPollKind kind = FeedbackPollKind::Position;
+    CanSlotKind kind = CanSlotKind::ActuatorTarget;
     uint8_t node_id = 1;
-    // Independent round-robin cursor used for one streaming target per CAN
-    // slot. It advances even when a temperature request replaces position.
-    uint8_t actuator_node_id = 1;
 };
 
-// Produces exactly one unicast CAN request per timer slot. Position and
-// temperature cursors advance independently so a temperature sample never
-// creates a second response burst in a position slot.
-class FeedbackPollScheduler
+// Produces at most one outbound CAN frame per 700 Hz timer slot. Target and
+// feedback slots alternate. Feedback is phase-shifted by three nodes so a
+// motor never receives its target and query in adjacent slots.
+class CanSlotScheduler
 {
 public:
-    explicit FeedbackPollScheduler(uint32_t temperature_slot_interval);
+    explicit CanSlotScheduler(uint32_t temperature_feedback_slot_interval);
 
-    FeedbackPollRequest Next();
+    CanSlotRequest Next();
     void Reset();
 
 private:
-    uint32_t temperature_slot_interval_ = 0;
-    uint32_t slots_since_temperature_ = 0;
-    uint8_t next_position_node_ = 1;
-    uint8_t next_temperature_node_ = 1;
-    uint8_t next_actuator_node_ = 1;
+    uint32_t temperature_feedback_slot_interval_ = 0;
+    uint32_t feedback_slots_since_temperature_ = 0;
+    uint8_t next_target_node_ = 1;
+    uint8_t current_pair_target_node_ = 1;
+    bool target_slot_next_ = true;
 };
 
 // Tracks when all seven actuator nodes have accepted at least one CAN frame for

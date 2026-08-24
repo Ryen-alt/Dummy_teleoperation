@@ -62,13 +62,17 @@ dummy::protocol::FeedbackSafetyConfig MakeFeedbackSafetyConfig()
 dummy::protocol::FeedbackSafetySupervisor feedback_safety_supervisor(
     MakeFeedbackSafetyConfig());
 
-constexpr uint32_t kTemperatureSlotInterval =
-    dummy::generated_config::kFeedbackPollHz /
+static_assert(dummy::generated_config::kFeedbackPollHz % 2U == 0U,
+              "CAN slot rate must split evenly between targets and feedback");
+constexpr uint32_t kFeedbackSlotHz =
+    dummy::generated_config::kFeedbackPollHz / 2U;
+constexpr uint32_t kTemperatureFeedbackSlotInterval =
+    kFeedbackSlotHz /
     static_cast<uint32_t>(dummy::protocol::kActuatorNodeCount);
-static_assert(kTemperatureSlotInterval > 0U,
+static_assert(kTemperatureFeedbackSlotInterval > 0U,
               "feedback scheduler requires temperature slots");
-dummy::protocol::FeedbackPollScheduler feedback_poll_scheduler(
-    kTemperatureSlotInterval);
+dummy::protocol::CanSlotScheduler can_slot_scheduler(
+    kTemperatureFeedbackSlotInterval);
 
 enum class ScheduledActuatorMode : uint8_t
 {
@@ -249,7 +253,7 @@ void ThreadFeedbackPoll(void* argument)
         // Clear any accumulated notifications so a delayed task never emits a
         // catch-up burst onto CAN. A missed slot remains visible as feedback age.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        const auto request = feedback_poll_scheduler.Next();
+        const auto request = can_slot_scheduler.Next();
 
         const ScheduledActuatorRequest scheduled = ReadScheduledActuatorRequest();
         if (scheduled.mode == ScheduledActuatorMode::Stream)
@@ -260,24 +264,35 @@ void ThreadFeedbackPoll(void* argument)
                 if (!robot.IsEnabled())
                     robot.SetEnable(true);
                 processed_mode = ScheduledActuatorMode::Stream;
+                // Enabling is a one-time multi-frame transition. Give it this
+                // entire slot so no target/query is appended to the burst.
+                continue;
             }
 
-            // Re-read after a possible enable burst. If the realtime safety
-            // task published HOLD/FAULT meanwhile, skip this stale target and
-            // process the transition in the next (<= 1.43 ms) CAN slot.
-            const ScheduledActuatorRequest latest = ReadScheduledActuatorRequest();
-            if (latest.mode == ScheduledActuatorMode::Stream)
+            if (request.kind == dummy::protocol::CanSlotKind::ActuatorTarget)
             {
-                const bool transmitted = robot.ApplyExternalUrdfTargetNodeRad(
-                    request.actuator_node_id, latest.position);
-                if (application_tracker.RecordTransmission(
-                        latest.sequence, request.actuator_node_id, transmitted))
-                    dummy::protocol::MarkBinaryTargetApplied(latest.sequence);
+                // Re-read immediately before transmitting. If the realtime
+                // safety task published HOLD/FAULT meanwhile, skip this stale
+                // target and process the transition in the next (<= 1.43 ms)
+                // CAN slot.
+                const ScheduledActuatorRequest latest = ReadScheduledActuatorRequest();
+                if (latest.mode == ScheduledActuatorMode::Stream)
+                {
+                    const bool transmitted = robot.ApplyExternalUrdfTargetNodeRad(
+                        request.node_id, latest.position);
+                    if (application_tracker.RecordTransmission(
+                            latest.sequence, request.node_id, transmitted))
+                        dummy::protocol::MarkBinaryTargetApplied(latest.sequence);
+                }
+                else
+                {
+                    application_tracker.Reset();
+                }
             }
+            else if (request.kind == dummy::protocol::CanSlotKind::PositionFeedback)
+                robot.RequestPositionFeedback(request.node_id);
             else
-            {
-                application_tracker.Reset();
-            }
+                robot.RequestTemperatureFeedback(request.node_id);
         }
         else
         {
@@ -289,16 +304,19 @@ void ThreadFeedbackPoll(void* argument)
                 else if (scheduled.mode == ScheduledActuatorMode::Fault)
                     robot.commandHandler.EmergencyStop();
                 processed_mode = scheduled.mode;
+                // HOLD/FAULT can fan out to all nodes. Do not append another
+                // CAN frame until the following timer slot.
+                continue;
             }
-        }
 
-        // The target frame above has completed before this request can acquire
-        // the single-flight CAN token. Each slot therefore has deterministic
-        // target-then-feedback ordering without a seven-frame command burst.
-        if (request.kind == dummy::protocol::FeedbackPollKind::Position)
-            robot.RequestPositionFeedback(request.node_id);
-        else
-            robot.RequestTemperatureFeedback(request.node_id);
+            // With control inactive, reuse target slots for position queries.
+            // This preserves high-rate idle diagnostics without ever sending
+            // more than one normal-operation frame in a timer slot.
+            if (request.kind == dummy::protocol::CanSlotKind::TemperatureFeedback)
+                robot.RequestTemperatureFeedback(request.node_id);
+            else
+                robot.RequestPositionFeedback(request.node_id);
+        }
     }
 }
 

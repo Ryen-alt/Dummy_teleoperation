@@ -455,22 +455,23 @@ void TestUrdfJointSpaceMapping()
                      (dummy::generated_config::kJointZeroOffsetRad[5] - kProbe)) < 1e-6F);
 }
 
-void TestFeedbackPollSchedulerUsesOneRequestPerSlot()
+void TestCanSlotSchedulerUsesOneFrameAndPhaseOffsets()
 {
-    constexpr uint32_t kTemperatureSlotInterval = 100;
-    FeedbackPollScheduler scheduler(kTemperatureSlotInterval);
+    // At 700 total slots/s, alternating leaves 350 feedback slots/s. One
+    // temperature query per 50 feedback slots gives exactly 1 Hz per node.
+    constexpr uint32_t kTemperatureFeedbackSlotInterval = 50;
+    CanSlotScheduler scheduler(kTemperatureFeedbackSlotInterval);
+    std::array<uint32_t, kActuatorNodeCount> target_counts{};
     std::array<uint32_t, kActuatorNodeCount> position_counts{};
     std::array<uint32_t, kActuatorNodeCount> temperature_counts{};
-    std::array<uint32_t, kActuatorNodeCount> actuator_counts{};
 
     for (uint32_t slot = 0; slot < 700; ++slot)
     {
-        const FeedbackPollRequest request = scheduler.Next();
+        const CanSlotRequest request = scheduler.Next();
         assert(request.node_id >= 1 && request.node_id <= kActuatorNodeCount);
-        assert(request.actuator_node_id >= 1 &&
-               request.actuator_node_id <= kActuatorNodeCount);
-        ++actuator_counts[request.actuator_node_id - 1U];
-        if (request.kind == FeedbackPollKind::Position)
+        if (request.kind == CanSlotKind::ActuatorTarget)
+            ++target_counts[request.node_id - 1U];
+        else if (request.kind == CanSlotKind::PositionFeedback)
             ++position_counts[request.node_id - 1U];
         else
             ++temperature_counts[request.node_id - 1U];
@@ -478,18 +479,25 @@ void TestFeedbackPollSchedulerUsesOneRequestPerSlot()
 
     for (size_t index = 0; index < kActuatorNodeCount; ++index)
     {
-        assert(position_counts[index] == 99U);
+        assert(target_counts[index] == 50U);
+        assert(position_counts[index] == 49U);
         assert(temperature_counts[index] == 1U);
-        assert(actuator_counts[index] == 100U);
     }
 
     scheduler.Reset();
-    for (uint8_t expected_node = 1; expected_node <= 7; ++expected_node)
+    for (uint8_t target_node = 1; target_node <= 7; ++target_node)
     {
-        const FeedbackPollRequest request = scheduler.Next();
-        assert(request.kind == FeedbackPollKind::Position);
-        assert(request.node_id == expected_node);
-        assert(request.actuator_node_id == expected_node);
+        const CanSlotRequest target = scheduler.Next();
+        assert(target.kind == CanSlotKind::ActuatorTarget);
+        assert(target.node_id == target_node);
+
+        const CanSlotRequest feedback = scheduler.Next();
+        assert(feedback.kind == CanSlotKind::PositionFeedback);
+        const uint8_t expected_feedback_node = static_cast<uint8_t>(
+            ((static_cast<uint32_t>(target_node) - 1U + 3U) %
+             kActuatorNodeCount) + 1U);
+        assert(feedback.node_id == expected_feedback_node);
+        assert(feedback.node_id != target.node_id);
     }
 }
 
@@ -651,7 +659,7 @@ int main()
     TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap();
     TestStateValidityBitsComeFromOneFeedbackSnapshot();
     TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault();
-    TestFeedbackPollSchedulerUsesOneRequestPerSlot();
+    TestCanSlotSchedulerUsesOneFrameAndPhaseOffsets();
     TestActuatorApplicationTrackerRequiresEverySuccessfulNode();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
