@@ -13,6 +13,7 @@ def export_raw_session(
     sink: DatasetSink,
 ) -> ExportReport:
     session = RawSession(session_dir)
+    session.validate_export_recipe(recipe)
     episodes = session.episodes()
     selected = [episode for episode in episodes if episode.outcome in recipe.accepted_outcomes]
     episodes_exported = 0
@@ -55,6 +56,12 @@ def export_raw_session(
         "camera_rig_version": session.manifest.get("camera_rig_version"),
         "camera_rig_hash": session.manifest.get("camera_rig_hash"),
         "camera_calibrations": session.manifest.get("camera_calibrations", {}),
+        "camera_calibration_versions": session.camera_calibration_versions(),
+        "data_classification": session.data_classification,
+        "offline_training_only": session.manifest_extra.get("offline_training_only", False),
+        "real_policy_execution_allowed": False,
+        "allow_uncalibrated_cameras": recipe.allow_uncalibrated_cameras,
+        "require_temporary_source": recipe.require_temporary_source,
     }
     result = sink.finalize(metadata=metadata)
     return ExportReport(

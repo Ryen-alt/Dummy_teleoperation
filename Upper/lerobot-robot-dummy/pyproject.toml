@@ -20,6 +20,8 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 dummy-export-lerobot-v3 = "lerobot_robot_dummy.cli:main"
+dummy-act-smoke = "lerobot_robot_dummy.act_smoke:main"
+dummy-temp-raw-fixture = "lerobot_robot_dummy.temp_fixture:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

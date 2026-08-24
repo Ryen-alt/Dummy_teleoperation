@@ -116,6 +116,9 @@ def test_session_qa_reports_export_gate_and_renders_svg(
     report, states = analyze_session(session)
     assert report.ok
     assert report.export_ready
+    assert report.data_classification == "legacy_unspecified"
+    assert not report.offline_training_only
+    assert not report.real_policy_execution_allowed
     assert report.measured_sample_hz == 20.0
     assert report.episode_outcomes["accepted"] == 1
     assert report.cameras[0].role == "wrist"

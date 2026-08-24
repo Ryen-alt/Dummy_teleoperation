@@ -43,6 +43,79 @@ class RawSession:
         if self.manifest.get("clean_shutdown") is not True:
             raise RawSessionError("dataset export requires a cleanly finalized raw session")
 
+    @property
+    def manifest_extra(self) -> Mapping[str, object]:
+        value = self.manifest.get("extra")
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def data_classification(self) -> str:
+        return str(self.manifest_extra.get("data_classification", "legacy_unspecified"))
+
+    def camera_calibration_versions(self) -> dict[str, tuple[str, ...]]:
+        db_path = self.session_dir / "samples.sqlite"
+        try:
+            with sqlite3.connect(
+                f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
+            ) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT role, calibration_version
+                    FROM camera_samples
+                    GROUP BY role, calibration_version
+                    ORDER BY role, calibration_version
+                    """
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise RawSessionError(f"cannot read camera calibration identities: {exc}") from exc
+        versions: dict[str, list[str]] = {}
+        for role, version in rows:
+            versions.setdefault(str(role), []).append(str(version))
+        return {role: tuple(values) for role, values in versions.items()}
+
+    def validate_export_recipe(self, recipe: ExportRecipe) -> None:
+        if recipe.require_temporary_source:
+            if self.data_classification != "temporary_uncalibrated_pipeline_test":
+                raise RawSessionError(
+                    "temporary export recipe requires a source collected with "
+                    "--temporary-uncalibrated"
+                )
+            if self.manifest_extra.get("offline_training_only") is not True:
+                raise RawSessionError("temporary source must be marked offline_training_only")
+            if self.manifest_extra.get("real_policy_execution_allowed") is not False:
+                raise RawSessionError(
+                    "temporary source must explicitly forbid real policy execution"
+                )
+        versions = self.camera_calibration_versions()
+        missing_roles = [role for role in recipe.required_camera_roles if role not in versions]
+        if missing_roles:
+            raise RawSessionError(
+                "required camera roles have no recorded frames: " + ", ".join(missing_roles)
+            )
+        if recipe.allow_uncalibrated_cameras:
+            return
+        archived = self.manifest.get("camera_calibrations")
+        archived = archived if isinstance(archived, dict) else {}
+        invalid_roles: list[str] = []
+        for role in recipe.required_camera_roles:
+            role_versions = versions[role]
+            calibration = archived.get(role)
+            calibration_id = (
+                calibration.get("calibration_id") if isinstance(calibration, dict) else None
+            )
+            if (
+                not isinstance(calibration_id, str)
+                or not calibration_id
+                or any(version != calibration_id for version in role_versions)
+                or any(version.lower().startswith("uncalibrated") for version in role_versions)
+            ):
+                invalid_roles.append(f"{role}={list(role_versions)}")
+        if invalid_roles:
+            raise RawSessionError(
+                "formal export recipe rejects missing/mismatched/uncalibrated camera identity: "
+                + "; ".join(invalid_roles)
+            )
+
     def episodes(self) -> tuple[EpisodeWindow, ...]:
         active: dict[str, dict[str, object]] = {}
         completed: list[EpisodeWindow] = []

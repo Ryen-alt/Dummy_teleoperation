@@ -32,6 +32,9 @@ class CameraQa:
 class SessionQaReport:
     ok: bool
     export_ready: bool
+    data_classification: str
+    offline_training_only: bool
+    real_policy_execution_allowed: bool
     session: str
     integrity: SessionCheckReport
     duration_s: float
@@ -220,8 +223,12 @@ def analyze_session(session_dir: str | Path) -> tuple[SessionQaReport, tuple[np.
     interval_max_ms = 0.0 if tick_intervals_ms.size == 0 else float(tick_intervals_ms.max())
     outcomes = _episode_outcomes(session_dir / "events.jsonl")
     extra = manifest.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    data_classification = str(extra.get("data_classification", "legacy_unspecified"))
+    offline_training_only = extra.get("offline_training_only") is True
+    real_policy_execution_allowed = extra.get("real_policy_execution_allowed") is True
     required_roles: set[str] = set()
-    if isinstance(extra, dict) and extra.get("camera_required") is True:
+    if extra.get("camera_required") is True:
         camera_roles = extra.get("camera_roles")
         if isinstance(camera_roles, list):
             required_roles = {str(role) for role in camera_roles}
@@ -256,6 +263,12 @@ def analyze_session(session_dir: str | Path) -> tuple[SessionQaReport, tuple[np.
             )
     if not cameras:
         warnings.append("no camera frames; only state/action export recipes can use this session")
+    if data_classification == "temporary_uncalibrated_pipeline_test":
+        warnings.append(
+            "TEMP/UNCALIBRATED: offline pipeline training only; real policy execution is forbidden"
+        )
+        if not offline_training_only or real_policy_execution_allowed:
+            errors.append("temporary session safety classification fields are inconsistent")
 
     state_min, state_max = _range(states)
     action_min, action_max = _range(actions)
@@ -264,6 +277,9 @@ def analyze_session(session_dir: str | Path) -> tuple[SessionQaReport, tuple[np.
     report = SessionQaReport(
         ok=ok,
         export_ready=export_ready,
+        data_classification=data_classification,
+        offline_training_only=offline_training_only,
+        real_policy_execution_allowed=real_policy_execution_allowed,
         session=str(session_dir.resolve()),
         integrity=integrity,
         duration_s=duration_s,
@@ -347,6 +363,9 @@ def render_html(report: SessionQaReport, states: tuple[np.ndarray, ...]) -> str:
 <style>body{{font:14px system-ui;margin:2rem;max-width:1100px}}table{{border-collapse:collapse}}
 td,th{{border:1px solid #d1d5db;padding:.4rem .6rem}}code{{word-break:break-all}}svg{{width:100%;height:auto;border:1px solid #e5e7eb}}</style></head>
 <body><h1>Dummy Raw Session QA</h1><p><code>{html.escape(report.session)}</code></p>
+<p><strong>Classification:</strong> {html.escape(report.data_classification)} &nbsp;
+<strong>Offline training only:</strong> {report.offline_training_only} &nbsp;
+<strong>Real policy execution:</strong> {report.real_policy_execution_allowed}</p>
 <p><strong>Integrity:</strong> {report.ok} &nbsp; <strong>Export ready:</strong> {report.export_ready}</p>
 <table><tr><th>Samples</th><th>Duration (s)</th><th>Measured Hz</th><th>Tick p95 (ms)</th><th>Actions</th><th>Fault rows</th></tr>
 <tr><td>{report.integrity.samples}</td><td>{report.duration_s:.3f}</td><td>{report.measured_sample_hz:.3f}</td>

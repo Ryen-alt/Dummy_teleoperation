@@ -25,8 +25,13 @@ def _load_recipe(path: str | Path) -> ExportRecipe:
     if not isinstance(metadata, Mapping):
         raise ValueError("recipe metadata must be a mapping")
     include_depth = raw.get("include_depth", False)
-    if not isinstance(include_depth, bool):
-        raise ValueError("include_depth must be boolean")
+    allow_uncalibrated = raw.get("allow_uncalibrated_cameras", False)
+    require_temporary = raw.get("require_temporary_source", False)
+    if not all(
+        isinstance(value, bool)
+        for value in (include_depth, allow_uncalibrated, require_temporary)
+    ):
+        raise ValueError("recipe camera and source gates must be boolean")
     return ExportRecipe(
         recipe_id=str(raw.get("recipe_id", "")),
         version=int(raw.get("version", 0)),
@@ -35,6 +40,8 @@ def _load_recipe(path: str | Path) -> ExportRecipe:
         dataset_format=str(raw.get("dataset_format", "")),
         accepted_outcomes=tuple(outcomes),
         include_depth=include_depth,
+        allow_uncalibrated_cameras=allow_uncalibrated,
+        require_temporary_source=require_temporary,
         metadata=metadata,
     )
 

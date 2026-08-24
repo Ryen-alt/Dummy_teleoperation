@@ -18,6 +18,8 @@ class ExportRecipe:
     dataset_format: str = "lerobot_v3"
     accepted_outcomes: tuple[str, ...] = ("accepted",)
     include_depth: bool = False
+    allow_uncalibrated_cameras: bool = False
+    require_temporary_source: bool = False
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -44,8 +46,19 @@ class ExportRecipe:
             or len(set(self.accepted_outcomes)) != len(self.accepted_outcomes)
         ):
             raise ValueError("accepted_outcomes must be unique and non-empty")
-        if not isinstance(self.include_depth, bool):
-            raise ValueError("include_depth must be boolean")
+        if not all(
+            isinstance(value, bool)
+            for value in (
+                self.include_depth,
+                self.allow_uncalibrated_cameras,
+                self.require_temporary_source,
+            )
+        ):
+            raise ValueError("recipe camera and source gates must be boolean")
+        if self.require_temporary_source and not self.allow_uncalibrated_cameras:
+            raise ValueError(
+                "require_temporary_source requires allow_uncalibrated_cameras"
+            )
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be a mapping")
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
@@ -60,6 +73,8 @@ class ExportRecipe:
             "dataset_format": self.dataset_format,
             "accepted_outcomes": self.accepted_outcomes,
             "include_depth": self.include_depth,
+            "allow_uncalibrated_cameras": self.allow_uncalibrated_cameras,
+            "require_temporary_source": self.require_temporary_source,
             "metadata": dict(self.metadata),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

@@ -183,7 +183,7 @@ class LeRobotV3DatasetSink:
         if factory is None:
             try:
                 installed_version = version("lerobot")
-                from lerobot.datasets import LeRobotDataset
+                from lerobot.datasets.lerobot_dataset import LeRobotDataset
             except (ImportError, PackageNotFoundError) as exc:
                 raise LeRobotAdapterError(
                     "install the pinned lerobot-robot-dummy environment before export"

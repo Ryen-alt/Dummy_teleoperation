@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from dummy_host.cameras import CameraFrame
 from dummy_host.dataset import DatasetFrame, ExportRecipe, export_raw_session
+from dummy_host.dataset.raw_session import RawSessionError
 from dummy_host.recording import SessionRecorder
 from dummy_host.schema import AppliedAction, ControlMode, RobotState
 from dummy_host.teleop import KeyboardMapper, load_teleop_profile
@@ -75,6 +77,11 @@ def test_raw_session_v2_exports_through_version_isolated_sink(config, tmp_path: 
         profile,
         source="keyboard",
         session_name="export_source",
+        extra_manifest={
+            "data_classification": "temporary_uncalibrated_pipeline_test",
+            "offline_training_only": True,
+            "real_policy_execution_allowed": False,
+        },
     )
     recorder.record_event(
         "episode_start",
@@ -100,11 +107,22 @@ def test_raw_session_v2_exports_through_version_isolated_sink(config, tmp_path: 
     recorder.close()
 
     sink = MemorySink()
-    recipe = ExportRecipe(
+    formal_recipe = ExportRecipe(
         recipe_id="dummy_dual_rgb_v1",
         version=1,
         required_camera_roles=("wrist", "global"),
         include_depth=True,
+    )
+    with pytest.raises(RawSessionError, match="formal export recipe rejects"):
+        export_raw_session(recorder.session_dir, formal_recipe, sink)
+
+    recipe = ExportRecipe(
+        recipe_id="dummy_dual_rgb_temp_uncalibrated_v1",
+        version=1,
+        required_camera_roles=("wrist", "global"),
+        include_depth=True,
+        allow_uncalibrated_cameras=True,
+        require_temporary_source=True,
     )
     report = export_raw_session(recorder.session_dir, recipe, sink)
     assert report.episodes_exported == 1
@@ -116,3 +134,27 @@ def test_raw_session_v2_exports_through_version_isolated_sink(config, tmp_path: 
     assert sink.frames[0].depths["wrist"].dtype == np.float32
     assert sink.metadata["dataset_format"] == "lerobot_v3"
     assert sink.metadata["robot_config_hash"] == config.config_hash
+    assert sink.metadata["data_classification"] == "temporary_uncalibrated_pipeline_test"
+    assert sink.metadata["offline_training_only"] is True
+    assert sink.metadata["real_policy_execution_allowed"] is False
+
+
+def test_temporary_recipe_rejects_an_unclassified_source(config, tmp_path: Path) -> None:
+    profile = load_teleop_profile(Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml")
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="unclassified_source",
+    )
+    recorder.close()
+    recipe = ExportRecipe(
+        recipe_id="dummy_dual_rgb_temp_uncalibrated_v1",
+        version=1,
+        required_camera_roles=("wrist", "global"),
+        allow_uncalibrated_cameras=True,
+        require_temporary_source=True,
+    )
+    with pytest.raises(RawSessionError, match="--temporary-uncalibrated"):
+        export_raw_session(recorder.session_dir, recipe, MemorySink())

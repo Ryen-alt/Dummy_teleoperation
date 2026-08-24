@@ -59,6 +59,14 @@ def main() -> None:
     parser.add_argument("--camera-rig", help="optional independently versioned camera-rig YAML")
     parser.add_argument("--require-camera", action="store_true")
     parser.add_argument(
+        "--temporary-uncalibrated",
+        action="store_true",
+        help=(
+            "mark this camera session as TEMP/UNCALIBRATED for offline pipeline tests only; "
+            "never authorizes real policy execution"
+        ),
+    )
+    parser.add_argument(
         "--allow-joint",
         type=int,
         choices=range(1, 7),
@@ -71,6 +79,10 @@ def main() -> None:
         parser.error("--execute requires --port")
     if args.require_camera and not args.with_cameras:
         parser.error("--require-camera also requires --with-cameras")
+    if args.temporary_uncalibrated and not args.with_cameras:
+        parser.error("--temporary-uncalibrated requires --with-cameras")
+    if args.temporary_uncalibrated and args.require_camera:
+        parser.error("--temporary-uncalibrated cannot be combined with --require-camera")
     if args.progress_interval <= 0:
         parser.error("--progress-interval must be positive")
     if args.execute and not args.allow_joint and not args.allow_gripper:
@@ -116,6 +128,13 @@ def main() -> None:
             "cameras_enabled": args.with_cameras,
             "camera_roles": list(camera_manager.roles) if camera_manager is not None else [],
             "camera_required": args.require_camera,
+            "data_classification": (
+                "temporary_uncalibrated_pipeline_test"
+                if args.temporary_uncalibrated
+                else ("formal_candidate" if args.require_camera else "engineering")
+            ),
+            "offline_training_only": args.temporary_uncalibrated,
+            "real_policy_execution_allowed": False,
             "allowed_joints": list(range(1, 7))
             if args.simulate and args.allow_joint is None
             else sorted(set(args.allow_joint or ())),

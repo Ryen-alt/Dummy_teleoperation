@@ -1,11 +1,13 @@
-recipe_id: dummy_rgb_v1
+recipe_id: dummy_dual_rgb_v1
 version: 1
 dataset_format: lerobot_v3
 control_hz: 20
-required_camera_roles: [wrist]
+required_camera_roles: [wrist, global]
 accepted_outcomes: [accepted]
 include_depth: false
+allow_uncalibrated_cameras: false
+require_temporary_source: false
 metadata:
-  description: Accepted teleoperation episodes with applied actions as labels
+  description: Accepted dual-camera teleoperation episodes with applied actions as labels
   image_color_space: RGB
   depth_unit: metre_when_enabled

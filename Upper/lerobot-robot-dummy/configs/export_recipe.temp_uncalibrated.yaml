@@ -1,0 +1,16 @@
+# Pipeline smoke tests only. This recipe cannot turn an engineering session
+# into a formal dataset and must never be used for real-policy execution.
+recipe_id: dummy_temp_uncalibrated_dual_rgb_v1
+version: 1
+dataset_format: lerobot_v3
+control_hz: 20
+required_camera_roles: [wrist, global]
+accepted_outcomes: [accepted]
+include_depth: false
+allow_uncalibrated_cameras: true
+require_temporary_source: true
+metadata:
+  description: TEMP uncalibrated end-to-end pipeline smoke test
+  data_classification: temporary_uncalibrated_pipeline_test
+  image_color_space: RGB
+  real_policy_execution_allowed: false

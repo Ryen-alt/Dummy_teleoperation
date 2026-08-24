@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+from dummy_host.cameras import CameraFrame
+from dummy_host.recording import SessionRecorder
+from dummy_host.schema import AppliedAction, ControlMode, RobotState, load_robot_config
+from dummy_host.teleop import TeleopCommand, load_teleop_profile
+
+from .act_smoke import TEMP_CLASSIFICATION
+
+
+def _rgb_frame(height: int, width: int, index: int, *, global_view: bool) -> np.ndarray:
+    x = np.arange(width, dtype=np.uint16)[None, :]
+    y = np.arange(height, dtype=np.uint16)[:, None]
+    offset = 71 if global_view else 19
+    return np.stack(
+        (
+            np.broadcast_to((x + index * 5 + offset) % 256, (height, width)),
+            np.broadcast_to((y * 2 + index * 3 + offset) % 256, (height, width)),
+            (x + y + index * 7 + offset) % 256,
+        ),
+        axis=2,
+    ).astype(np.uint8)
+
+
+def create_temp_raw_session(
+    *,
+    config_path: str | Path,
+    input_config_path: str | Path,
+    output_root: str | Path,
+    session_name: str,
+    episodes: int = 2,
+    frames_per_episode: int = 12,
+    image_height: int = 96,
+    image_width: int = 96,
+) -> Path:
+    if episodes <= 0 or frames_per_episode < 8:
+        raise ValueError("episodes must be positive and frames_per_episode must be at least 8")
+    if image_height < 32 or image_width < 32:
+        raise ValueError("fixture images must be at least 32x32")
+    config = load_robot_config(config_path)
+    profile = load_teleop_profile(input_config_path)
+    recorder = SessionRecorder(
+        output_root,
+        config,
+        profile,
+        source="synthetic_temp_pipeline_fixture",
+        firmware_version="dummy-ref-v1.6-fixture-not-hardware",
+        session_name=session_name,
+        extra_manifest={
+            "data_classification": TEMP_CLASSIFICATION,
+            "offline_training_only": True,
+            "real_policy_execution_allowed": False,
+            "synthetic_fixture": True,
+            "camera_required": False,
+            "camera_roles": ["wrist", "global"],
+        },
+    )
+    base_ns = 20_000_000_000
+    episode_stride_ns = frames_per_episode * 50_000_000 + 2_000_000
+    sequence = 0
+    for episode_index in range(episodes):
+        episode_id = f"temp-pipeline-{episode_index:03d}"
+        episode_start_ns = base_ns + episode_index * episode_stride_ns
+        recorder.record_event(
+            "episode_start",
+            monotonic_ns=episode_start_ns,
+            payload={
+                "episode_id": episode_id,
+                "status": "recording",
+                "task_id": "temp_pipeline_smoke",
+                "task": "TEMP uncalibrated ACT pipeline smoke",
+            },
+        )
+        for frame_index in range(frames_per_episode):
+            sequence += 1
+            tick_ns = episode_start_ns + (frame_index + 1) * 50_000_000
+            phase = np.float32((episode_index * frames_per_episode + frame_index) * 0.01)
+            position = np.concatenate(
+                (
+                    config.initial_pose_rad.astype(np.float32).copy(),
+                    np.asarray([0.45 + 0.05 * np.sin(float(phase))], dtype=np.float32),
+                )
+            )
+            position[0] += phase
+            requested = position.copy()
+            requested[0] += np.float32(0.005)
+            command = TeleopCommand(
+                monotonic_ns=tick_ns,
+                source="synthetic_temp_pipeline_fixture",
+                joint_velocity_rad_s=np.zeros(6, dtype=np.float32),
+                gripper_velocity_per_s=0.0,
+                deadman=True,
+                hold_requested=False,
+                estop_requested=False,
+                episode_event=None,
+                connected=True,
+                raw={"fixture": True, "frame_index": frame_index},
+            )
+            state = RobotState(
+                position=position,
+                velocity=np.zeros(7, dtype=np.float32),
+                monotonic_ns=tick_ns,
+                mcu_time_us=tick_ns // 1000,
+                mode=ControlMode.TELEOP,
+                fault_bits=0,
+                position_valid=True,
+                velocity_valid=True,
+                gripper_valid=True,
+                last_received_sequence=sequence,
+                last_applied_sequence=sequence,
+                target_age_ms=1,
+                config_hash=config.config_hash,
+                feedback_age_ms=np.ones(7, dtype=np.uint32),
+            )
+            action = AppliedAction(
+                requested=requested,
+                applied=requested.copy(),
+                sequence=sequence,
+                monotonic_ns=tick_ns,
+                clipped=False,
+                reasons=(),
+                source="synthetic_temp_pipeline_fixture",
+            )
+            frames = {}
+            for role, is_global in (("wrist", False), ("global", True)):
+                rgb = _rgb_frame(
+                    image_height,
+                    image_width,
+                    sequence,
+                    global_view=is_global,
+                )
+                frames[role] = CameraFrame(
+                    color=rgb,
+                    depth=None,
+                    capture_time_ns=tick_ns,
+                    arrival_time_ns=tick_ns + 1_000_000,
+                    device_timestamp_ms=sequence * 50.0,
+                    frame_number=sequence,
+                    depth_device_timestamp_ms=0.0,
+                    depth_frame_number=0,
+                    color_depth_skew_ms=0.0,
+                    role=role,
+                    calibration_version="uncalibrated-v0",
+                )
+            recorder.record_sample(command, state, action=action, camera_frames=frames)
+        recorder.record_event(
+            "episode_success",
+            monotonic_ns=episode_start_ns + frames_per_episode * 50_000_000 + 1_000_000,
+            payload={"episode_id": episode_id, "status": "accepted"},
+        )
+    recorder.close()
+    return recorder.session_dir.resolve()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Create a synthetic v1.6-shaped TEMP Raw Session for offline pipeline tests"
+    )
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--input-config", required=True)
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--session-name", default="temp_v16_pipeline_fixture")
+    parser.add_argument("--episodes", type=int, default=2)
+    parser.add_argument("--frames-per-episode", type=int, default=12)
+    parser.add_argument("--image-height", type=int, default=96)
+    parser.add_argument("--image-width", type=int, default=96)
+    args = parser.parse_args()
+    try:
+        session = create_temp_raw_session(
+            config_path=args.config,
+            input_config_path=args.input_config,
+            output_root=args.output_root,
+            session_name=args.session_name,
+            episodes=args.episodes,
+            frames_per_episode=args.frames_per_episode,
+            image_height=args.image_height,
+            image_width=args.image_width,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+    print(
+        json.dumps(
+            {
+                "session": str(session),
+                "data_classification": TEMP_CLASSIFICATION,
+                "synthetic_fixture": True,
+                "real_policy_execution_allowed": False,
+            },
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
