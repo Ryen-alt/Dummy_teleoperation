@@ -118,7 +118,7 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.7");
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.8");
 dummy::protocol::FeedbackSafetyOutput binary_safety_telemetry{};
 dummy::protocol::MonotonicMicros32 binary_monotonic_micros;
 uint64_t binary_last_state_us = 0;

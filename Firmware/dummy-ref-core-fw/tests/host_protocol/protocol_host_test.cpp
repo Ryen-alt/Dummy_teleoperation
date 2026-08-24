@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -201,6 +202,26 @@ void TestCanFeedbackMonitorTracksAgeAndLossWithoutInventingFaultSources()
     assert(status[2].consecutive_position_losses == 0U);
     assert(status[2].temperature_seen);
     assert(std::fabs(status[2].temperature_c - 42.5F) < 1e-6F);
+}
+
+void TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap()
+{
+    CanFeedbackMonitor monitor;
+
+    // Reproduces the runtime race where CAN RX updates the response timestamp
+    // a few microseconds after the control task captured its snapshot time.
+    monitor.OnPositionResponse(1, 1001U);
+    monitor.OnTemperatureResponse(1, 1002U, 35.0F);
+    auto status = monitor.Snapshot(1000U);
+    assert(status[0].position_age_ms == 0U);
+    assert(status[0].temperature_age_ms == 0U);
+
+    // A real 32-bit micros() wrap remains a small positive elapsed interval.
+    monitor.Reset();
+    monitor.OnPositionResponse(
+        1, std::numeric_limits<uint32_t>::max() - 499U);
+    status = monitor.Snapshot(500U);
+    assert(status[0].position_age_ms == 1U);
 }
 
 FeedbackSafetyConfig MakeSafetyConfig()
@@ -593,6 +614,7 @@ int main()
     TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap();
     TestMeasuredVelocityUsesOnlyValidMonotonicIntervals();
     TestCanFeedbackMonitorTracksAgeAndLossWithoutInventingFaultSources();
+    TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap();
     TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault();
     TestFeedbackPollSchedulerUsesOneRequestPerSlot();
     TestUrdfJointSpaceMapping();
