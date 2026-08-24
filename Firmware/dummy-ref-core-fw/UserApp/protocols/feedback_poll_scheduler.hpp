@@ -38,6 +38,22 @@ private:
     uint8_t next_temperature_node_ = 1;
 };
 
+// Keeps actuator writes at a deterministic divisor of the 200 Hz safety and
+// trajectory loop. An inactive tick resets the phase so a newly armed command
+// is transmitted immediately.
+class ActuatorCommandScheduler
+{
+public:
+    explicit ActuatorCommandScheduler(uint32_t control_tick_divisor);
+
+    bool ShouldTransmit(bool command_valid);
+    void Reset();
+
+private:
+    uint32_t control_tick_divisor_ = 1;
+    uint32_t ticks_until_transmit_ = 0;
+};
+
 } // namespace dummy::protocol
 
 #endif // DUMMY_FEEDBACK_POLL_SCHEDULER_HPP

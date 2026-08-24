@@ -2,6 +2,21 @@
 #include "communication.hpp"
 #include "protocols/feedback_runtime.hpp"
 
+namespace
+{
+void RecordPositionRequest(void* context)
+{
+    if (context != nullptr)
+        dummy::protocol::RecordPositionFeedbackRequest(*static_cast<uint8_t*>(context));
+}
+
+void RecordTemperatureRequest(void* context)
+{
+    if (context != nullptr)
+        dummy::protocol::RecordTemperatureFeedbackRequest(*static_cast<uint8_t*>(context));
+}
+}
+
 
 CtrlStepMotor::CtrlStepMotor(CAN_HandleTypeDef* _hcan, uint8_t _id, bool _inverse,
                              uint8_t _reduction, float _angleLimitMin, float _angleLimitMax) :
@@ -93,6 +108,12 @@ void CtrlStepMotor::SetVelocitySetPoint(float _val)
 
 void CtrlStepMotor::SetPositionSetPoint(float _val)
 {
+    SendPositionSetPoint(_val, true);
+}
+
+
+void CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack)
+{
     uint8_t mode = 0x05;
     txHeader.StdId = nodeID << 7 | mode;
 
@@ -100,7 +121,10 @@ void CtrlStepMotor::SetPositionSetPoint(float _val)
     auto* b = (unsigned char*) &_val;
     for (int i = 0; i < 4; i++)
         canBuf[i] = *(b + i);
-    canBuf[4] = 1; // Need ACK
+    canBuf[4] = request_ack ? 1U : 0U;
+    canBuf[5] = 0U;
+    canBuf[6] = 0U;
+    canBuf[7] = 0U;
 
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
@@ -238,8 +262,8 @@ float CtrlStepMotor::GetTemp()
     request_header.StdId = nodeID << 7 | mode;
     uint8_t request_data[8] = {};
 
-    dummy::protocol::RecordTemperatureFeedbackRequest(nodeID);
-    CanSendMessage(get_can_ctx(hcan), request_data, &request_header);
+    CanSendMessage(get_can_ctx(hcan), request_data, &request_header,
+                   RecordTemperatureRequest, &nodeID);
     return temperature;
 }
 
@@ -260,6 +284,14 @@ void CtrlStepMotor::SetAngle(float _angle)
 }
 
 
+void CtrlStepMotor::SetStreamingAngle(float _angle)
+{
+    _angle = inverseDirection ? -_angle : _angle;
+    const float stepMotorCnt = _angle / 360.0f * (float) reduction;
+    SendPositionSetPoint(stepMotorCnt, false);
+}
+
+
 void CtrlStepMotor::SetAngleWithVelocityLimit(float _angle, float _vel)
 {
     _angle = inverseDirection ? -_angle : _angle;
@@ -275,8 +307,8 @@ void CtrlStepMotor::UpdateAngle()
     request_header.StdId = nodeID << 7 | mode;
     uint8_t request_data[8] = {};
 
-    dummy::protocol::RecordPositionFeedbackRequest(nodeID);
-    CanSendMessage(get_can_ctx(hcan), request_data, &request_header);
+    CanSendMessage(get_can_ctx(hcan), request_data, &request_header,
+                   RecordPositionRequest, &nodeID);
 }
 
 

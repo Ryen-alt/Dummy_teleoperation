@@ -40,7 +40,12 @@ struct CAN_context
 
 struct CAN_context* get_can_ctx(CAN_HandleTypeDef* hcan);
 bool StartCanServer(CAN_TypeDef* hcan);
-void CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader);
+using CanTxQueuedCallback = void (*)(void* context);
+// Returns true only when the frame was accepted by a hardware TX mailbox. The
+// optional callback runs in the same critical section as the mailbox enqueue.
+bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader,
+                    CanTxQueuedCallback on_queued = nullptr,
+                    void* callback_context = nullptr);
 void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* data);
 
 #endif // __INTERFACE_CAN_HPP

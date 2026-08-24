@@ -38,4 +38,32 @@ void FeedbackPollScheduler::Reset()
     next_temperature_node_ = 1;
 }
 
+ActuatorCommandScheduler::ActuatorCommandScheduler(uint32_t control_tick_divisor)
+    : control_tick_divisor_(control_tick_divisor == 0U ? 1U : control_tick_divisor)
+{
+}
+
+bool ActuatorCommandScheduler::ShouldTransmit(bool command_valid)
+{
+    if (!command_valid)
+    {
+        Reset();
+        return false;
+    }
+
+    if (ticks_until_transmit_ == 0U)
+    {
+        ticks_until_transmit_ = control_tick_divisor_ - 1U;
+        return true;
+    }
+
+    --ticks_until_transmit_;
+    return false;
+}
+
+void ActuatorCommandScheduler::Reset()
+{
+    ticks_until_transmit_ = 0U;
+}
+
 } // namespace dummy::protocol

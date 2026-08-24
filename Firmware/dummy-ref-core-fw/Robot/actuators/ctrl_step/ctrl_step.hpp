@@ -30,6 +30,9 @@ public:
     State state = STOP;
 
     void SetAngle(float _angle);
+    // Streaming control targets are already supervised by the 200 Hz firmware
+    // executor. Suppress the motor-board ACK to keep CAN feedback deterministic.
+    void SetStreamingAngle(float _angle);
     void SetAngleWithVelocityLimit(float _angle, float _vel);
     // CAN Command
     void SetEnable(bool _enable);
@@ -92,6 +95,8 @@ public:
 
 
 private:
+    void SendPositionSetPoint(float _val, bool request_ack);
+
     CAN_HandleTypeDef* hcan;
     uint8_t canBuf[8] = {};
     CAN_TxHeaderTypeDef txHeader = {};

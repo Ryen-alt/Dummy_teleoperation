@@ -120,8 +120,9 @@ void DummyRobot::ApplyExternalUrdfTargetRad(const std::array<float, 7>& target)
             kRadiansToDegrees;
         targetJoints.a[index] = target_degrees;
         // The 200 Hz executor has already bounded position, velocity and
-        // acceleration. Send its incremental absolute target directly.
-        motorJ[index + 1]->SetAngle(target_degrees - initPose.a[index]);
+        // acceleration. This streaming path intentionally suppresses the
+        // per-target motor ACK; position feedback remains independently polled.
+        motorJ[index + 1]->SetStreamingAngle(target_degrees - initPose.a[index]);
     }
     hand->SetNormalizedPosition(
         target[6], dummy::generated_config::kGripperVelocityLimitPerS);

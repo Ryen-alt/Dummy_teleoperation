@@ -70,6 +70,14 @@ static_assert(kTemperatureSlotInterval > 0U,
 dummy::protocol::FeedbackPollScheduler feedback_poll_scheduler(
     kTemperatureSlotInterval);
 
+constexpr uint32_t kActuatorCommandHz = 100U;
+static_assert(dummy::generated_config::kFirmwareLoopHz % kActuatorCommandHz == 0U,
+              "actuator command rate must divide the control loop rate");
+dummy::protocol::ActuatorCommandScheduler actuator_command_scheduler(
+    dummy::generated_config::kFirmwareLoopHz / kActuatorCommandHz);
+bool actuator_hold_latched = false;
+bool actuator_fault_latched = false;
+
 constexpr uint32_t kFeedbackPollStackBytes = 768U;
 static_assert(kFeedbackPollStackBytes % sizeof(StackType_t) == 0U,
               "feedback task stack must be word aligned");
@@ -132,40 +140,73 @@ void ThreadControlLoopFixUpdate(void* argument)
 
         if (binary_context_active)
         {
-            if (step.entered_hold || safety_stop)
-                robot.HoldCurrentPosition();
-            if (binary_snapshot.mode == dummy::protocol::ControlMode::Fault ||
-                safety.fault_bits != 0)
-                robot.commandHandler.EmergencyStop();
-            else if (step.command_valid && !safety_stop)
+            const bool fault_requested =
+                binary_snapshot.mode == dummy::protocol::ControlMode::Fault ||
+                safety.fault_bits != 0;
+            const bool hold_requested = step.entered_hold || safety_stop;
+
+            if (fault_requested)
             {
-                if (!robot.IsEnabled())
-                    robot.SetEnable(true);
-                robot.ApplyExternalUrdfTargetRad(step.position);
-                dummy::protocol::MarkBinaryTargetApplied(step.sequence);
+                actuator_command_scheduler.Reset();
+                actuator_hold_latched = false;
+                if (!actuator_fault_latched)
+                    robot.commandHandler.EmergencyStop();
+                actuator_fault_latched = true;
+            }
+            else
+            {
+                actuator_fault_latched = false;
+                if (hold_requested)
+                {
+                    actuator_command_scheduler.Reset();
+                    if (!actuator_hold_latched)
+                        robot.HoldCurrentPosition();
+                    actuator_hold_latched = true;
+                }
+                else if (step.command_valid)
+                {
+                    actuator_hold_latched = false;
+                    if (actuator_command_scheduler.ShouldTransmit(true))
+                    {
+                        if (!robot.IsEnabled())
+                            robot.SetEnable(true);
+                        robot.ApplyExternalUrdfTargetRad(step.position);
+                        dummy::protocol::MarkBinaryTargetApplied(step.sequence);
+                    }
+                }
+                else
+                {
+                    actuator_command_scheduler.Reset();
+                }
             }
             robot.UpdateJointPose6D();
         }
-        else if (robot.IsEnabled())
+        else
         {
-            // Send control command to Motors & update Joint states
-            switch (robot.commandMode)
+            actuator_command_scheduler.Reset();
+            actuator_hold_latched = false;
+            actuator_fault_latched = false;
+            if (robot.IsEnabled())
             {
-                case DummyRobot::COMMAND_TARGET_POINT_SEQUENTIAL:
-                case DummyRobot::COMMAND_TARGET_POINT_INTERRUPTABLE:
-                case DummyRobot::COMMAND_CONTINUES_TRAJECTORY:
-                    robot.MoveJoints(robot.targetJoints);
-                    robot.UpdateJointPose6D();
-                    break;
-                case DummyRobot::COMMAND_MOTOR_TUNING:
-                    robot.tuningHelper.Tick(10);
-                    robot.UpdateJointPose6D();
-                    break;
+                // Send control command to Motors & update Joint states
+                switch (robot.commandMode)
+                {
+                    case DummyRobot::COMMAND_TARGET_POINT_SEQUENTIAL:
+                    case DummyRobot::COMMAND_TARGET_POINT_INTERRUPTABLE:
+                    case DummyRobot::COMMAND_CONTINUES_TRAJECTORY:
+                        robot.MoveJoints(robot.targetJoints);
+                        robot.UpdateJointPose6D();
+                        break;
+                    case DummyRobot::COMMAND_MOTOR_TUNING:
+                        robot.tuningHelper.Tick(10);
+                        robot.UpdateJointPose6D();
+                        break;
+                }
+            } else
+            {
+                // Just update Joint states
+                robot.UpdateJointPose6D();
             }
-        } else
-        {
-            // Just update Joint states
-            robot.UpdateJointPose6D();
         }
     }
 }

@@ -487,6 +487,22 @@ void TestFeedbackPollSchedulerUsesOneRequestPerSlot()
     }
 }
 
+void TestActuatorCommandSchedulerIsDeterministicAndResets()
+{
+    ActuatorCommandScheduler scheduler(2U);
+    const std::array<bool, 6> expected = {true, false, true, false, true, false};
+    for (const bool should_transmit : expected)
+        assert(scheduler.ShouldTransmit(true) == should_transmit);
+
+    assert(!scheduler.ShouldTransmit(false));
+    assert(scheduler.ShouldTransmit(true));
+    assert(!scheduler.ShouldTransmit(true));
+
+    ActuatorCommandScheduler invalid_divisor(0U);
+    assert(invalid_divisor.ShouldTransmit(true));
+    assert(invalid_divisor.ShouldTransmit(true));
+}
+
 void TestLatestTargetExecutorIsBoundedAndHolds()
 {
     ExecutorConfig config{};
@@ -628,6 +644,7 @@ int main()
     TestStateValidityBitsComeFromOneFeedbackSnapshot();
     TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault();
     TestFeedbackPollSchedulerUsesOneRequestPerSlot();
+    TestActuatorCommandSchedulerIsDeterministicAndResets();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();

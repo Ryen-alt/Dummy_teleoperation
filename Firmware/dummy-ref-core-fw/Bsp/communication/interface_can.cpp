@@ -266,15 +266,16 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* hcan)
         ctx->unexpected_errors++;
 }
 
-void CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader)
+bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader,
+                    CanTxQueuedCallback on_queued, void* callback_context)
 {
     if (canCtx == nullptr || canCtx->handle == nullptr || txData == nullptr ||
         txHeader == nullptr)
-        return;
+        return false;
 
     const osSemaphoreId semaphore = TxSemaphore(canCtx->handle);
     if (semaphore == nullptr)
-        return;
+        return false;
 
     osStatus semaphore_status = osSemaphoreAcquire(semaphore, kCanTxWaitTicks);
     if (semaphore_status != osOK)
@@ -299,16 +300,25 @@ void CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* t
             semaphore_status = osSemaphoreAcquire(semaphore, 0U);
         }
         if (semaphore_status != osOK)
-            return;
+            return false;
     }
 
+    // Keep send accounting atomic with mailbox admission. Without this, a
+    // motor response or the realtime control task could run between enqueue
+    // and feedback bookkeeping and manufacture a false missed-response count.
+    taskENTER_CRITICAL();
     const HAL_StatusTypeDef send_status = HAL_CAN_AddTxMessage(
         canCtx->handle, txHeader, txData, &canCtx->last_heartbeat_mailbox);
+    if (send_status == HAL_OK && on_queued != nullptr)
+        on_queued(callback_context);
+    taskEXIT_CRITICAL();
     if (send_status != HAL_OK)
     {
         // No completion interrupt will be generated when the frame was never
         // queued, so restore the token immediately.
         canCtx->unexpected_errors++;
         ReleaseTxToken(canCtx->handle);
+        return false;
     }
+    return true;
 }
