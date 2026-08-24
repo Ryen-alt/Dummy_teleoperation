@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 from threading import Event, Thread
 
 from dummy_host.cameras import CameraManager
@@ -15,7 +17,8 @@ from dummy_host.input_evdev import (
     create_gamepad_source,
     resolve_gamepad_endpoint,
 )
-from dummy_host.recording import SessionRecorder
+from dummy_host.frame_archive import DEFAULT_MINIMUM_FREE_BYTES
+from dummy_host.recording import SessionRecorder, estimate_camera_archive_bytes
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import ConfigError, load_robot_config, validate_camera_rig_for_formal_collection
 from dummy_host.teleop import load_teleop_profile, validate_profile_for_robot
@@ -117,6 +120,21 @@ def main() -> None:
     camera_manager = CameraManager.from_config(config.camera_rig) if args.with_cameras else None
     packet_transport = FakeMcuTransport(config) if args.simulate else SerialTransport(args.port)
     robot = DummyRobot(config, packet_transport, camera_manager=camera_manager)
+    estimated_camera_bytes = (
+        estimate_camera_archive_bytes(config, args.duration)
+        if args.with_cameras and args.duration is not None
+        else 0
+    )
+    session_root = Path(args.session_root)
+    session_root.mkdir(parents=True, exist_ok=True)
+    available_bytes = shutil.disk_usage(session_root).free
+    required_bytes = estimated_camera_bytes + DEFAULT_MINIMUM_FREE_BYTES
+    if estimated_camera_bytes and available_bytes < required_bytes:
+        parser.error(
+            "insufficient free space for lossless camera capture: "
+            f"estimated={estimated_camera_bytes} free={available_bytes} "
+            f"required_with_reserve={required_bytes}"
+        )
     recorder = SessionRecorder(
         args.session_root,
         config,
@@ -139,6 +157,8 @@ def main() -> None:
             if args.simulate and args.allow_joint is None
             else sorted(set(args.allow_joint or ())),
             "gripper_allowed": args.allow_gripper,
+            "estimated_camera_archive_bytes": estimated_camera_bytes,
+            "free_bytes_at_start": available_bytes,
         },
     )
     clean_shutdown = False
@@ -171,7 +191,9 @@ def main() -> None:
     print(
         f"[collect] started session_dir={recorder.session_dir} "
         f"duration={'unbounded' if args.duration is None else f'{args.duration:.1f}s'} "
-        f"progress_interval={args.progress_interval:.1f}s",
+        f"progress_interval={args.progress_interval:.1f}s "
+        f"estimated_camera_gib={estimated_camera_bytes / 1024**3:.2f} "
+        f"free_gib={available_bytes / 1024**3:.2f}",
         file=sys.stderr,
         flush=True,
     )

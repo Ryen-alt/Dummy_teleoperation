@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import sqlite3
@@ -15,7 +16,7 @@ from typing import Callable, Mapping
 import numpy as np
 
 from .cameras import CameraFrame
-from .frame_archive import FrameArchive, NpzFrameArchive
+from .frame_archive import DEFAULT_MINIMUM_FREE_BYTES, FrameArchive, NpzFrameArchive
 from .schema import AppliedAction, RobotConfig, RobotState
 from .teleop import TeleopCommand, TeleopProfile
 
@@ -26,6 +27,26 @@ class RecorderError(RuntimeError):
 
 class RecorderBackpressure(RecorderError):
     pass
+
+
+def estimate_camera_archive_bytes(robot_config: RobotConfig, duration_s: float) -> int:
+    """Conservative upper bound for atomic, uncompressed camera capture."""
+
+    if not np.isfinite(duration_s) or duration_s <= 0:
+        raise ValueError("duration_s must be positive and finite")
+    samples = math.ceil(duration_s * robot_config.control_rate_hz)
+    bytes_per_sample = 0
+    for camera in robot_config.camera_rig.cameras.values():
+        if not camera.enabled:
+            continue
+        pixels = camera.width * camera.height
+        bytes_per_sample += pixels * 3
+        if camera.depth_format.strip().lower() not in {"", "none"}:
+            bytes_per_sample += pixels * 2
+        # ZIP container headers and scalar metadata arrays. The 5% multiplier
+        # below covers filesystem allocation and future metadata additions.
+        bytes_per_sample += 4096
+    return math.ceil(samples * bytes_per_sample * 1.05)
 
 
 @dataclass(frozen=True)
@@ -86,6 +107,7 @@ class SessionRecorder:
         queue_size: int = 64,
         frame_segment_size: int = 300,
         frame_archive_factory: Callable[[Path], FrameArchive] | None = None,
+        minimum_camera_free_bytes: int = DEFAULT_MINIMUM_FREE_BYTES,
         session_name: str | None = None,
         extra_manifest: Mapping[str, object] | None = None,
     ) -> None:
@@ -93,6 +115,8 @@ class SessionRecorder:
             raise ValueError("queue_size must be positive")
         if frame_segment_size <= 0:
             raise ValueError("frame_segment_size must be positive")
+        if minimum_camera_free_bytes < 0:
+            raise ValueError("minimum_camera_free_bytes must be non-negative")
         if not source:
             raise ValueError("source must be non-empty")
         if session_name is None:
@@ -139,9 +163,16 @@ class SessionRecorder:
             lambda session_dir: NpzFrameArchive(
                 session_dir,
                 segment_size=self._frame_segment_size,
+                compressed=False,
+                sync_files=True,
+                minimum_free_bytes=minimum_camera_free_bytes,
             )
         )
         self._queue: queue.Queue[tuple[str, object] | None] = queue.Queue(maxsize=queue_size)
+        # Sample producers stop before consuming the whole queue so shutdown,
+        # HOLD and Episode audit events still have bounded space available.
+        self._critical_event_reserve = min(4, max(0, queue_size - 1))
+        self._sample_queue_limit = queue_size - self._critical_event_reserve
         self._thread = threading.Thread(target=self._writer, name="dummy-session-writer", daemon=True)
         self._writer_error: BaseException | None = None
         self._closed = False
@@ -174,7 +205,15 @@ class SessionRecorder:
             "joint_order": list(robot_config.joint_order),
             "joint_unit": robot_config.joint_unit,
             "array_encoding": "little-endian float32 blobs",
-            "camera_archive": "pluggable FrameArchive; default lossless RGB/depth NPZ by role",
+            "camera_archive": (
+                "atomic lossless uncompressed RGB/depth NPZ by role; "
+                "compression deferred to offline dataset export"
+            ),
+            "camera_archive_compression": "none",
+            "camera_archive_atomic_commit": True,
+            "camera_archive_minimum_free_bytes": minimum_camera_free_bytes,
+            "recorder_queue_capacity": queue_size,
+            "recorder_critical_event_reserve": self._critical_event_reserve,
         }
         if extra_manifest:
             self._manifest["extra"] = dict(extra_manifest)
@@ -255,7 +294,7 @@ class SessionRecorder:
             valid=valid,
             invalid_reason=invalid_reason,
         )
-        self._enqueue(("sample", record))
+        self._enqueue(("sample", record), sample=True)
 
     def record_event(
         self, event: str, *, monotonic_ns: int | None = None, payload: Mapping[str, object] | None = None
@@ -301,13 +340,19 @@ class SessionRecorder:
         self._write_json_atomic(self.checksums_path, checksums)
         return stats
 
-    def _enqueue(self, item: tuple[str, object]) -> None:
+    def _enqueue(self, item: tuple[str, object], *, sample: bool = False) -> None:
         self._raise_writer_error()
+        if sample and self._queue.qsize() >= self._sample_queue_limit:
+            raise RecorderBackpressure(
+                "recorder sample queue reached its safety limit; HOLD without "
+                f"dropping data ({self._sample_queue_limit}/{self._queue.maxsize}, "
+                f"{self._critical_event_reserve} slots reserved for critical events)"
+            )
         try:
             self._queue.put_nowait(item)
         except queue.Full as exc:
             raise RecorderBackpressure(
-                "recorder queue is full; HOLD instead of dropping a control sample"
+                "recorder queue is full; HOLD instead of dropping data"
             ) from exc
         with self._stats_lock:
             self._queue_high_watermark = max(self._queue_high_watermark, self._queue.qsize())
