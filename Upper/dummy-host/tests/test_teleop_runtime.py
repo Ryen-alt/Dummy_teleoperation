@@ -44,6 +44,18 @@ class IdleKeyboard(ScriptedKeyboard):
         return self.mapper.map(set(), now_ns)
 
 
+class StrayEpisodeFailureKeyboard(ScriptedKeyboard):
+    def poll(self, now_ns: int | None = None) -> TeleopCommand:
+        assert now_ns is not None
+        self.polls += 1
+        keys: set[str] = set()
+        if 2 <= self.polls <= 10:
+            keys = {"KEY_SPACE", "KEY_Q"}
+        if self.polls == 5:
+            keys.add("KEY_F7")
+        return self.mapper.map(keys, now_ns)
+
+
 class SuccessfulEpisodeKeyboard(ScriptedKeyboard):
     def poll(self, now_ns: int | None = None) -> TeleopCommand:
         assert now_ns is not None
@@ -151,6 +163,38 @@ def test_idle_fake_mcu_collection_keeps_state_fresh(
     assert result.final_mode == "HOLD"
     assert source.closed
     assert not robot.is_connected
+
+
+def test_stray_episode_failure_while_idle_does_not_abort_teleoperation(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = StrayEpisodeFailureKeyboard(KeyboardMapper(profile))
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_stray_episode_failure",
+    )
+
+    result = run_teleop_collection(
+        robot,
+        source,
+        recorder,
+        profile,
+        duration_s=0.7,
+    )
+    recorder.close()
+
+    events = recorder.events_path.read_text(encoding="utf-8")
+    assert result.actions_sent >= 1
+    assert '"event":"episode_transition_ignored"' in events
+    assert '"event":"episode_transition_rejected"' not in events
+    assert result.final_mode == "HOLD"
 
 
 def test_required_camera_cannot_be_silently_omitted(

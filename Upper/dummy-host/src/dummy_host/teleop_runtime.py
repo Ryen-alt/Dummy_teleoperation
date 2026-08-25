@@ -612,67 +612,114 @@ def run_teleop_collection(
                 return
 
             if command.episode_event is not None:
-                try:
-                    if command.episode_event == "start":
-                        episode = episode_manager.begin(
-                            task_id=task_id,
-                            task=task,
-                            now_ns=now_ns,
-                            metadata={"source": command.source},
-                        )
-                        episode_last_sequence = None
-                        episode_finalize_deadline_ns = None
-                    elif command.episode_event == "success":
-                        if episode_last_sequence is None:
-                            fail_active_episode("episode_has_no_action", now_ns)
-                            lease.request("hold")
-                            record_control_sample(
-                                command,
-                                final_state,
-                                scheduled,
-                                valid=False,
-                                invalid_reason="an Episode without any action cannot be accepted",
-                            )
-                            return
-                        episode = episode_manager.begin_finalizing(now_ns=now_ns)
-                        episode_finalize_deadline_ns = now_ns + 250_000_000
-                    else:
-                        outcome = {
-                            "failure": EpisodeStatus.FAILED,
-                            "cancel": EpisodeStatus.CANCELLED,
-                        }.get(command.episode_event)
-                        if outcome is None:
-                            raise EpisodeError(f"unknown Episode event {command.episode_event!r}")
-                        episode = episode_manager.finish(outcome, now_ns=now_ns)
-                except EpisodeError as exc:
-                    lease.request("hold")
-                    recorder.record_event(
-                        "episode_transition_rejected",
-                        monotonic_ns=now_ns,
-                        payload={"event": command.episode_event, "error": str(exc)},
+                requested_episode_event = command.episode_event
+                episode_status = episode_manager.snapshot.status
+                episode_active = episode_status in {
+                    EpisodeStatus.RECORDING,
+                    EpisodeStatus.FINALIZING,
+                }
+                transition_allowed = (
+                    (requested_episode_event == "start" and not episode_active)
+                    or (
+                        requested_episode_event == "success"
+                        and episode_status is EpisodeStatus.RECORDING
                     )
-                    raise TeleopError(str(exc)) from exc
-                recorder.record_event(
-                    "episode_finalizing"
-                    if command.episode_event == "success"
-                    else f"episode_{command.episode_event}",
-                    monotonic_ns=now_ns,
-                    payload={
-                        "source": command.source,
-                        "episode_id": episode.episode_id,
-                        "status": episode.status.value,
-                        "task_id": episode.task_id,
-                        "task": episode.task,
-                    },
+                    or (
+                        requested_episode_event in {"failure", "cancel"}
+                        and episode_active
+                    )
                 )
-                episode_events += 1
-                if command.episode_event in {"failure", "cancel"}:
-                    lease.request("hold")
-                    integrator.reset()
-                    control_had_lease = False
-                    hold_transitions += 1
-                    record_control_sample(command, final_state, scheduled)
-                    return
+                if not transition_allowed:
+                    # Episode buttons are metadata controls, not robot safety
+                    # controls.  A stray stick click while no Episode is active
+                    # must not terminate an otherwise healthy teleop session.
+                    recorder.record_event(
+                        "episode_transition_ignored",
+                        monotonic_ns=now_ns,
+                        payload={
+                            "event": requested_episode_event,
+                            "current_status": episode_status.value,
+                        },
+                    )
+                    command = replace(command, episode_event=None)
+                    last_command = command
+                else:
+                    try:
+                        if requested_episode_event == "start":
+                            episode = episode_manager.begin(
+                                task_id=task_id,
+                                task=task,
+                                now_ns=now_ns,
+                                metadata={"source": command.source},
+                            )
+                            episode_last_sequence = None
+                            episode_finalize_deadline_ns = None
+                        elif requested_episode_event == "success":
+                            if episode_last_sequence is None:
+                                fail_active_episode("episode_has_no_action", now_ns)
+                                lease.request("hold")
+                                record_control_sample(
+                                    command,
+                                    final_state,
+                                    scheduled,
+                                    valid=False,
+                                    invalid_reason="an Episode without any action cannot be accepted",
+                                )
+                                return
+                            episode = episode_manager.begin_finalizing(now_ns=now_ns)
+                            episode_finalize_deadline_ns = now_ns + 250_000_000
+                        else:
+                            outcome = {
+                                "failure": EpisodeStatus.FAILED,
+                                "cancel": EpisodeStatus.CANCELLED,
+                            }.get(requested_episode_event)
+                            if outcome is None:
+                                raise EpisodeError(
+                                    f"unknown Episode event {requested_episode_event!r}"
+                                )
+                            episode = episode_manager.finish(outcome, now_ns=now_ns)
+                    except EpisodeError as exc:
+                        lease.request("hold")
+                        hold_latched = True
+                        integrator.reset()
+                        fail_active_episode("episode_transition_rejected", now_ns)
+                        recorder.record_event(
+                            "episode_transition_rejected",
+                            monotonic_ns=now_ns,
+                            payload={
+                                "event": requested_episode_event,
+                                "error": str(exc),
+                            },
+                        )
+                        record_control_sample(
+                            command,
+                            final_state,
+                            scheduled,
+                            valid=False,
+                            invalid_reason=f"Episode transition rejected: {exc}",
+                        )
+                        return
+                    recorder.record_event(
+                        "episode_finalizing"
+                        if requested_episode_event == "success"
+                        else f"episode_{requested_episode_event}",
+                        monotonic_ns=now_ns,
+                        payload={
+                            "source": command.source,
+                            "episode_id": episode.episode_id,
+                            "status": episode.status.value,
+                            "task_id": episode.task_id,
+                            "task": episode.task,
+                        },
+                    )
+                    episode_events += 1
+                    if requested_episode_event in {"failure", "cancel"}:
+                        lease.request("hold")
+                        integrator.reset()
+                        control_had_lease = False
+                        hold_transitions += 1
+                        record_control_sample(command, final_state, scheduled)
+                        return
 
             if not command.connected:
                 lease.request("hold")
@@ -782,8 +829,15 @@ def run_teleop_collection(
                     integrator.reset()
                     control_had_lease = False
                     hold_transitions += 1
+                    hold_event = (
+                        "operator_hold"
+                        if command.hold_requested
+                        else "deadman_released"
+                        if not command.deadman
+                        else "safety_hold_latched"
+                    )
                     recorder.record_event(
-                        "operator_hold" if command.hold_requested else "deadman_released",
+                        hold_event,
                         monotonic_ns=now_ns,
                     )
                 record_control_sample(command, final_state, scheduled)
