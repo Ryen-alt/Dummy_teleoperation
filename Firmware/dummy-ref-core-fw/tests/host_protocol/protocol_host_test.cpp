@@ -398,7 +398,10 @@ void TestSessionTargetAndTimeout()
     ControlSession session(MakeConfig(true), "test-fw");
     session.SetControlReady(true);
     const Packet hello = MakeConfiguredHello();
-    session.Process(hello, 1000);
+    const ProcessResult hello_result = session.Process(hello, 1000);
+    HelloAckPayload hello_ack{};
+    std::memcpy(&hello_ack, hello_result.response.payload.data(), sizeof(hello_ack));
+    assert((hello_ack.capabilities & kCapabilityMultiChannelSequence) != 0U);
 
     Packet acquire = MakePacket(MessageType::AcquireControl, hello.header.session_id,
                                 hello.header.sequence + 1);
@@ -515,6 +518,51 @@ void TestSequenceWrapUsesUint32SerialArithmetic()
         MessageType::Heartbeat, hello.header.session_id, 1U);
     assert(ResponseCode(session.Process(heartbeat, 4U)) == ResultCode::Ok);
     assert(ResponseCode(session.Process(heartbeat, 5U)) == ResultCode::BadSequence);
+}
+
+void TestReliableControlMayOvertakeAnOlderMotionTarget()
+{
+    ControlSession session(MakeConfig(true), "test-fw");
+    session.SetControlReady(true);
+    const Packet hello = MakeConfiguredHello();
+    session.Process(hello, 1U);
+
+    Packet acquire = MakePacket(MessageType::AcquireControl,
+                                hello.header.session_id,
+                                hello.header.sequence + 1U);
+    SetPayload(acquire, AcquireControlPayload{500U});
+    assert(ResponseCode(session.Process(acquire, 2U)) == ResultCode::Ok);
+
+    Packet mode = MakePacket(MessageType::SetMode, hello.header.session_id,
+                             hello.header.sequence + 2U);
+    SetPayload(mode, SetModePayload{static_cast<uint8_t>(ControlMode::Teleop)});
+    assert(ResponseCode(session.Process(mode, 3U)) == ResultCode::Ok);
+
+    JointTargetPayload target{};
+    std::copy(dummy::generated_config::kInitialPoseRad.begin(),
+              dummy::generated_config::kInitialPoseRad.end(), target.target);
+    target.target[2] = -1.0F;
+    target.target[6] = 0.5F;
+    for (size_t index = 0; index < 6; ++index)
+        target.max_velocity[index] = 0.1F;
+    target.valid_for_ms = 100U;
+    Packet delayed_target = MakePacket(MessageType::SetJointTarget,
+                                       hello.header.session_id,
+                                       hello.header.sequence + 3U);
+    SetPayload(delayed_target, target);
+
+    // The serial writer intentionally prioritizes reliable control over the
+    // latest-value motion mailbox.  That must not turn the delayed target into
+    // a false replay rejection.
+    Packet overtaking_heartbeat = MakePacket(MessageType::Heartbeat,
+                                             hello.header.session_id,
+                                             hello.header.sequence + 4U);
+    assert(ResponseCode(session.Process(overtaking_heartbeat, 4U)) == ResultCode::Ok);
+    assert(ResponseCode(session.Process(delayed_target, 5U)) == ResultCode::Ok);
+    assert(session.last_received_sequence() == delayed_target.header.sequence);
+
+    // The target channel still rejects an exact replay independently.
+    assert(ResponseCode(session.Process(delayed_target, 6U)) == ResultCode::BadSequence);
 }
 
 Packet MakeConfiguredHello()
@@ -969,6 +1017,7 @@ int main()
     TestTelemetryMovesToLatestHelloAfterRelease();
     TestBadSequenceAndTargetAreRejected();
     TestSequenceWrapUsesUint32SerialArithmetic();
+    TestReliableControlMayOvertakeAnOlderMotionTarget();
     TestLatestTargetExecutorIsBoundedAndHolds();
     TestExecutorRejectsInvalidRuntimeLimits();
     TestLatestTargetWinsBeforeApplication();

@@ -75,6 +75,7 @@ class ActionProgressStage(enum.IntEnum):
 
 
 ACK_DETAIL_FEEDBACK_NOT_READY = 1
+CAPABILITY_MULTI_CHANNEL_SEQUENCE = 1 << 0
 
 
 @dataclass(frozen=True)

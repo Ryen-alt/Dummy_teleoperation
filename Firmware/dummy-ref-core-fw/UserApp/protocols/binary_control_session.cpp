@@ -91,6 +91,7 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
 
         session_id_ = request.header.session_id;
         last_command_sequence_ = request.header.sequence;
+        last_target_sequence_ = request.header.sequence;
         last_received_sequence_ = 0;
         lease_duration_ms_ = payload.lease_ms;
         lease_active_ = true;
@@ -102,9 +103,25 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
     }
 
     ProcessResult validation{};
-    if (!ValidateSessionAndSequence(request, validation))
+    if (!ValidateSession(request, validation))
         return validation;
-    last_command_sequence_ = request.header.sequence;
+    if (message_type == MessageType::SetJointTarget)
+    {
+        if (!IsNewerSequence(request.header.sequence, last_target_sequence_))
+            return Ack(request, ResultCode::BadSequence);
+        last_target_sequence_ = request.header.sequence;
+        // Keep the reliable-control watermark monotonic when target and
+        // control packets happen to arrive in enqueue order.  Never move it
+        // backwards when a reliable packet legitimately overtook a target.
+        if (IsNewerSequence(request.header.sequence, last_command_sequence_))
+            last_command_sequence_ = request.header.sequence;
+    }
+    else
+    {
+        if (!IsNewerSequence(request.header.sequence, last_command_sequence_))
+            return Ack(request, ResultCode::BadSequence);
+        last_command_sequence_ = request.header.sequence;
+    }
 
     switch (message_type)
     {
@@ -295,13 +312,13 @@ ProcessResult ControlSession::Hello(const Packet& request)
     output.response.header.sender_time_us = 0;
     HelloAckPayload response{};
     std::copy(config_.config_sha256.begin(), config_.config_sha256.end(), response.config_sha256);
-    response.capabilities = 0;
+    response.capabilities = kCapabilityMultiChannelSequence;
     std::copy(firmware_version_.begin(), firmware_version_.end(), response.firmware_version);
     WritePayload(output.response, response);
     return output;
 }
 
-bool ControlSession::ValidateSessionAndSequence(const Packet& request, ProcessResult& result)
+bool ControlSession::ValidateSession(const Packet& request, ProcessResult& result) const
 {
     if (!lease_active_)
     {
@@ -311,11 +328,6 @@ bool ControlSession::ValidateSessionAndSequence(const Packet& request, ProcessRe
     if (request.header.session_id != session_id_)
     {
         result = Ack(request, ResultCode::BadSession);
-        return false;
-    }
-    if (!IsNewerSequence(request.header.sequence, last_command_sequence_))
-    {
-        result = Ack(request, ResultCode::BadSequence);
         return false;
     }
     return true;

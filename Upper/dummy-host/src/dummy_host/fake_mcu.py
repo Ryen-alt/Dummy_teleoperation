@@ -7,6 +7,7 @@ from collections.abc import Callable
 import numpy as np
 
 from .protocol import (
+    CAPABILITY_MULTI_CHANNEL_SEQUENCE,
     ACQUIRE_CONTROL,
     SET_MODE,
     MessageType,
@@ -46,6 +47,7 @@ class FakeMcuTransport:
 
     is_simulated = True
     firmware_version = "fake-mcu-v2.1"
+    firmware_capabilities = CAPABILITY_MULTI_CHANNEL_SEQUENCE
 
     def __init__(
         self,
@@ -168,7 +170,7 @@ class FakeMcuTransport:
                     MessageType.HELLO_ACK,
                     pack_hello_ack(
                         self.config.config_hash_bytes,
-                        0,
+                        self.firmware_capabilities,
                         self.firmware_version,
                     ),
                 )

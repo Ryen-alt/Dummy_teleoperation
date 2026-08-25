@@ -8,7 +8,7 @@ import pytest
 from dummy_host.fake_mcu import FakeMcuTransport
 from dummy_host.protocol import MessageType, Packet, pack_hello
 from dummy_host.robot_driver import DummyRobot, RobotError
-from dummy_host.schema import ControlMode
+from dummy_host.schema import ConfigError, ControlMode
 from dummy_host.domain.models import ActionStage, FaultBits, HoldReasonBits
 
 
@@ -48,6 +48,12 @@ class ExactCanWithoutPostFeedbackTransport(FakeMcuTransport):
             self._last_applied = applied
 
 
+class OldV21WithoutMultiChannelSequence(FakeMcuTransport):
+    is_simulated = False
+    firmware_version = "dummy-ref-v2.1"
+    firmware_capabilities = 0
+
+
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
     robot = DummyRobot(config, FakeMcuTransport(config))
     with robot:
@@ -75,6 +81,13 @@ def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
         while robot.read_state().mode != ControlMode.HOLD and time.monotonic() < deadline:
             time.sleep(0.005)
         assert robot.read_state().mode == ControlMode.HOLD
+
+
+def test_real_v21_without_multi_channel_sequence_capability_is_rejected(config) -> None:
+    robot = DummyRobot(config, OldV21WithoutMultiChannelSequence(config))
+    with pytest.raises(ConfigError, match="multi-channel sequence"):
+        robot.connect()
+    assert not robot.is_connected
 
 
 def test_nonblocking_action_reports_exact_can_queue_and_post_feedback(config) -> None:

@@ -13,6 +13,7 @@ constexpr uint8_t kProtocolVersion = 4;
 constexpr size_t kMaxDecodedFrame = 512;
 constexpr size_t kCrcSize = 4;
 constexpr size_t kActionProgressReplayCapacity = 6;
+constexpr uint32_t kCapabilityMultiChannelSequence = 1U << 0U;
 
 enum class MessageType : uint8_t
 {

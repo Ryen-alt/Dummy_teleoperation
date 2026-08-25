@@ -72,7 +72,7 @@ private:
     ProcessResult Ack(const Packet& request, ResultCode result = ResultCode::Ok,
                       uint16_t detail = 0) const;
     ProcessResult Hello(const Packet& request);
-    bool ValidateSessionAndSequence(const Packet& request, ProcessResult& result);
+    bool ValidateSession(const Packet& request, ProcessResult& result) const;
     ResultCode ValidateTarget(const JointTargetPayload& target) const;
     void EnterHold(uint16_t hold_reason_bits);
     void ExtendLease(uint64_t now_us);
@@ -88,6 +88,10 @@ private:
     uint32_t hello_sequence_ = 0;
     uint32_t session_id_ = 0;
     uint32_t last_command_sequence_ = 0;
+    // Motion targets and reliable control commands are transported on
+    // different priority channels.  A newer heartbeat may therefore reach
+    // the MCU before an older target without making that target a replay.
+    uint32_t last_target_sequence_ = 0;
     uint32_t last_received_sequence_ = 0;
     uint32_t lease_duration_ms_ = 0;
     uint64_t lease_deadline_us_ = 0;

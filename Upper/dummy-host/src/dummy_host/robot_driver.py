@@ -20,6 +20,7 @@ from .domain import (
     RobotHealth,
 )
 from .protocol import (
+    CAPABILITY_MULTI_CHANNEL_SEQUENCE,
     ACK_DETAIL_FEEDBACK_NOT_READY,
     ACQUIRE_CONTROL,
     ActionProgressStage,
@@ -114,6 +115,7 @@ class DummyRobot:
         self._control_acquired = False
         self._reader_error: BaseException | None = None
         self.firmware_version: str | None = None
+        self.firmware_capabilities = 0
         set_tx_observer = getattr(self.transport, "set_tx_observer", None)
         if callable(set_tx_observer):
             set_tx_observer(self._on_serial_tx)
@@ -149,7 +151,11 @@ class DummyRobot:
             response = self._hello_with_retry(deadline)
             if response.message_type != MessageType.HELLO_ACK:
                 raise RobotError(f"expected HELLO_ACK, received {response.message_type.name}")
-            remote_hash, _, self.firmware_version = unpack_hello_ack(response.payload)
+            (
+                remote_hash,
+                self.firmware_capabilities,
+                self.firmware_version,
+            ) = unpack_hello_ack(response.payload)
             if remote_hash != self.config.config_hash_bytes:
                 raise ConfigError(
                     f"firmware config hash {remote_hash.hex()} does not match host {self.config.config_hash}"
@@ -161,6 +167,15 @@ class DummyRobot:
                 raise ConfigError(
                     "protocol v4 host requires firmware dummy-ref-v2.1 exactly; "
                     f"received {self.firmware_version!r}"
+                )
+            if (
+                not self.transport.is_simulated
+                and not self.firmware_capabilities
+                & CAPABILITY_MULTI_CHANNEL_SEQUENCE
+            ):
+                raise ConfigError(
+                    "dummy-ref-v2.1 firmware is missing the multi-channel sequence "
+                    "capability; rebuild and reflash the current v2.1 firmware"
                 )
             self._wait_for_first_state(deadline)
             self._connected = True
@@ -517,7 +532,10 @@ class DummyRobot:
         )
 
     def _hello_with_retry(self, deadline: float) -> Packet:
-        payload = pack_hello(self.config.config_hash_bytes)
+        payload = pack_hello(
+            self.config.config_hash_bytes,
+            CAPABILITY_MULTI_CHANNEL_SEQUENCE,
+        )
         last_timeout: RobotError | None = None
         while True:
             remaining = deadline - time.monotonic()
