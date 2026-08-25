@@ -201,7 +201,7 @@ def test_real_cartesian_runtime_rejects_missing_calibration_before_connect(
 ) -> None:
     class RealLabelledFakeMcu(FakeMcuTransport):
         is_simulated = False
-        firmware_version = "dummy-ref-v2.1"
+        firmware_version = "dummy-ref-v2.2"
 
     class NeverPolled:
         closed = False
@@ -242,7 +242,7 @@ def test_real_cartesian_runtime_requires_three_ready_pose_sweeps(
 ) -> None:
     class RealLabelledFakeMcu(FakeMcuTransport):
         is_simulated = False
-        firmware_version = "dummy-ref-v2.1"
+        firmware_version = "dummy-ref-v2.2"
 
     class NeverPolled:
         closed = False

@@ -87,6 +87,7 @@ class ActionStage(StrEnum):
     SERIAL_SEND_FINISHED = "serial_send_finished"
     ACKNOWLEDGED = "acknowledged"
     CAN_QUEUED_EXACT = "can_queued_exact"
+    CAN_TX_COMPLETE_EXACT = "can_tx_complete_exact"
     POST_COMMAND_FEEDBACK = "post_command_feedback"
     SUPERSEDED = "superseded"
     PREEMPTED_BY_SAFETY = "preempted_by_safety"
@@ -109,8 +110,9 @@ class ActionLifecycleUpdate:
 
 class ActionProgressFlags(IntEnum):
     CAN_QUEUED_EXACT = 1 << 0
-    POST_COMMAND_FEEDBACK = 1 << 1
-    SUPERSEDED = 1 << 2
+    CAN_TX_COMPLETE_EXACT = 1 << 1
+    POST_COMMAND_FEEDBACK = 1 << 2
+    SUPERSEDED = 1 << 3
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,7 @@ class ActionProgressRecord:
     sequence: int
     flags: int
     can_queued_mcu_us: int = 0
+    can_tx_complete_mcu_us: int = 0
     post_feedback_mcu_us: int = 0
     feedback_sweep_id: int = 0
 
@@ -126,6 +129,7 @@ class ActionProgressRecord:
             self.sequence,
             self.flags,
             self.can_queued_mcu_us,
+            self.can_tx_complete_mcu_us,
             self.post_feedback_mcu_us,
             self.feedback_sweep_id,
         ) < 0:
@@ -274,6 +278,28 @@ class RobotState:
                 record.can_queued_mcu_us
                 for record in reversed(self.action_progress)
                 if record.flags & int(ActionProgressFlags.CAN_QUEUED_EXACT)
+            ),
+            0,
+        )
+
+    @property
+    def last_can_tx_complete_exact_sequence(self) -> int:
+        return next(
+            (
+                record.sequence
+                for record in reversed(self.action_progress)
+                if record.flags & int(ActionProgressFlags.CAN_TX_COMPLETE_EXACT)
+            ),
+            0,
+        )
+
+    @property
+    def last_can_tx_complete_mcu_us(self) -> int:
+        return next(
+            (
+                record.can_tx_complete_mcu_us
+                for record in reversed(self.action_progress)
+                if record.flags & int(ActionProgressFlags.CAN_TX_COMPLETE_EXACT)
             ),
             0,
         )

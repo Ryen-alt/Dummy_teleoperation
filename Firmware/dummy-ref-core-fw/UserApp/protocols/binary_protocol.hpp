@@ -9,12 +9,16 @@ namespace dummy::protocol
 {
 
 constexpr uint16_t kMagic = 0x4459;
-constexpr uint8_t kProtocolVersion = 4;
-constexpr size_t kMaxDecodedFrame = 512;
+constexpr uint8_t kProtocolVersion = 5;
+constexpr size_t kMaxDecodedFrame = 576;
 constexpr size_t kCrcSize = 4;
 constexpr size_t kActionProgressReplayCapacity = 6;
 constexpr uint32_t kCapabilityMultiChannelSequence = 1U << 0U;
 constexpr uint32_t kCapabilityTargetKeepalive = 1U << 1U;
+constexpr uint32_t kCapabilityCanTxCompleteExact = 1U << 2U;
+constexpr uint32_t kCapabilityControlFreshnessToken = 1U << 3U;
+constexpr uint32_t kCapabilityTimeSync = 1U << 4U;
+constexpr uint32_t kCapabilityCanDiagnostics = 1U << 5U;
 
 enum class MessageType : uint8_t
 {
@@ -28,12 +32,16 @@ enum class MessageType : uint8_t
     EmergencyStop = 0x08,
     ClearFault = 0x09,
     TargetKeepalive = 0x0A,
+    TimeSync = 0x0B,
+    GetCanDiagnostics = 0x0C,
     HelloAck = 0x81,
     State = 0x82,
     Ack = 0x83,
     Nack = 0x84,
     Fault = 0x85,
     Event = 0x86,
+    TimeSyncAck = 0x87,
+    CanDiagnostics = 0x88,
 };
 
 enum class ControlMode : uint8_t
@@ -122,11 +130,25 @@ struct JointTargetPayload
     float max_velocity[6];
     uint16_t valid_for_ms;
     uint16_t target_flags;
+    uint32_t control_tick_id;
 };
 
 struct TargetKeepalivePayload
 {
     uint32_t action_sequence;
+    uint32_t control_tick_id;
+};
+
+struct TimeSyncPayload
+{
+    uint64_t host_t0_ns;
+};
+
+struct TimeSyncAckPayload
+{
+    uint64_t host_t0_ns;
+    uint64_t mcu_rx_us;
+    uint64_t mcu_tx_us;
 };
 
 struct AckPayload
@@ -139,13 +161,15 @@ struct AckPayload
 enum class ActionProgressStage : uint8_t
 {
     CanQueuedExact = 1,
-    PostCommandFeedback = 2,
-    Superseded = 3,
+    CanTxCompleteExact = 2,
+    PostCommandFeedback = 3,
+    Superseded = 4,
 };
 
 constexpr uint8_t kActionProgressCanQueuedExact = 1U << 0;
-constexpr uint8_t kActionProgressPostCommandFeedback = 1U << 1;
-constexpr uint8_t kActionProgressSuperseded = 1U << 2;
+constexpr uint8_t kActionProgressCanTxCompleteExact = 1U << 1;
+constexpr uint8_t kActionProgressPostCommandFeedback = 1U << 2;
+constexpr uint8_t kActionProgressSuperseded = 1U << 3;
 constexpr uint8_t kStateRepeated = 1U << 0;
 
 struct ActionProgressPayload
@@ -163,8 +187,26 @@ struct ActionProgressRecord
     uint8_t flags;
     uint8_t reserved[3];
     uint32_t can_queued_time_low_us;
+    uint32_t can_tx_complete_time_low_us;
     uint32_t post_feedback_time_low_us;
     uint32_t feedback_sweep_id;
+};
+
+struct CanDiagnosticsPayload
+{
+    uint64_t window_start_us;
+    uint64_t window_duration_us;
+    uint32_t target_tx_complete[7];
+    uint32_t position_response[7];
+    uint32_t temperature_response[7];
+    uint32_t position_timeout_count;
+    uint32_t temperature_timeout_count;
+    uint32_t tx_abort_count;
+    uint32_t tx_error_count;
+    uint32_t tx_recovery_count;
+    uint32_t safety_preemption_count;
+    uint32_t max_safety_wait_us;
+    uint32_t max_fanout_us;
 };
 
 struct StatePayload
@@ -203,11 +245,14 @@ struct StatePayload
 
 static_assert(sizeof(float) == 4, "protocol requires IEEE-754 binary32 floats");
 static_assert(sizeof(PacketHeader) == 24, "PacketHeader layout changed");
-static_assert(sizeof(JointTargetPayload) == 56, "JointTargetPayload layout changed");
-static_assert(sizeof(TargetKeepalivePayload) == 4, "TargetKeepalivePayload layout changed");
+static_assert(sizeof(JointTargetPayload) == 60, "JointTargetPayload layout changed");
+static_assert(sizeof(TargetKeepalivePayload) == 8, "TargetKeepalivePayload layout changed");
+static_assert(sizeof(TimeSyncPayload) == 8, "TimeSyncPayload layout changed");
+static_assert(sizeof(TimeSyncAckPayload) == 24, "TimeSyncAckPayload layout changed");
 static_assert(sizeof(ActionProgressPayload) == 20, "ActionProgressPayload layout changed");
-static_assert(sizeof(ActionProgressRecord) == 20, "ActionProgressRecord layout changed");
-static_assert(sizeof(StatePayload) == 484, "StatePayload layout changed");
+static_assert(sizeof(ActionProgressRecord) == 24, "ActionProgressRecord layout changed");
+static_assert(sizeof(CanDiagnosticsPayload) == 132, "CanDiagnosticsPayload layout changed");
+static_assert(sizeof(StatePayload) == 508, "StatePayload layout changed");
 
 constexpr size_t kMaxPayload = kMaxDecodedFrame - sizeof(PacketHeader) - kCrcSize;
 

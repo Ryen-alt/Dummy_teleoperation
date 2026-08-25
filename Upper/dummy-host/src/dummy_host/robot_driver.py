@@ -22,6 +22,10 @@ from .domain import (
 from .protocol import (
     CAPABILITY_MULTI_CHANNEL_SEQUENCE,
     CAPABILITY_TARGET_KEEPALIVE,
+    CAPABILITY_CAN_TX_COMPLETE_EXACT,
+    CAPABILITY_CONTROL_FRESHNESS_TOKEN,
+    CAPABILITY_TIME_SYNC,
+    CAPABILITY_CAN_DIAGNOSTICS,
     ACK_DETAIL_FEEDBACK_NOT_READY,
     ACQUIRE_CONTROL,
     ActionProgressStage,
@@ -108,6 +112,7 @@ class DummyRobot:
         self.action_gateway = ActionGateway(config, self.safety)
         self.session_id = secrets.randbits(32) or 1
         self._sequence = 0
+        self._control_tick_id = 0
         self._sequence_lock = threading.Lock()
         self._state: RobotState | None = None
         self._state_condition = threading.Condition()
@@ -174,10 +179,10 @@ class DummyRobot:
                 )
             if (
                 not self.transport.is_simulated
-                and self.firmware_version != "dummy-ref-v2.1"
+                and self.firmware_version != "dummy-ref-v2.2"
             ):
                 raise ConfigError(
-                    "protocol v4 host requires firmware dummy-ref-v2.1 exactly; "
+                    "protocol v5 host requires firmware dummy-ref-v2.2 exactly; "
                     f"received {self.firmware_version!r}"
                 )
             if (
@@ -186,16 +191,23 @@ class DummyRobot:
                 & (
                     CAPABILITY_MULTI_CHANNEL_SEQUENCE
                     | CAPABILITY_TARGET_KEEPALIVE
+                    | CAPABILITY_CAN_TX_COMPLETE_EXACT
+                    | CAPABILITY_CONTROL_FRESHNESS_TOKEN
+                    | CAPABILITY_TIME_SYNC
+                    | CAPABILITY_CAN_DIAGNOSTICS
                 )
                 != (
                     CAPABILITY_MULTI_CHANNEL_SEQUENCE
                     | CAPABILITY_TARGET_KEEPALIVE
+                    | CAPABILITY_CAN_TX_COMPLETE_EXACT
+                    | CAPABILITY_CONTROL_FRESHNESS_TOKEN
+                    | CAPABILITY_TIME_SYNC
+                    | CAPABILITY_CAN_DIAGNOSTICS
                 )
             ):
                 raise ConfigError(
-                    "dummy-ref-v2.1 firmware is missing the multi-channel sequence "
-                    "or control-bound target keepalive capability; rebuild and reflash "
-                    "the current v2.1 firmware"
+                    "dummy-ref-v2.2 firmware is missing required protocol-v5 "
+                    "execution-evidence capabilities; rebuild and reflash v2.2"
                 )
             self._wait_for_first_state(deadline)
             self._connected = True
@@ -372,6 +384,7 @@ class DummyRobot:
         self._require_control()
         received_ns = self.clock_ns()
         sequence = self._next_sequence()
+        control_tick_id = self._next_control_tick_id()
         self._prepare_action_sequence(sequence)
         self._emit_action_stage(sequence, ActionStage.RECEIVED, received_ns)
         generated_ns = received_ns if generated_at_ns is None else generated_at_ns
@@ -407,6 +420,7 @@ class DummyRobot:
                 if max_velocity_rad_s is None
                 else max_velocity_rad_s,
                 self.config.target_ttl_ms,
+                control_tick_id,
             ),
         )
         enqueued_ns = self.clock_ns()
@@ -453,6 +467,7 @@ class DummyRobot:
             self._best_effort_hold()
             raise
         sequence = self._next_sequence()
+        control_tick_id = self._next_control_tick_id()
         packet = Packet(
             MessageType.SET_JOINT_TARGET,
             self.session_id,
@@ -464,6 +479,7 @@ class DummyRobot:
                 if max_velocity_rad_s is None
                 else max_velocity_rad_s,
                 self.config.target_ttl_ms,
+                control_tick_id,
             ),
         )
         response = self._send_wait(packet)
@@ -484,7 +500,9 @@ class DummyRobot:
         self._require_control()
         self._expect_ack(self._request(MessageType.HEARTBEAT), MessageType.HEARTBEAT)
 
-    def refresh_target(self, action_sequence: int) -> None:
+    def refresh_target(
+        self, action_sequence: int, control_tick_id: int | None = None
+    ) -> None:
         """Refresh exactly one active motion target from a healthy control tick.
 
         This is deliberately separate from HEARTBEAT: a lease heartbeat must
@@ -501,10 +519,12 @@ class DummyRobot:
                 result=ResultCode.BAD_SEQUENCE,
             )
         try:
+            if control_tick_id is None:
+                control_tick_id = self._next_control_tick_id()
             self._expect_ack(
                 self._request(
                     MessageType.TARGET_KEEPALIVE,
-                    pack_target_keepalive(action_sequence),
+                    pack_target_keepalive(action_sequence, control_tick_id),
                 ),
                 MessageType.TARGET_KEEPALIVE,
             )
@@ -730,6 +750,7 @@ class DummyRobot:
                                 stages = self._action_stages.get(packet.sequence, set())
                                 if not {
                                     ActionStage.CAN_QUEUED_EXACT,
+                                    ActionStage.CAN_TX_COMPLETE_EXACT,
                                     ActionStage.POST_COMMAND_FEEDBACK,
                                 }.issubset(stages):
                                     deadline_ns = self.clock_ns() + int(
@@ -791,6 +812,13 @@ class DummyRobot:
                     state.monotonic_ns,
                     mcu_time_us=progress.can_queued_mcu_us,
                 )
+            if progress.flags & int(ActionProgressFlags.CAN_TX_COMPLETE_EXACT):
+                self._emit_action_stage(
+                    progress.sequence,
+                    ActionStage.CAN_TX_COMPLETE_EXACT,
+                    state.monotonic_ns,
+                    mcu_time_us=progress.can_tx_complete_mcu_us,
+                )
             if progress.flags & int(ActionProgressFlags.POST_COMMAND_FEEDBACK):
                 self._emit_action_stage(
                     progress.sequence,
@@ -812,6 +840,7 @@ class DummyRobot:
                 return
         mapping = {
             ActionProgressStage.CAN_QUEUED_EXACT: ActionStage.CAN_QUEUED_EXACT,
+            ActionProgressStage.CAN_TX_COMPLETE_EXACT: ActionStage.CAN_TX_COMPLETE_EXACT,
             ActionProgressStage.POST_COMMAND_FEEDBACK: ActionStage.POST_COMMAND_FEEDBACK,
             ActionProgressStage.SUPERSEDED: ActionStage.SUPERSEDED,
         }
@@ -882,7 +911,7 @@ class DummyRobot:
                     ActionStage.FAILED,
                     now_ns,
                     detail=(
-                        "action did not reach CAN_QUEUED_EXACT and "
+                        "action did not reach CAN_TX_COMPLETE_EXACT and "
                         "POST_COMMAND_FEEDBACK within completion deadline"
                     ),
                 )
@@ -900,11 +929,30 @@ class DummyRobot:
             stages = self._action_stages.setdefault(sequence, set())
             if stage in stages:
                 return False
+            exact = ActionStage.CAN_TX_COMPLETE_EXACT in stages
+            completed_before = {
+                ActionStage.ACKNOWLEDGED,
+                ActionStage.CAN_TX_COMPLETE_EXACT,
+                ActionStage.POST_COMMAND_FEEDBACK,
+            }.issubset(stages)
+            if completed_before and stage in {
+                ActionStage.SUPERSEDED,
+                ActionStage.PREEMPTED_BY_SAFETY,
+                ActionStage.REJECTED,
+                ActionStage.FAILED,
+            }:
+                return False
+            if exact and stage in {
+                ActionStage.SUPERSEDED,
+                ActionStage.PREEMPTED_BY_SAFETY,
+            }:
+                return False
             stages.add(stage)
             listener = self._action_listener
             completed = {
                 ActionStage.ACKNOWLEDGED,
                 ActionStage.CAN_QUEUED_EXACT,
+                ActionStage.CAN_TX_COMPLETE_EXACT,
                 ActionStage.POST_COMMAND_FEEDBACK,
             }.issubset(stages)
             terminal = completed or stage in (
@@ -1002,6 +1050,13 @@ class DummyRobot:
             self._action_stages.pop(sequence, None)
             self._ack_deadlines.pop(sequence, None)
             self._completion_deadlines.pop(sequence, None)
+
+    def _next_control_tick_id(self) -> int:
+        with self._sequence_lock:
+            self._control_tick_id = (self._control_tick_id + 1) & 0xFFFFFFFF
+            if self._control_tick_id == 0:
+                self._control_tick_id = 1
+            return self._control_tick_id
 
     def _enqueue_priority_hold(self) -> None:
         """Non-blockingly preempt motion without waiting on the serial writer."""

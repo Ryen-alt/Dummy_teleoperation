@@ -85,9 +85,9 @@ SessionConfig MakeConfig(bool verified)
 Packet DecodeHelloVector()
 {
     const auto wire = FromHex(
-        "06594404012401013944332211887766550807060504030201"
+        "06594405012401013944332211887766550807060504030201"
         "cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d"
-        "40421a73f5043d4a5a5aa5a5e1d29f3f00");
+        "40421a73f5043d4a5a5aa5a5150cea8a00");
     Packet packet{};
     const DecodeStatus status = DecodePacket(wire.data(), wire.size(), packet);
     if (status != DecodeStatus::Ok)
@@ -109,9 +109,9 @@ void TestCodecVectors()
     std::array<uint8_t, 600> output{};
     const size_t length = EncodePacket(hello, output.data(), output.size());
     const auto expected = FromHex(
-        "06594404012401013944332211887766550807060504030201"
+        "06594405012401013944332211887766550807060504030201"
         "cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d"
-        "40421a73f5043d4a5a5aa5a5e1d29f3f00");
+        "40421a73f5043d4a5a5aa5a5150cea8a00");
     assert(length == expected.size());
     assert(std::equal(expected.begin(), expected.end(), output.begin()));
 
@@ -120,10 +120,10 @@ void TestCodecVectors()
     assert(DecodePacket(output.data(), length, invalid) == DecodeStatus::BadCrc);
 
     const auto target_wire = FromHex(
-        "06594404063801012544332211897766551007060504030201"
+        "06594405063c01012544332211897766551007060504030201"
         "cdcccc3dcdcc4c3e9a9999bf9a99993ecdccccbe0101023f01"
         "0f403f3333b33e3333b33e3333b33e0101023f0101073f33"
-        "33333f640203058fa8714400");
+        "33333fc8020309403020101f478fc700");
     Packet target_packet{};
     assert(DecodePacket(target_wire.data(), target_wire.size(), target_packet) == DecodeStatus::Ok);
     assert(target_packet.header.message_type == static_cast<uint8_t>(MessageType::SetJointTarget));
@@ -134,15 +134,16 @@ void TestCodecVectors()
     assert(std::fabs(target.target[1] - 0.2F) < 1e-6F);
     assert(std::fabs(target.target[2] + 1.2F) < 1e-6F);
     assert(std::fabs(target.target[6] - 0.75F) < 1e-6F);
-    assert(target.valid_for_ms == 100);
+    assert(target.valid_for_ms == 200);
     assert(target.target_flags == 3);
+    assert(target.control_tick_id == 0x10203040U);
     const size_t target_length = EncodePacket(target_packet, output.data(), output.size());
     assert(target_length == target_wire.size());
     assert(std::equal(target_wire.begin(), target_wire.end(), output.begin()));
 
     const auto keepalive_wire = FromHex(
-        "065944040a04010119443322118a7766551807060504030201"
-        "8977665565128e9600");
+        "065944050a0801011d443322118a7766551807060504030201"
+        "8977665541302010e9e44b0a00");
     Packet keepalive_packet{};
     assert(DecodePacket(keepalive_wire.data(), keepalive_wire.size(),
                         keepalive_packet) == DecodeStatus::Ok);
@@ -151,6 +152,7 @@ void TestCodecVectors()
     TargetKeepalivePayload keepalive{};
     std::memcpy(&keepalive, keepalive_packet.payload.data(), sizeof(keepalive));
     assert(keepalive.action_sequence == 0x55667789U);
+    assert(keepalive.control_tick_id == 0x10203041U);
     const size_t keepalive_length = EncodePacket(
         keepalive_packet, output.data(), output.size());
     assert(keepalive_length == keepalive_wire.size());
@@ -429,6 +431,10 @@ void TestSessionTargetAndTimeout()
     std::memcpy(&hello_ack, hello_result.response.payload.data(), sizeof(hello_ack));
     assert((hello_ack.capabilities & kCapabilityMultiChannelSequence) != 0U);
     assert((hello_ack.capabilities & kCapabilityTargetKeepalive) != 0U);
+    assert((hello_ack.capabilities & kCapabilityCanTxCompleteExact) != 0U);
+    assert((hello_ack.capabilities & kCapabilityControlFreshnessToken) != 0U);
+    assert((hello_ack.capabilities & kCapabilityTimeSync) != 0U);
+    assert((hello_ack.capabilities & kCapabilityCanDiagnostics) != 0U);
 
     Packet acquire = MakePacket(MessageType::AcquireControl, hello.header.session_id,
                                 hello.header.sequence + 1);
@@ -450,6 +456,7 @@ void TestSessionTargetAndTimeout()
     std::copy(std::begin(velocities), std::end(velocities), target.max_velocity);
     target.valid_for_ms = 100;
     target.target_flags = 3;
+    target.control_tick_id = 1U;
     Packet command = MakePacket(MessageType::SetJointTarget, hello.header.session_id,
                                 hello.header.sequence + 3);
     SetPayload(command, target);
@@ -492,6 +499,7 @@ void TestTargetKeepaliveIsExactAndControlBound()
     target.max_velocity[4] = 0.1F;
     target.max_velocity[5] = 0.1F;
     target.valid_for_ms = 100U;
+    target.control_tick_id = 1U;
     Packet command = MakePacket(MessageType::SetJointTarget,
                                 hello.header.session_id,
                                 hello.header.sequence + 3U);
@@ -509,12 +517,14 @@ void TestTargetKeepaliveIsExactAndControlBound()
     Packet wrong = MakePacket(MessageType::TargetKeepalive,
                               hello.header.session_id,
                               hello.header.sequence + 5U);
-    SetPayload(wrong, TargetKeepalivePayload{command.header.sequence + 1U});
+    SetPayload(wrong, TargetKeepalivePayload{
+        command.header.sequence + 1U, 2U});
     assert(ResponseCode(session.Process(wrong, 60000U)) == ResultCode::BadSequence);
     Packet refresh = MakePacket(MessageType::TargetKeepalive,
                                 hello.header.session_id,
                                 hello.header.sequence + 6U);
-    SetPayload(refresh, TargetKeepalivePayload{command.header.sequence});
+    SetPayload(refresh, TargetKeepalivePayload{
+        command.header.sequence, 2U});
     assert(ResponseCode(session.Process(refresh, 90000U)) == ResultCode::Ok);
     assert(session.active_target().last_refresh_time_us == 90000U);
     assert(session.active_target().deadline_us == 190000U);
@@ -571,6 +581,7 @@ void TestBadSequenceAndTargetAreRejected()
     target.target[2] = -1.0F;
     target.target[6] = 0.5F;
     target.valid_for_ms = 100;
+    target.control_tick_id = 1U;
     Packet bad = MakePacket(MessageType::SetJointTarget, hello.header.session_id,
                             hello.header.sequence + 3);
     target.target[0] = 100.0F;
@@ -632,6 +643,7 @@ void TestReliableControlMayOvertakeAnOlderMotionTarget()
     for (size_t index = 0; index < 6; ++index)
         target.max_velocity[index] = 0.1F;
     target.valid_for_ms = 100U;
+    target.control_tick_id = 1U;
     Packet delayed_target = MakePacket(MessageType::SetJointTarget,
                                        hello.header.session_id,
                                        hello.header.sequence + 3U);
@@ -1035,6 +1047,7 @@ void TestLatestTargetWinsBeforeApplication()
     for (size_t index = 0; index < 6; ++index)
         target.max_velocity[index] = 0.1F;
     target.valid_for_ms = 100;
+    target.control_tick_id = 1U;
 
     Packet first = MakePacket(MessageType::SetJointTarget, hello.header.session_id,
                               hello.header.sequence + 3);
@@ -1045,6 +1058,7 @@ void TestLatestTargetWinsBeforeApplication()
     Packet latest = MakePacket(MessageType::SetJointTarget, hello.header.session_id,
                                hello.header.sequence + 4);
     target.target[0] = 0.2F;
+    target.control_tick_id = 2U;
     SetPayload(latest, target);
     assert(ResponseCode(session.Process(latest, 5000)) == ResultCode::Ok);
     assert(session.active_target().sequence == latest.header.sequence);
@@ -1066,8 +1080,10 @@ void TestLeaseTimeoutAndSessionIndependentEstop()
                              hello.header.sequence + 2);
     SetPayload(mode, SetModePayload{static_cast<uint8_t>(ControlMode::Teleop)});
     session.Process(mode, 3000);
-    assert(!session.Tick(502999));
-    assert(session.Tick(503000));
+    // SET_MODE and targets never extend the lease; only ACQUIRE establishes it
+    // and HEARTBEAT refreshes it.
+    assert(!session.Tick(501999));
+    assert(session.Tick(502000));
     assert(!session.lease_active());
     assert(session.mode() == ControlMode::Hold);
 

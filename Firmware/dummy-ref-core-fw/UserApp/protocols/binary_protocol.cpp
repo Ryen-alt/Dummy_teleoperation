@@ -190,12 +190,16 @@ bool IsKnownMessage(uint8_t raw_type)
         case MessageType::EmergencyStop:
         case MessageType::ClearFault:
         case MessageType::TargetKeepalive:
+        case MessageType::TimeSync:
+        case MessageType::GetCanDiagnostics:
         case MessageType::HelloAck:
         case MessageType::State:
         case MessageType::Ack:
         case MessageType::Nack:
         case MessageType::Fault:
         case MessageType::Event:
+        case MessageType::TimeSyncAck:
+        case MessageType::CanDiagnostics:
             return true;
     }
     return false;

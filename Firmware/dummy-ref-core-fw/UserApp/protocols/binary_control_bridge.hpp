@@ -24,6 +24,7 @@ uint64_t BinaryControlMonotonicMicros();
 BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us);
 void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
                                       uint32_t coherent_sweep_id);
+void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us);
 void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us);
 bool TryStartBinaryTargetDispatch(uint32_t sequence);
 void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us);

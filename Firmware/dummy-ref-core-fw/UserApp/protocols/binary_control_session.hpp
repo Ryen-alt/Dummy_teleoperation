@@ -31,6 +31,7 @@ struct ActiveTarget
     uint64_t deadline_us = 0;
     uint16_t valid_for_ms = 0;
     uint16_t flags = 0;
+    uint32_t control_tick_id = 0;
     bool valid = false;
 };
 
@@ -95,6 +96,7 @@ private:
     // the MCU before an older target without making that target a replay.
     uint32_t last_target_sequence_ = 0;
     uint32_t last_received_sequence_ = 0;
+    uint32_t last_control_tick_id_ = 0;
     uint32_t lease_duration_ms_ = 0;
     uint64_t lease_deadline_us_ = 0;
     uint16_t fault_bits_ = 0;

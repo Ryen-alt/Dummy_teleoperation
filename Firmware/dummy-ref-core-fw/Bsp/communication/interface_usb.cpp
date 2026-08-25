@@ -118,7 +118,7 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v2.1");
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v2.2");
 dummy::protocol::FeedbackSafetyOutput binary_safety_telemetry{};
 dummy::protocol::MonotonicMicros32 binary_monotonic_micros;
 uint64_t binary_last_state_us = 0;
@@ -130,6 +130,7 @@ struct PendingProgress
 {
     uint32_t sequence = 0;
     uint32_t queued_sweep_id = 0;
+    uint64_t tx_complete_us = 0;
 };
 
 std::array<dummy::protocol::ActionProgressRecord,
@@ -142,6 +143,7 @@ std::array<dummy::protocol::ActionProgressPayload, 12> binary_progress_events{};
 size_t binary_progress_event_read = 0;
 size_t binary_progress_event_write = 0;
 uint32_t binary_incomplete_target_sequence = 0U;
+uint32_t binary_progress_epoch = 0U;
 
 dummy::protocol::ActionProgressRecord& ProgressRecord(uint32_t sequence)
 {
@@ -250,6 +252,31 @@ void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
     taskEXIT_CRITICAL();
 }
 
+void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us)
+{
+    if (sequence == 0U)
+        return;
+    taskENTER_CRITICAL();
+    auto& record = ProgressRecord(sequence);
+    const bool queued =
+        (record.flags & kActionProgressCanQueuedExact) != 0U;
+    const bool terminal =
+        (record.flags & kActionProgressSuperseded) != 0U;
+    const bool first_report =
+        (record.flags & kActionProgressCanTxCompleteExact) == 0U;
+    if (queued && !terminal && first_report)
+    {
+        record.flags |= kActionProgressCanTxCompleteExact;
+        record.can_tx_complete_time_low_us = static_cast<uint32_t>(now_us);
+        const size_t index = static_cast<size_t>(
+            &record - binary_progress.data());
+        binary_pending_progress[index].tx_complete_us = now_us;
+        QueueProgressEvent(
+            sequence, ActionProgressStage::CanTxCompleteExact, now_us, 0U);
+    }
+    taskEXIT_CRITICAL();
+}
+
 void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us)
 {
     if (sequence == 0U)
@@ -260,7 +287,9 @@ void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us)
     if (previous != 0U && previous != sequence)
     {
         auto& record = ProgressRecord(previous);
-        if ((record.flags & kActionProgressSuperseded) == 0U)
+        if ((record.flags & (kActionProgressCanQueuedExact |
+                            kActionProgressCanTxCompleteExact |
+                            kActionProgressSuperseded)) == 0U)
         {
             record.flags |= kActionProgressSuperseded;
             record.can_queued_time_low_us = static_cast<uint32_t>(now_us);
@@ -304,6 +333,12 @@ void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us)
     auto& record = ProgressRecord(sequence);
     const bool first_report =
         (record.flags & kActionProgressSuperseded) == 0U;
+    if ((record.flags & (kActionProgressCanQueuedExact |
+                        kActionProgressCanTxCompleteExact)) != 0U)
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     record.flags |= kActionProgressSuperseded;
     record.can_queued_time_low_us = static_cast<uint32_t>(now_us);
     const size_t index = static_cast<size_t>(&record - binary_progress.data());
@@ -325,7 +360,9 @@ void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us)
     {
         const auto pending = binary_pending_progress[index];
         if (pending.sequence == 0U ||
-            coherent_sweep_id <= pending.queued_sweep_id)
+            pending.tx_complete_us == 0U ||
+            coherent_sweep_id <= pending.queued_sweep_id ||
+            now_us <= pending.tx_complete_us)
             continue;
         auto& record = binary_progress[index];
         if (record.action_sequence != pending.sequence ||
@@ -431,7 +468,11 @@ void ProcessBinaryBytes(const uint8_t* data, size_t length, uint64_t now_us)
             binary_session.hello_valid() &&
             binary_session.telemetry_session_id() == request.header.session_id)
         {
-            dummy::protocol::ResetBinaryActionProgress();
+            if (binary_progress_epoch != request.header.session_id)
+            {
+                dummy::protocol::ResetBinaryActionProgress();
+                binary_progress_epoch = request.header.session_id;
+            }
         }
         if (result.target_updated)
             dummy::protocol::RecordBinaryTargetAccepted(

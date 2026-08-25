@@ -131,7 +131,7 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
     assert manifest["firmware_version"] == "fake-mcu-v1"
     assert manifest["robot_config_hash"] == config.config_hash
     assert manifest["schema_version"] == 4
-    assert manifest["binary_protocol_version"] == 4
+    assert manifest["binary_protocol_version"] == 5
     assert manifest["state_telemetry_version"] == 4
     assert manifest["camera_rig_hash"] == config.camera_rig.config_hash
     frame_files = list((recorder.session_dir / "frames").rglob("*.npz"))

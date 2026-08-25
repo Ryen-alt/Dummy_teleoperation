@@ -52,6 +52,22 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
     const auto message_type = static_cast<MessageType>(request.header.message_type);
     if (message_type == MessageType::Hello)
         return Hello(request);
+    if (message_type == MessageType::TimeSync)
+    {
+        TimeSyncPayload payload{};
+        if (!hello_valid_ || request.header.session_id != hello_session_id_)
+            return Ack(request, ResultCode::BadSession);
+        if (!ReadPayload(request, payload))
+            return Ack(request, ResultCode::BadLength);
+        ProcessResult result{};
+        result.response.header.message_type = static_cast<uint8_t>(
+            MessageType::TimeSyncAck);
+        result.response.header.session_id = request.header.session_id;
+        result.response.header.sequence = request.header.sequence;
+        WritePayload(result.response, TimeSyncAckPayload{
+            payload.host_t0_ns, now_us, now_us});
+        return result;
+    }
     if (message_type == MessageType::EmergencyStop)
     {
         SetFault(kFaultEmergencyStop);
@@ -86,13 +102,21 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
             return Ack(request, ResultCode::LeaseConflict);
         if (payload.lease_ms == 0 || payload.lease_ms > config_.max_lease_ms)
             return Ack(request, ResultCode::OutOfRange);
-        if (!IsNewerSequence(request.header.sequence, hello_sequence_))
+        const bool same_active_epoch = lease_active_ &&
+            request.header.session_id == session_id_;
+        const uint32_t acquire_watermark = same_active_epoch
+            ? last_command_sequence_ : hello_sequence_;
+        if (!IsNewerSequence(request.header.sequence, acquire_watermark))
             return Ack(request, ResultCode::BadSequence);
 
         session_id_ = request.header.session_id;
         last_command_sequence_ = request.header.sequence;
-        last_target_sequence_ = request.header.sequence;
-        last_received_sequence_ = 0;
+        if (!same_active_epoch)
+        {
+            last_target_sequence_ = request.header.sequence;
+            last_received_sequence_ = 0;
+            last_control_tick_id_ = 0;
+        }
         lease_duration_ms_ = payload.lease_ms;
         lease_active_ = true;
         mode_ = ControlMode::Hold;
@@ -150,7 +174,6 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
             mode_ = requested_mode;
             hold_reason_bits_ = requested_mode == ControlMode::Hold
                 ? kHoldReasonOperator : 0;
-            ExtendLease(now_us);
             ProcessResult result = Ack(request);
             result.entered_hold = requested_mode == ControlMode::Hold;
             return result;
@@ -175,10 +198,14 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
                 EnterHold(kHoldReasonTargetTimeout);
                 return Ack(request, ResultCode::Expired);
             }
+            if (!IsNewerSequence(payload.control_tick_id,
+                                 last_control_tick_id_))
+                return Ack(request, ResultCode::BadSequence);
             active_target_.last_refresh_time_us = now_us;
             active_target_.deadline_us = now_us +
                 static_cast<uint64_t>(active_target_.valid_for_ms) * 1000U;
-            ExtendLease(now_us);
+            active_target_.control_tick_id = payload.control_tick_id;
+            last_control_tick_id_ = payload.control_tick_id;
             return Ack(request);
         }
         case MessageType::SetJointTarget:
@@ -191,6 +218,9 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
             const ResultCode target_result = ValidateTarget(payload);
             if (target_result != ResultCode::Ok)
                 return Ack(request, target_result);
+            if (!IsNewerSequence(payload.control_tick_id,
+                                 last_control_tick_id_))
+                return Ack(request, ResultCode::BadSequence);
 
             for (size_t index = 0; index < active_target_.target.size(); ++index)
                 active_target_.target[index] = payload.target[index];
@@ -202,9 +232,10 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
             active_target_.deadline_us = now_us + static_cast<uint64_t>(payload.valid_for_ms) * 1000U;
             active_target_.valid_for_ms = payload.valid_for_ms;
             active_target_.flags = payload.target_flags;
+            active_target_.control_tick_id = payload.control_tick_id;
             active_target_.valid = true;
             last_received_sequence_ = request.header.sequence;
-            ExtendLease(now_us);
+            last_control_tick_id_ = payload.control_tick_id;
             ProcessResult result = Ack(request);
             result.target_updated = true;
             return result;
@@ -317,6 +348,8 @@ ProcessResult ControlSession::Ack(const Packet& request, ResultCode result, uint
 ProcessResult ControlSession::Hello(const Packet& request)
 {
     HelloPayload payload{};
+    if (request.header.session_id == 0U)
+        return Ack(request, ResultCode::BadSession);
     if (!ReadPayload(request, payload))
         return Ack(request, ResultCode::BadLength);
     if (!HashMatches(payload.config_sha256, config_.config_sha256))
@@ -325,6 +358,14 @@ ProcessResult ControlSession::Hello(const Packet& request)
         return Ack(request, ResultCode::BadConfig);
     }
 
+    const bool new_epoch = !hello_valid_ ||
+        request.header.session_id != hello_session_id_;
+    if (new_epoch)
+    {
+        lease_active_ = false;
+        active_target_ = {};
+        mode_ = fault_bits_ == 0U ? ControlMode::Hold : ControlMode::Fault;
+    }
     hello_valid_ = true;
     hello_session_id_ = request.header.session_id;
     hello_sequence_ = request.header.sequence;
@@ -337,7 +378,10 @@ ProcessResult ControlSession::Hello(const Packet& request)
     HelloAckPayload response{};
     std::copy(config_.config_sha256.begin(), config_.config_sha256.end(), response.config_sha256);
     response.capabilities =
-        kCapabilityMultiChannelSequence | kCapabilityTargetKeepalive;
+        kCapabilityMultiChannelSequence | kCapabilityTargetKeepalive |
+        kCapabilityCanTxCompleteExact |
+        kCapabilityControlFreshnessToken | kCapabilityTimeSync |
+        kCapabilityCanDiagnostics;
     std::copy(firmware_version_.begin(), firmware_version_.end(), response.firmware_version);
     WritePayload(output.response, response);
     return output;

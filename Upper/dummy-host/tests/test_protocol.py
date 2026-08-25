@@ -18,8 +18,12 @@ from dummy_host.protocol import (
     encode_packet,
     pack_joint_target,
     pack_target_keepalive,
+    pack_time_sync,
+    pack_time_sync_ack,
     unpack_joint_target,
     unpack_target_keepalive,
+    unpack_time_sync,
+    unpack_time_sync_ack,
     pack_state,
     unpack_state,
     PROTOCOL_VERSION,
@@ -60,20 +64,29 @@ def test_crc_error_is_rejected() -> None:
 def test_joint_target_payload() -> None:
     action = np.arange(7, dtype=np.float32) / 10
     velocity = np.ones(6, dtype=np.float32)
-    restored_action, restored_velocity, ttl, flags = unpack_joint_target(
-        pack_joint_target(action, velocity, 100, 3)
+    restored_action, restored_velocity, ttl, flags, tick_id = unpack_joint_target(
+        pack_joint_target(action, velocity, 100, 0x10203040, 3)
     )
     np.testing.assert_array_equal(restored_action, action)
     np.testing.assert_array_equal(restored_velocity, velocity)
     assert (ttl, flags) == (100, 3)
+    assert tick_id == 0x10203040
 
 
 def test_target_keepalive_references_one_exact_action_sequence() -> None:
-    assert unpack_target_keepalive(pack_target_keepalive(0xFFFFFFFF)) == 0xFFFFFFFF
+    assert unpack_target_keepalive(pack_target_keepalive(0xFFFFFFFF, 9)) == (
+        0xFFFFFFFF,
+        9,
+    )
     with pytest.raises(ProtocolError, match="non-zero"):
-        pack_target_keepalive(0)
+        pack_target_keepalive(0, 1)
     with pytest.raises(ProtocolError, match="length"):
         unpack_target_keepalive(b"\x01")
+
+
+def test_time_sync_payload_round_trip() -> None:
+    assert unpack_time_sync(pack_time_sync(123456789)) == 123456789
+    assert unpack_time_sync_ack(pack_time_sync_ack(11, 22, 33)) == (11, 22, 33)
 
 
 def test_shared_wire_vectors() -> None:
@@ -107,6 +120,7 @@ def test_shared_wire_vectors() -> None:
             np.asarray(target["target"], dtype=np.float32),
             np.asarray(target["max_velocity"], dtype=np.float32),
             target["valid_for_ms"],
+            target["control_tick_id"],
             target["target_flags"],
         ),
     )
@@ -118,12 +132,14 @@ def test_shared_wire_vectors() -> None:
         keepalive["session_id"],
         keepalive["sequence"],
         keepalive["sender_time_us"],
-        pack_target_keepalive(keepalive["action_sequence"]),
+        pack_target_keepalive(
+            keepalive["action_sequence"], keepalive["control_tick_id"]
+        ),
     )
     assert encode_packet(packet).hex() == keepalive["wire_hex"]
 
 
-def test_state_v4_coherent_feedback_and_exact_action_progress_round_trip(config) -> None:
+def test_state_v5_coherent_feedback_and_exact_action_progress_round_trip(config) -> None:
     state = RobotState(
         position=np.arange(7, dtype=np.float32) / 10,
         velocity=np.arange(7, dtype=np.float32) / 100,
@@ -157,8 +173,10 @@ def test_state_v4_coherent_feedback_and_exact_action_progress_round_trip(config)
             ActionProgressRecord(
                 sequence=6,
                 flags=int(ActionProgressFlags.CAN_QUEUED_EXACT)
+                | int(ActionProgressFlags.CAN_TX_COMPLETE_EXACT)
                 | int(ActionProgressFlags.POST_COMMAND_FEEDBACK),
                 can_queued_mcu_us=2_000,
+                can_tx_complete_mcu_us=2_500,
                 post_feedback_mcu_us=3_000,
                 feedback_sweep_id=9,
             ),
@@ -180,6 +198,8 @@ def test_state_v4_coherent_feedback_and_exact_action_progress_round_trip(config)
     assert restored.coherent_reference_mcu_us == 1_003
     assert restored.state_repeated
     assert restored.last_can_queued_mcu_us == 2000
+    assert restored.last_can_tx_complete_exact_sequence == 6
+    assert restored.last_can_tx_complete_mcu_us == 2500
     assert restored.last_post_command_feedback_sequence == 6
     assert restored.last_post_command_feedback_mcu_us == 3000
 

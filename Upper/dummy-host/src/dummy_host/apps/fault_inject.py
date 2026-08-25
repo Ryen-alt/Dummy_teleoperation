@@ -67,11 +67,16 @@ class ProtocolHarness:
         self.timeout_s = timeout_s
         self.session_id = 0x53544550
         self.sequence = 0
+        self.control_tick_id = 0
         self.latest_state: RobotState | None = None
 
     def next_sequence(self) -> int:
         self.sequence += 1
         return self.sequence
+
+    def next_control_tick_id(self) -> int:
+        self.control_tick_id += 1
+        return self.control_tick_id
 
     def packet(self, message_type: MessageType, payload: bytes = b"", *, sequence: int | None = None) -> Packet:
         return Packet(
@@ -148,6 +153,7 @@ class ProtocolHarness:
                 self.latest_state.position.copy(),
                 self.config.joint_velocity_limit_rad_s,
                 self.config.target_ttl_ms,
+                self.next_control_tick_id(),
             ),
             sequence=sequence,
         )

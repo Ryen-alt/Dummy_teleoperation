@@ -57,7 +57,7 @@ class OldV21WithoutMultiChannelSequence(FakeMcuTransport):
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
     robot = DummyRobot(config, FakeMcuTransport(config))
     with robot:
-        assert robot.firmware_version == "fake-mcu-v2.1"
+        assert robot.firmware_version == "fake-mcu-v2.2"
         robot.acquire_control(ControlMode.TELEOP)
         deadline = time.monotonic() + 0.5
         while robot.read_state().mode != ControlMode.TELEOP and time.monotonic() < deadline:
@@ -110,9 +110,9 @@ def test_target_keepalive_is_exact_and_heartbeat_does_not_refresh_target(config)
         assert state.hold_reason_bits & int(HoldReasonBits.TARGET_TIMEOUT)
 
 
-def test_real_v21_without_multi_channel_sequence_capability_is_rejected(config) -> None:
+def test_protocol_v4_firmware_is_rejected_by_v5_host(config) -> None:
     robot = DummyRobot(config, OldV21WithoutMultiChannelSequence(config))
-    with pytest.raises(ConfigError, match="multi-channel sequence"):
+    with pytest.raises(ConfigError, match="protocol v5"):
         robot.connect()
     assert not robot.is_connected
 
@@ -145,6 +145,7 @@ def test_nonblocking_action_reports_exact_can_queue_and_post_feedback(config) ->
         assert ActionStage.SERIAL_SEND_FINISHED in observed
         assert ActionStage.ACKNOWLEDGED in observed
         assert ActionStage.CAN_QUEUED_EXACT in observed
+        assert ActionStage.CAN_TX_COMPLETE_EXACT in observed
         assert ActionStage.POST_COMMAND_FEEDBACK in observed
 
 

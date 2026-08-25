@@ -10,23 +10,26 @@ from .domain.models import ActionProgressRecord
 from .schema import ControlMode, RobotState
 
 MAGIC = 0x4459
-PROTOCOL_VERSION = 4
-MAX_DECODED_FRAME = 512
+PROTOCOL_VERSION = 5
+MAX_DECODED_FRAME = 576
 HEADER = struct.Struct("<HBBHHIIQ")
 CRC = struct.Struct("<I")
 HELLO = struct.Struct("<32sI")
 HELLO_ACK = struct.Struct("<32sI32s")
 ACQUIRE_CONTROL = struct.Struct("<I")
 SET_MODE = struct.Struct("<B")
-JOINT_TARGET = struct.Struct("<7f6fHH")
-TARGET_KEEPALIVE = struct.Struct("<I")
+JOINT_TARGET = struct.Struct("<7f6fHHI")
+TARGET_KEEPALIVE = struct.Struct("<II")
 ACK = struct.Struct("<BBH")
 ACTION_PROGRESS = struct.Struct("<IB3xQI")
-ACTION_PROGRESS_RECORD = struct.Struct("<IB3xIII")
+ACTION_PROGRESS_RECORD = struct.Struct("<IB3xIIII")
+TIME_SYNC = struct.Struct("<Q")
+TIME_SYNC_ACK = struct.Struct("<QQQ")
+CAN_DIAGNOSTICS = struct.Struct("<QQ7I7I7I8I")
 ACTION_PROGRESS_CAPACITY = 6
 STATE = struct.Struct(
     "<Q7f7fIBBHI32s7f7I7I7I7H7H7BBHH7Q7IIIQ4B"
-    + "IB3xIII" * ACTION_PROGRESS_CAPACITY
+    + "IB3xIIII" * ACTION_PROGRESS_CAPACITY
 )
 
 
@@ -45,12 +48,16 @@ class MessageType(enum.IntEnum):
     ESTOP = 0x08
     CLEAR_FAULT = 0x09
     TARGET_KEEPALIVE = 0x0A
+    TIME_SYNC = 0x0B
+    GET_CAN_DIAGNOSTICS = 0x0C
     HELLO_ACK = 0x81
     STATE = 0x82
     ACK = 0x83
     NACK = 0x84
     FAULT = 0x85
     EVENT = 0x86
+    TIME_SYNC_ACK = 0x87
+    CAN_DIAGNOSTICS = 0x88
 
 
 class ResultCode(enum.IntEnum):
@@ -72,13 +79,18 @@ class ResultCode(enum.IntEnum):
 
 class ActionProgressStage(enum.IntEnum):
     CAN_QUEUED_EXACT = 1
-    POST_COMMAND_FEEDBACK = 2
-    SUPERSEDED = 3
+    CAN_TX_COMPLETE_EXACT = 2
+    POST_COMMAND_FEEDBACK = 3
+    SUPERSEDED = 4
 
 
 ACK_DETAIL_FEEDBACK_NOT_READY = 1
 CAPABILITY_MULTI_CHANNEL_SEQUENCE = 1 << 0
 CAPABILITY_TARGET_KEEPALIVE = 1 << 1
+CAPABILITY_CAN_TX_COMPLETE_EXACT = 1 << 2
+CAPABILITY_CONTROL_FRESHNESS_TOKEN = 1 << 3
+CAPABILITY_TIME_SYNC = 1 << 4
+CAPABILITY_CAN_DIAGNOSTICS = 1 << 5
 
 
 @dataclass(frozen=True)
@@ -263,6 +275,7 @@ def pack_joint_target(
     action: np.ndarray,
     max_velocity_rad_s: np.ndarray,
     valid_for_ms: int,
+    control_tick_id: int,
     target_flags: int = 0,
 ) -> bytes:
     action = np.asarray(action, dtype=np.float32)
@@ -273,10 +286,16 @@ def pack_joint_target(
         raise ProtocolError("joint target contains NaN or Inf")
     if not 1 <= valid_for_ms <= 0xFFFF:
         raise ProtocolError("target TTL is outside uint16 range")
-    return JOINT_TARGET.pack(*action, *velocity, valid_for_ms, target_flags)
+    if not 0 < control_tick_id <= 0xFFFFFFFF:
+        raise ProtocolError("control tick ID must be uint32 and non-zero")
+    return JOINT_TARGET.pack(
+        *action, *velocity, valid_for_ms, target_flags, control_tick_id
+    )
 
 
-def unpack_joint_target(payload: bytes) -> tuple[np.ndarray, np.ndarray, int, int]:
+def unpack_joint_target(
+    payload: bytes,
+) -> tuple[np.ndarray, np.ndarray, int, int, int]:
     if len(payload) != JOINT_TARGET.size:
         raise ProtocolError("invalid SET_JOINT_TARGET payload length")
     values = JOINT_TARGET.unpack(payload)
@@ -284,22 +303,48 @@ def unpack_joint_target(payload: bytes) -> tuple[np.ndarray, np.ndarray, int, in
     velocity = np.asarray(values[7:13], dtype=np.float32)
     if not np.isfinite(action).all() or not np.isfinite(velocity).all():
         raise ProtocolError("joint target contains NaN or Inf")
-    return action, velocity, values[13], values[14]
+    if values[15] == 0:
+        raise ProtocolError("control tick ID must be non-zero")
+    return action, velocity, values[13], values[14], values[15]
 
 
-def pack_target_keepalive(action_sequence: int) -> bytes:
+def pack_target_keepalive(action_sequence: int, control_tick_id: int) -> bytes:
     if not 0 < action_sequence <= 0xFFFFFFFF:
         raise ProtocolError("target keepalive action sequence must be uint32 and non-zero")
-    return TARGET_KEEPALIVE.pack(action_sequence)
+    if not 0 < control_tick_id <= 0xFFFFFFFF:
+        raise ProtocolError("target keepalive control tick ID must be non-zero")
+    return TARGET_KEEPALIVE.pack(action_sequence, control_tick_id)
 
 
-def unpack_target_keepalive(payload: bytes) -> int:
+def unpack_target_keepalive(payload: bytes) -> tuple[int, int]:
     if len(payload) != TARGET_KEEPALIVE.size:
         raise ProtocolError("invalid TARGET_KEEPALIVE payload length")
-    action_sequence = TARGET_KEEPALIVE.unpack(payload)[0]
-    if action_sequence == 0:
-        raise ProtocolError("target keepalive action sequence must be non-zero")
-    return action_sequence
+    action_sequence, control_tick_id = TARGET_KEEPALIVE.unpack(payload)
+    if action_sequence == 0 or control_tick_id == 0:
+        raise ProtocolError("target keepalive identifiers must be non-zero")
+    return action_sequence, control_tick_id
+
+
+def pack_time_sync(host_t0_ns: int) -> bytes:
+    if not 0 <= host_t0_ns <= 0xFFFFFFFFFFFFFFFF:
+        raise ProtocolError("TIME_SYNC host timestamp must be uint64")
+    return TIME_SYNC.pack(host_t0_ns)
+
+
+def unpack_time_sync(payload: bytes) -> int:
+    if len(payload) != TIME_SYNC.size:
+        raise ProtocolError("invalid TIME_SYNC payload length")
+    return TIME_SYNC.unpack(payload)[0]
+
+
+def pack_time_sync_ack(host_t0_ns: int, mcu_rx_us: int, mcu_tx_us: int) -> bytes:
+    return TIME_SYNC_ACK.pack(host_t0_ns, mcu_rx_us, mcu_tx_us)
+
+
+def unpack_time_sync_ack(payload: bytes) -> tuple[int, int, int]:
+    if len(payload) != TIME_SYNC_ACK.size:
+        raise ProtocolError("invalid TIME_SYNC_ACK payload length")
+    return TIME_SYNC_ACK.unpack(payload)
 
 
 def pack_state(state: RobotState) -> bytes:
@@ -321,6 +366,7 @@ def pack_state(state: RobotState) -> bytes:
                 record.sequence,
                 record.flags,
                 record.can_queued_mcu_us & 0xFFFFFFFF,
+                record.can_tx_complete_mcu_us & 0xFFFFFFFF,
                 record.post_feedback_mcu_us & 0xFFFFFFFF,
                 record.feedback_sweep_id,
             )
@@ -442,14 +488,15 @@ def unpack_state(payload: bytes, monotonic_ns: int) -> RobotState:
         state_repeated=bool(values[90] & 0x01),
         action_progress=tuple(
             ActionProgressRecord(
-                values[94 + index * 5],
-                values[95 + index * 5],
-                _extend_low_mcu_time(values[0], values[96 + index * 5]),
-                _extend_low_mcu_time(values[0], values[97 + index * 5]),
-                values[98 + index * 5],
+                values[94 + index * 6],
+                values[95 + index * 6],
+                _extend_low_mcu_time(values[0], values[96 + index * 6]),
+                _extend_low_mcu_time(values[0], values[97 + index * 6]),
+                _extend_low_mcu_time(values[0], values[98 + index * 6]),
+                values[99 + index * 6],
             )
             for index in range(min(values[91], ACTION_PROGRESS_CAPACITY))
-            if values[94 + index * 5] != 0
+            if values[94 + index * 6] != 0
         ),
     )
 

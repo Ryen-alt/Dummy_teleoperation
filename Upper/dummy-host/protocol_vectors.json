@@ -1,11 +1,11 @@
 {
-  "protocol_version": 4,
+  "protocol_version": 5,
   "config_hash": "cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d40421a73f5043d4a",
   "decoded_sizes": {
     "header": 24,
-    "joint_target_payload": 56,
-    "target_keepalive_payload": 4,
-    "state_payload": 484
+    "joint_target_payload": 60,
+    "target_keepalive_payload": 8,
+    "state_payload": 508
   },
   "vectors": [
     {
@@ -14,7 +14,7 @@
       "sequence": 1432778632,
       "sender_time_us": 72623859790382856,
       "capabilities": 2779077210,
-      "wire_hex": "06594404012401013944332211887766550807060504030201cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d40421a73f5043d4a5a5aa5a5e1d29f3f00"
+      "wire_hex": "06594405012401013944332211887766550807060504030201cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d40421a73f5043d4a5a5aa5a5150cea8a00"
     },
     {
       "name": "set_joint_target",
@@ -23,9 +23,10 @@
       "sender_time_us": 72623859790382864,
       "target": [0.1, 0.2, -1.2, 0.3, -0.4, 0.5, 0.75],
       "max_velocity": [0.35, 0.35, 0.35, 0.5, 0.5, 0.7],
-      "valid_for_ms": 100,
+      "valid_for_ms": 200,
       "target_flags": 3,
-      "wire_hex": "06594404063801012544332211897766551007060504030201cdcccc3dcdcc4c3e9a9999bf9a99993ecdccccbe0101023f010f403f3333b33e3333b33e3333b33e0101023f0101073f3333333f640203058fa8714400"
+      "control_tick_id": 270544960,
+      "wire_hex": "06594405063c01012544332211897766551007060504030201cdcccc3dcdcc4c3e9a9999bf9a99993ecdccccbe0101023f010f403f3333b33e3333b33e3333b33e0101023f0101073f3333333fc8020309403020101f478fc700"
     },
     {
       "name": "target_keepalive",
@@ -33,7 +34,8 @@
       "sequence": 1432778634,
       "sender_time_us": 72623859790382872,
       "action_sequence": 1432778633,
-      "wire_hex": "065944040a04010119443322118a77665518070605040302018977665565128e9600"
+      "control_tick_id": 270544961,
+      "wire_hex": "065944050a0801011d443322118a77665518070605040302018977665541302010e9e44b0a00"
     }
   ]
 }

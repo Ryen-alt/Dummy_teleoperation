@@ -9,6 +9,10 @@ import numpy as np
 from .protocol import (
     CAPABILITY_MULTI_CHANNEL_SEQUENCE,
     CAPABILITY_TARGET_KEEPALIVE,
+    CAPABILITY_CAN_TX_COMPLETE_EXACT,
+    CAPABILITY_CONTROL_FRESHNESS_TOKEN,
+    CAPABILITY_TIME_SYNC,
+    CAPABILITY_CAN_DIAGNOSTICS,
     ACQUIRE_CONTROL,
     SET_MODE,
     MessageType,
@@ -18,9 +22,11 @@ from .protocol import (
     pack_ack,
     pack_hello_ack,
     pack_state,
+    pack_time_sync_ack,
     unpack_hello,
     unpack_joint_target,
     unpack_target_keepalive,
+    unpack_time_sync,
 )
 from .domain.models import (
     ActionProgressFlags,
@@ -48,9 +54,14 @@ class FakeMcuTransport:
     """In-memory firmware peer used before any motor is connected."""
 
     is_simulated = True
-    firmware_version = "fake-mcu-v2.1"
+    firmware_version = "fake-mcu-v2.2"
     firmware_capabilities = (
-        CAPABILITY_MULTI_CHANNEL_SEQUENCE | CAPABILITY_TARGET_KEEPALIVE
+        CAPABILITY_MULTI_CHANNEL_SEQUENCE
+        | CAPABILITY_TARGET_KEEPALIVE
+        | CAPABILITY_CAN_TX_COMPLETE_EXACT
+        | CAPABILITY_CONTROL_FRESHNESS_TOKEN
+        | CAPABILITY_TIME_SYNC
+        | CAPABILITY_CAN_DIAGNOSTICS
     )
 
     def __init__(
@@ -71,6 +82,7 @@ class FakeMcuTransport:
         self._hold_reason_bits = 0
         self._last_received = 0
         self._has_received_target = False
+        self._last_control_tick_id = 0
         self._last_applied = 0
         self._last_applied_mcu_us = 0
         self._last_observed = 0
@@ -168,6 +180,7 @@ class FakeMcuTransport:
             self._session = packet.session_id
             self._last_received = 0
             self._has_received_target = False
+            self._last_control_tick_id = 0
             self._progress.clear()
             self._next_state_ns = self.clock_ns() + self._state_period_ns
             self._rx.put(
@@ -179,6 +192,21 @@ class FakeMcuTransport:
                         self.firmware_capabilities,
                         self.firmware_version,
                     ),
+                )
+            )
+            return
+        if packet.message_type == MessageType.TIME_SYNC:
+            try:
+                host_t0_ns = unpack_time_sync(packet.payload)
+            except ValueError:
+                self._nack(packet, ResultCode.BAD_LENGTH)
+                return
+            mcu_us = self.clock_ns() // 1_000
+            self._rx.put(
+                self._response(
+                    packet,
+                    MessageType.TIME_SYNC_ACK,
+                    pack_time_sync_ack(host_t0_ns, mcu_us, mcu_us),
                 )
             )
             return
@@ -253,7 +281,9 @@ class FakeMcuTransport:
                 self._nack(packet, ResultCode.BAD_MODE)
                 return
             try:
-                action, velocity, valid_for_ms, _ = unpack_joint_target(packet.payload)
+                action, velocity, valid_for_ms, _, control_tick_id = (
+                    unpack_joint_target(packet.payload)
+                )
             except ValueError:
                 self._nack(packet, ResultCode.BAD_LENGTH)
                 return
@@ -264,6 +294,9 @@ class FakeMcuTransport:
                 return
             if valid_for_ms == 0 or valid_for_ms > self.config.target_ttl_ms:
                 self._nack(packet, ResultCode.EXPIRED)
+                return
+            if not _is_newer_sequence(control_tick_id, self._last_control_tick_id):
+                self._nack(packet, ResultCode.BAD_SEQUENCE)
                 return
             if (
                 np.any(action[:6] < self.config.joint_limit_min_rad)
@@ -279,11 +312,14 @@ class FakeMcuTransport:
             self._has_received_target = True
             self._last_applied = packet.sequence
             self._last_applied_mcu_us = self.clock_ns() // 1_000
+            self._last_control_tick_id = control_tick_id
             self._progress.append(
                 ActionProgressRecord(
                     packet.sequence,
-                    int(ActionProgressFlags.CAN_QUEUED_EXACT),
+                    int(ActionProgressFlags.CAN_QUEUED_EXACT)
+                    | int(ActionProgressFlags.CAN_TX_COMPLETE_EXACT),
                     can_queued_mcu_us=self._last_applied_mcu_us,
+                    can_tx_complete_mcu_us=self._last_applied_mcu_us,
                 )
             )
             self._progress = self._progress[-6:]
@@ -292,7 +328,6 @@ class FakeMcuTransport:
             self._position = action
             self._target_deadline_ns = self.clock_ns() + valid_for_ms * 1_000_000
             self._target_last_refresh_ns = self.clock_ns()
-            self._extend_lease()
             self._ack(packet)
             self._emit_state(packet.sequence)
             return
@@ -304,9 +339,14 @@ class FakeMcuTransport:
                 self._nack(packet, ResultCode.BAD_MODE)
                 return
             try:
-                action_sequence = unpack_target_keepalive(packet.payload)
+                action_sequence, control_tick_id = unpack_target_keepalive(
+                    packet.payload
+                )
             except ValueError:
                 self._nack(packet, ResultCode.BAD_LENGTH)
+                return
+            if not _is_newer_sequence(control_tick_id, self._last_control_tick_id):
+                self._nack(packet, ResultCode.BAD_SEQUENCE)
                 return
             if (
                 self._target_deadline_ns is None
@@ -323,7 +363,7 @@ class FakeMcuTransport:
                 now_ns + self.config.target_ttl_ms * 1_000_000
             )
             self._target_last_refresh_ns = now_ns
-            self._extend_lease()
+            self._last_control_tick_id = control_tick_id
             self._ack(packet)
             return
         if packet.message_type == MessageType.HEARTBEAT:
@@ -385,8 +425,10 @@ class FakeMcuTransport:
             ):
                 self._progress[-1] = ActionProgressRecord(
                     latest.sequence,
-                    latest.flags | int(ActionProgressFlags.POST_COMMAND_FEEDBACK),
+                    latest.flags
+                    | int(ActionProgressFlags.POST_COMMAND_FEEDBACK),
                     latest.can_queued_mcu_us,
+                    latest.can_tx_complete_mcu_us,
                     self._last_observed_mcu_us,
                     self._sweep_id,
                 )
