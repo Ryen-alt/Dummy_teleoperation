@@ -139,6 +139,22 @@ void TestCodecVectors()
     const size_t target_length = EncodePacket(target_packet, output.data(), output.size());
     assert(target_length == target_wire.size());
     assert(std::equal(target_wire.begin(), target_wire.end(), output.begin()));
+
+    const auto keepalive_wire = FromHex(
+        "065944040a04010119443322118a7766551807060504030201"
+        "8977665565128e9600");
+    Packet keepalive_packet{};
+    assert(DecodePacket(keepalive_wire.data(), keepalive_wire.size(),
+                        keepalive_packet) == DecodeStatus::Ok);
+    assert(keepalive_packet.header.message_type ==
+           static_cast<uint8_t>(MessageType::TargetKeepalive));
+    TargetKeepalivePayload keepalive{};
+    std::memcpy(&keepalive, keepalive_packet.payload.data(), sizeof(keepalive));
+    assert(keepalive.action_sequence == 0x55667789U);
+    const size_t keepalive_length = EncodePacket(
+        keepalive_packet, output.data(), output.size());
+    assert(keepalive_length == keepalive_wire.size());
+    assert(std::equal(keepalive_wire.begin(), keepalive_wire.end(), output.begin()));
 }
 
 void TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap()
@@ -412,6 +428,7 @@ void TestSessionTargetAndTimeout()
     HelloAckPayload hello_ack{};
     std::memcpy(&hello_ack, hello_result.response.payload.data(), sizeof(hello_ack));
     assert((hello_ack.capabilities & kCapabilityMultiChannelSequence) != 0U);
+    assert((hello_ack.capabilities & kCapabilityTargetKeepalive) != 0U);
 
     Packet acquire = MakePacket(MessageType::AcquireControl, hello.header.session_id,
                                 hello.header.sequence + 1);
@@ -445,6 +462,65 @@ void TestSessionTargetAndTimeout()
     assert(session.Tick(104000));
     assert(session.mode() == ControlMode::Hold);
     assert(!session.active_target().valid);
+}
+
+void TestTargetKeepaliveIsExactAndControlBound()
+{
+    ControlSession session(MakeConfig(true), "test-fw");
+    session.SetControlReady(true);
+    const Packet hello = MakeConfiguredHello();
+    session.Process(hello, 1000U);
+
+    Packet acquire = MakePacket(MessageType::AcquireControl,
+                                hello.header.session_id,
+                                hello.header.sequence + 1U);
+    SetPayload(acquire, AcquireControlPayload{500U});
+    assert(ResponseCode(session.Process(acquire, 2000U)) == ResultCode::Ok);
+    Packet mode = MakePacket(MessageType::SetMode, hello.header.session_id,
+                             hello.header.sequence + 2U);
+    SetPayload(mode, SetModePayload{static_cast<uint8_t>(ControlMode::Teleop)});
+    assert(ResponseCode(session.Process(mode, 3000U)) == ResultCode::Ok);
+
+    JointTargetPayload target{};
+    std::copy(dummy::generated_config::kInitialPoseRad.begin(),
+              dummy::generated_config::kInitialPoseRad.end(), target.target);
+    target.target[6] = 0.5F;
+    target.max_velocity[0] = 0.1F;
+    target.max_velocity[1] = 0.1F;
+    target.max_velocity[2] = 0.1F;
+    target.max_velocity[3] = 0.1F;
+    target.max_velocity[4] = 0.1F;
+    target.max_velocity[5] = 0.1F;
+    target.valid_for_ms = 100U;
+    Packet command = MakePacket(MessageType::SetJointTarget,
+                                hello.header.session_id,
+                                hello.header.sequence + 3U);
+    SetPayload(command, target);
+    assert(ResponseCode(session.Process(command, 4000U)) == ResultCode::Ok);
+
+    // A generic lease heartbeat does not extend the motion deadline.
+    Packet heartbeat = MakePacket(MessageType::Heartbeat,
+                                  hello.header.session_id,
+                                  hello.header.sequence + 4U);
+    assert(ResponseCode(session.Process(heartbeat, 50000U)) == ResultCode::Ok);
+    assert(session.active_target().deadline_us == 104000U);
+
+    // A fresh control tick must name the exact active action sequence.
+    Packet wrong = MakePacket(MessageType::TargetKeepalive,
+                              hello.header.session_id,
+                              hello.header.sequence + 5U);
+    SetPayload(wrong, TargetKeepalivePayload{command.header.sequence + 1U});
+    assert(ResponseCode(session.Process(wrong, 60000U)) == ResultCode::BadSequence);
+    Packet refresh = MakePacket(MessageType::TargetKeepalive,
+                                hello.header.session_id,
+                                hello.header.sequence + 6U);
+    SetPayload(refresh, TargetKeepalivePayload{command.header.sequence});
+    assert(ResponseCode(session.Process(refresh, 90000U)) == ResultCode::Ok);
+    assert(session.active_target().last_refresh_time_us == 90000U);
+    assert(session.active_target().deadline_us == 190000U);
+    assert(!session.Tick(189999U));
+    assert(session.Tick(190000U));
+    assert(session.mode() == ControlMode::Hold);
 }
 
 void TestTelemetryMovesToLatestHelloAfterRelease()
@@ -1024,6 +1100,7 @@ int main()
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();
+    TestTargetKeepaliveIsExactAndControlBound();
     TestTelemetryMovesToLatestHelloAfterRelease();
     TestBadSequenceAndTargetAreRejected();
     TestSequenceWrapUsesUint32SerialArithmetic();

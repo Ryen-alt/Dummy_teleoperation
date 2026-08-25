@@ -17,11 +17,14 @@ from dummy_host.protocol import (
     decode_packet,
     encode_packet,
     pack_joint_target,
+    pack_target_keepalive,
     unpack_joint_target,
+    unpack_target_keepalive,
     pack_state,
     unpack_state,
     PROTOCOL_VERSION,
     STATE,
+    TARGET_KEEPALIVE,
 )
 from dummy_host.domain import ActionProgressFlags, ActionProgressRecord
 from dummy_host.schema import ControlMode, RobotState
@@ -65,10 +68,22 @@ def test_joint_target_payload() -> None:
     assert (ttl, flags) == (100, 3)
 
 
+def test_target_keepalive_references_one_exact_action_sequence() -> None:
+    assert unpack_target_keepalive(pack_target_keepalive(0xFFFFFFFF)) == 0xFFFFFFFF
+    with pytest.raises(ProtocolError, match="non-zero"):
+        pack_target_keepalive(0)
+    with pytest.raises(ProtocolError, match="length"):
+        unpack_target_keepalive(b"\x01")
+
+
 def test_shared_wire_vectors() -> None:
     vectors = json.loads((Path(__file__).parents[1] / "protocol_vectors.json").read_text())
     assert vectors["protocol_version"] == PROTOCOL_VERSION
     assert vectors["decoded_sizes"]["state_payload"] == STATE.size
+    assert (
+        vectors["decoded_sizes"]["target_keepalive_payload"]
+        == TARGET_KEEPALIVE.size
+    )
     hello = vectors["vectors"][0]
     config_hash = bytes.fromhex(vectors["config_hash"])
     from dummy_host.protocol import pack_hello
@@ -96,6 +111,16 @@ def test_shared_wire_vectors() -> None:
         ),
     )
     assert encode_packet(packet).hex() == target["wire_hex"]
+
+    keepalive = vectors["vectors"][2]
+    packet = Packet(
+        MessageType.TARGET_KEEPALIVE,
+        keepalive["session_id"],
+        keepalive["sequence"],
+        keepalive["sender_time_us"],
+        pack_target_keepalive(keepalive["action_sequence"]),
+    )
+    assert encode_packet(packet).hex() == keepalive["wire_hex"]
 
 
 def test_state_v4_coherent_feedback_and_exact_action_progress_round_trip(config) -> None:

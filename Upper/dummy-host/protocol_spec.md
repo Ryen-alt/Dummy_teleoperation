@@ -23,7 +23,8 @@ struct PacketHeader {       // 24 bytes, packed
 
 Message values: `HELLO=0x01`, `ACQUIRE_CONTROL=0x02`, `RELEASE_CONTROL=0x03`,
 `SET_MODE=0x04`, `HEARTBEAT=0x05`, `SET_JOINT_TARGET=0x06`, `HOLD=0x07`,
-`ESTOP=0x08`, `CLEAR_FAULT=0x09`, `HELLO_ACK=0x81`, `STATE=0x82`,
+`ESTOP=0x08`, `CLEAR_FAULT=0x09`, `TARGET_KEEPALIVE=0x0a`,
+`HELLO_ACK=0x81`, `STATE=0x82`,
 `ACK=0x83`, `NACK=0x84`, `FAULT=0x85`, `EVENT=0x86`.
 
 Modes: `DISABLED=1`, `HOLD=2`, `TELEOP=3`, `POLICY=4`, `GRAVITY=5`,
@@ -37,6 +38,7 @@ through the host safety layer.
 - `ACQUIRE_CONTROL`: `uint32 lease_ms`
 - `SET_MODE`: `uint8 mode`
 - `SET_JOINT_TARGET`: `float target[7]; float max_velocity[6]; uint16 valid_for_ms; uint16 target_flags`
+- `TARGET_KEEPALIVE`: `uint32 action_sequence`
 - `ACK/NACK`: `uint8 request_type; uint8 result; uint16 detail`
 - `ACTION_PROGRESS EVENT`（20 bytes）: `uint32 action_sequence; uint8 stage;`
   `uint8 reserved[3]; uint64 stage_time_us; uint32 feedback_sweep_id`
@@ -62,6 +64,13 @@ previous coherent sweep and therefore reuses its velocity estimate.
 
 `STATE.validity`: bit 0 joint position, bit 1 velocity, bit 2 gripper feedback.
 `ACK.result=0` means accepted. NACK result codes are defined in the source enum.
+`target_age_ms` is the age of the latest accepted target or exact-sequence target
+keepalive, not the age of the lease heartbeat.
+`HELLO/HELLO_ACK capabilities & 0x00000001` declares the v2.1 multi-channel
+sequence model. A real host requires the bit so an earlier v2.1 image with the
+single global sequence watermark cannot be mixed into this transport.
+`capabilities & 0x00000002` declares exact-sequence target keepalive support;
+the current real host requires both bits.
 
 `hold_reason_bits`: target TTL `0x0001`, lease `0x0002`, following error `0x0004`,
 CAN feedback stale `0x0008`, operator HOLD `0x0010`, runtime limiter `0x0020`.
@@ -100,12 +109,23 @@ Until physical limit calibration is complete, the controller soft limits are the
 intersection of the URDF limits and the historical firmware-safe range, expressed
 in URDF coordinates. They may therefore be narrower than the mechanical URDF limits.
 
-Protocol v4 and older protocol versions must not share a control session. Targets
-use uint32 serial-number ordering across wrap. The MCU must reject wrong
-version/hash/session/mode, non-increasing sequence, expired TTL, non-finite or
-out-of-limit values. Target
+Protocol v4 and older protocol versions must not share a control session. Reliable
+control and latest-value motion targets each use independent uint32 serial-number
+ordering across wrap. This is required because a newer heartbeat may legitimately
+overtake an older target at the priority writer. The MCU must reject wrong
+version/hash/session/mode, non-increasing sequence within either channel, expired
+TTL, non-finite or out-of-limit values. Target
 timeout and lease timeout transition to HOLD locally; Linux is not a hard-real-time
 safety boundary.
+
+`HEARTBEAT` extends only the control lease and never the active target deadline.
+`TARGET_KEEPALIVE` is generated from a fresh control-thread tick, names the exact
+currently active action sequence, and extends that target by its original TTL.
+The keepalive worker does not repeat stale requests autonomously: if the control
+thread stalls, target expiry still enters HOLD even while lease heartbeats remain
+healthy. While an action has not reached `CAN_QUEUED_EXACT`, the host advances
+only its integration time anchor, refreshes that action when necessary, and does
+not enqueue a newer motion target.
 
 The v2.1 production CAN plan runs a 700 Hz dispatcher: target writes are
 50 Hz/node, position queries 40 Hz/node and temperature queries 1 Hz/node. This

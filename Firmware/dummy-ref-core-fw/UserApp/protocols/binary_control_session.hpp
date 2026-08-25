@@ -27,7 +27,9 @@ struct ActiveTarget
     std::array<float, 6> max_velocity{};
     uint32_t sequence = 0;
     uint64_t received_time_us = 0;
+    uint64_t last_refresh_time_us = 0;
     uint64_t deadline_us = 0;
+    uint16_t valid_for_ms = 0;
     uint16_t flags = 0;
     bool valid = false;
 };

@@ -14,6 +14,7 @@ constexpr size_t kMaxDecodedFrame = 512;
 constexpr size_t kCrcSize = 4;
 constexpr size_t kActionProgressReplayCapacity = 6;
 constexpr uint32_t kCapabilityMultiChannelSequence = 1U << 0U;
+constexpr uint32_t kCapabilityTargetKeepalive = 1U << 1U;
 
 enum class MessageType : uint8_t
 {
@@ -26,6 +27,7 @@ enum class MessageType : uint8_t
     Hold = 0x07,
     EmergencyStop = 0x08,
     ClearFault = 0x09,
+    TargetKeepalive = 0x0A,
     HelloAck = 0x81,
     State = 0x82,
     Ack = 0x83,
@@ -122,6 +124,11 @@ struct JointTargetPayload
     uint16_t target_flags;
 };
 
+struct TargetKeepalivePayload
+{
+    uint32_t action_sequence;
+};
+
 struct AckPayload
 {
     uint8_t request_type;
@@ -197,6 +204,7 @@ struct StatePayload
 static_assert(sizeof(float) == 4, "protocol requires IEEE-754 binary32 floats");
 static_assert(sizeof(PacketHeader) == 24, "PacketHeader layout changed");
 static_assert(sizeof(JointTargetPayload) == 56, "JointTargetPayload layout changed");
+static_assert(sizeof(TargetKeepalivePayload) == 4, "TargetKeepalivePayload layout changed");
 static_assert(sizeof(ActionProgressPayload) == 20, "ActionProgressPayload layout changed");
 static_assert(sizeof(ActionProgressRecord) == 20, "ActionProgressRecord layout changed");
 static_assert(sizeof(StatePayload) == 484, "StatePayload layout changed");

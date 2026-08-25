@@ -160,6 +160,27 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
                 return Ack(request, ResultCode::BadLength);
             ExtendLease(now_us);
             return Ack(request);
+        case MessageType::TargetKeepalive:
+        {
+            TargetKeepalivePayload payload{};
+            if (!ReadPayload(request, payload))
+                return Ack(request, ResultCode::BadLength);
+            if (mode_ != ControlMode::Teleop && mode_ != ControlMode::Policy)
+                return Ack(request, ResultCode::BadMode);
+            if (!active_target_.valid ||
+                payload.action_sequence != active_target_.sequence)
+                return Ack(request, ResultCode::BadSequence);
+            if (now_us >= active_target_.deadline_us)
+            {
+                EnterHold(kHoldReasonTargetTimeout);
+                return Ack(request, ResultCode::Expired);
+            }
+            active_target_.last_refresh_time_us = now_us;
+            active_target_.deadline_us = now_us +
+                static_cast<uint64_t>(active_target_.valid_for_ms) * 1000U;
+            ExtendLease(now_us);
+            return Ack(request);
+        }
         case MessageType::SetJointTarget:
         {
             JointTargetPayload payload{};
@@ -177,7 +198,9 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
                 active_target_.max_velocity[index] = payload.max_velocity[index];
             active_target_.sequence = request.header.sequence;
             active_target_.received_time_us = now_us;
+            active_target_.last_refresh_time_us = now_us;
             active_target_.deadline_us = now_us + static_cast<uint64_t>(payload.valid_for_ms) * 1000U;
+            active_target_.valid_for_ms = payload.valid_for_ms;
             active_target_.flags = payload.target_flags;
             active_target_.valid = true;
             last_received_sequence_ = request.header.sequence;
@@ -248,8 +271,9 @@ StatePayload ControlSession::MakeState(const std::array<float, 7>& position,
     state.mode = static_cast<uint8_t>(mode_);
     state.validity = validity;
     state.fault_bits = fault_bits_;
-    if (active_target_.valid && now_us >= active_target_.received_time_us)
-        state.target_age_ms = static_cast<uint32_t>((now_us - active_target_.received_time_us) / 1000U);
+    if (active_target_.valid && now_us >= active_target_.last_refresh_time_us)
+        state.target_age_ms = static_cast<uint32_t>(
+            (now_us - active_target_.last_refresh_time_us) / 1000U);
     std::copy(config_.config_sha256.begin(), config_.config_sha256.end(), state.config_sha256);
     std::copy(safety.following_error.begin(), safety.following_error.end(),
               state.following_error);
@@ -312,7 +336,8 @@ ProcessResult ControlSession::Hello(const Packet& request)
     output.response.header.sender_time_us = 0;
     HelloAckPayload response{};
     std::copy(config_.config_sha256.begin(), config_.config_sha256.end(), response.config_sha256);
-    response.capabilities = kCapabilityMultiChannelSequence;
+    response.capabilities =
+        kCapabilityMultiChannelSequence | kCapabilityTargetKeepalive;
     std::copy(firmware_version_.begin(), firmware_version_.end(), response.firmware_version);
     WritePayload(output.response, response);
     return output;

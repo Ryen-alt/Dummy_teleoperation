@@ -8,6 +8,7 @@ import numpy as np
 
 from .protocol import (
     CAPABILITY_MULTI_CHANNEL_SEQUENCE,
+    CAPABILITY_TARGET_KEEPALIVE,
     ACQUIRE_CONTROL,
     SET_MODE,
     MessageType,
@@ -19,6 +20,7 @@ from .protocol import (
     pack_state,
     unpack_hello,
     unpack_joint_target,
+    unpack_target_keepalive,
 )
 from .domain.models import (
     ActionProgressFlags,
@@ -47,7 +49,9 @@ class FakeMcuTransport:
 
     is_simulated = True
     firmware_version = "fake-mcu-v2.1"
-    firmware_capabilities = CAPABILITY_MULTI_CHANNEL_SEQUENCE
+    firmware_capabilities = (
+        CAPABILITY_MULTI_CHANNEL_SEQUENCE | CAPABILITY_TARGET_KEEPALIVE
+    )
 
     def __init__(
         self,
@@ -86,6 +90,7 @@ class FakeMcuTransport:
         self._lease_duration_ms = 0
         self._lease_deadline_ns: int | None = None
         self._target_deadline_ns: int | None = None
+        self._target_last_refresh_ns: int | None = None
         self._state_period_ns = max(1, int(1e9 / config.control_rate_hz))
         self._next_state_ns: int | None = None
 
@@ -116,6 +121,7 @@ class FakeMcuTransport:
             self._lease = False
             self._lease_deadline_ns = None
             self._target_deadline_ns = None
+            self._target_last_refresh_ns = None
         if self._open:
             self._emit_state(self._last_received)
 
@@ -182,6 +188,7 @@ class FakeMcuTransport:
             self._lease = False
             self._lease_deadline_ns = None
             self._target_deadline_ns = None
+            self._target_last_refresh_ns = None
             self._ack(packet)
             self._emit_state(packet.sequence)
             return
@@ -189,6 +196,7 @@ class FakeMcuTransport:
             self._mode = ControlMode.HOLD
             self._hold_reason_bits |= int(HoldReasonBits.OPERATOR)
             self._target_deadline_ns = None
+            self._target_last_refresh_ns = None
             self._ack(packet)
             self._emit_state(packet.sequence)
             return
@@ -204,6 +212,8 @@ class FakeMcuTransport:
             self._session = packet.session_id
             self._lease_duration_ms = lease_ms
             self._hold_reason_bits = 0
+            self._target_deadline_ns = None
+            self._target_last_refresh_ns = None
             self._extend_lease()
             self._ack(packet)
             self._emit_state(packet.sequence)
@@ -230,6 +240,7 @@ class FakeMcuTransport:
                 else 0
             )
             self._target_deadline_ns = None
+            self._target_last_refresh_ns = None
             self._extend_lease()
             self._ack(packet)
             self._emit_state(packet.sequence)
@@ -280,9 +291,40 @@ class FakeMcuTransport:
             self._velocity = (action - self._position) * self.config.control_rate_hz
             self._position = action
             self._target_deadline_ns = self.clock_ns() + valid_for_ms * 1_000_000
+            self._target_last_refresh_ns = self.clock_ns()
             self._extend_lease()
             self._ack(packet)
             self._emit_state(packet.sequence)
+            return
+        if packet.message_type == MessageType.TARGET_KEEPALIVE:
+            if not self._lease:
+                self._nack(packet, ResultCode.NO_LEASE)
+                return
+            if self._mode not in (ControlMode.TELEOP, ControlMode.POLICY):
+                self._nack(packet, ResultCode.BAD_MODE)
+                return
+            try:
+                action_sequence = unpack_target_keepalive(packet.payload)
+            except ValueError:
+                self._nack(packet, ResultCode.BAD_LENGTH)
+                return
+            if (
+                self._target_deadline_ns is None
+                or action_sequence != self._last_received
+            ):
+                self._nack(packet, ResultCode.BAD_SEQUENCE)
+                return
+            now_ns = self.clock_ns()
+            if now_ns >= self._target_deadline_ns:
+                self._expire_deadlines()
+                self._nack(packet, ResultCode.EXPIRED)
+                return
+            self._target_deadline_ns = (
+                now_ns + self.config.target_ttl_ms * 1_000_000
+            )
+            self._target_last_refresh_ns = now_ns
+            self._extend_lease()
+            self._ack(packet)
             return
         if packet.message_type == MessageType.HEARTBEAT:
             self._extend_lease()
@@ -294,6 +336,7 @@ class FakeMcuTransport:
             self._lease = False
             self._lease_deadline_ns = None
             self._target_deadline_ns = None
+            self._target_last_refresh_ns = None
             self._ack(packet)
             return
         self._nack(packet, ResultCode.UNSUPPORTED)
@@ -360,12 +403,8 @@ class FakeMcuTransport:
             gripper_valid=self.config.gripper_state_feedback,
             last_received_sequence=self._last_received,
             target_age_ms=0
-            if self._target_deadline_ns is None
-            else max(
-                0,
-                self.config.target_ttl_ms
-                - int((self._target_deadline_ns - now_ns) / 1e6),
-            ),
+            if self._target_last_refresh_ns is None
+            else max(0, int((now_ns - self._target_last_refresh_ns) / 1e6)),
             config_hash=self.config.config_hash,
             following_error=np.zeros(7, dtype=np.float32),
             following_error_duration_ms=np.zeros(7, dtype=np.uint32),
@@ -422,12 +461,14 @@ class FakeMcuTransport:
             self._lease = False
             self._lease_deadline_ns = None
             self._target_deadline_ns = None
+            self._target_last_refresh_ns = None
             self._mode = ControlMode.HOLD
             self._hold_reason_bits |= int(HoldReasonBits.LEASE_TIMEOUT)
             self._emit_state(self._last_received)
             return
         if self._target_deadline_ns is not None and now_ns >= self._target_deadline_ns:
             self._target_deadline_ns = None
+            self._target_last_refresh_ns = None
             self._mode = ControlMode.HOLD
             self._hold_reason_bits |= int(HoldReasonBits.TARGET_TIMEOUT)
             self._emit_state(self._last_received)

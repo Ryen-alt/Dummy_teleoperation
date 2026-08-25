@@ -7,7 +7,7 @@ import pytest
 
 from dummy_host.fake_mcu import FakeMcuTransport
 from dummy_host.protocol import MessageType, Packet, pack_hello
-from dummy_host.robot_driver import DummyRobot, RobotError
+from dummy_host.robot_driver import CommandRejected, DummyRobot, RobotError
 from dummy_host.schema import ConfigError, ControlMode
 from dummy_host.domain.models import ActionStage, FaultBits, HoldReasonBits
 
@@ -81,6 +81,33 @@ def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
         while robot.read_state().mode != ControlMode.HOLD and time.monotonic() < deadline:
             time.sleep(0.005)
         assert robot.read_state().mode == ControlMode.HOLD
+
+
+def test_target_keepalive_is_exact_and_heartbeat_does_not_refresh_target(config) -> None:
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        target = robot.read_state().position.copy()
+        target[0] += np.float32(0.002)
+        action = robot.send_action(target)
+
+        time.sleep(0.06)
+        robot.refresh_target(action.sequence)
+        time.sleep(0.06)
+        assert robot.read_state().mode == ControlMode.TELEOP
+        with pytest.raises(CommandRejected, match="BAD_SEQUENCE"):
+            robot.refresh_target((action.sequence + 1) & 0xFFFFFFFF or 1)
+
+        # A lease heartbeat is intentionally unable to keep that motion target
+        # alive. Without another control-bound refresh, the 100 ms target TTL
+        # still fails closed into HOLD.
+        robot.heartbeat()
+        deadline = time.monotonic() + 0.3
+        while robot.read_state().mode != ControlMode.HOLD and time.monotonic() < deadline:
+            time.sleep(0.01)
+        state = robot.read_state()
+        assert state.mode == ControlMode.HOLD
+        assert state.hold_reason_bits & int(HoldReasonBits.TARGET_TIMEOUT)
 
 
 def test_real_v21_without_multi_channel_sequence_capability_is_rejected(config) -> None:

@@ -21,6 +21,7 @@ from .domain import (
 )
 from .protocol import (
     CAPABILITY_MULTI_CHANNEL_SEQUENCE,
+    CAPABILITY_TARGET_KEEPALIVE,
     ACK_DETAIL_FEEDBACK_NOT_READY,
     ACQUIRE_CONTROL,
     ActionProgressStage,
@@ -31,6 +32,7 @@ from .protocol import (
     monotonic_us,
     pack_hello,
     pack_joint_target,
+    pack_target_keepalive,
     unpack_ack,
     unpack_action_progress,
     unpack_hello_ack,
@@ -52,7 +54,16 @@ class RobotError(RuntimeError):
 
 
 class CommandRejected(RobotError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: ResultCode | None = None,
+        detail: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+        self.detail = detail
 
 
 class DummyRobot:
@@ -105,6 +116,7 @@ class DummyRobot:
         self._completion_deadlines: dict[int, int] = {}
         self._deadline_heap: list[tuple[int, int, int]] = []
         self._action_stages: dict[int, set[ActionStage]] = {}
+        self._active_action_sequence: int | None = None
         self._action_listener: Callable[[ActionLifecycleUpdate], None] | None = None
         self._pending_lock = threading.Lock()
         self._watchdog_condition = threading.Condition(self._pending_lock)
@@ -170,12 +182,20 @@ class DummyRobot:
                 )
             if (
                 not self.transport.is_simulated
-                and not self.firmware_capabilities
-                & CAPABILITY_MULTI_CHANNEL_SEQUENCE
+                and self.firmware_capabilities
+                & (
+                    CAPABILITY_MULTI_CHANNEL_SEQUENCE
+                    | CAPABILITY_TARGET_KEEPALIVE
+                )
+                != (
+                    CAPABILITY_MULTI_CHANNEL_SEQUENCE
+                    | CAPABILITY_TARGET_KEEPALIVE
+                )
             ):
                 raise ConfigError(
                     "dummy-ref-v2.1 firmware is missing the multi-channel sequence "
-                    "capability; rebuild and reflash the current v2.1 firmware"
+                    "or control-bound target keepalive capability; rebuild and reflash "
+                    "the current v2.1 firmware"
                 )
             self._wait_for_first_state(deadline)
             self._connected = True
@@ -223,6 +243,7 @@ class DummyRobot:
         )
         self._wait_for_mode(target_mode)
         self._control_acquired = True
+        self._active_action_sequence = None
         self.action_gateway.reset()
 
     def wait_for_feedback_ready(
@@ -275,6 +296,7 @@ class DummyRobot:
             return
         self._expect_ack(self._request(MessageType.RELEASE_CONTROL), MessageType.RELEASE_CONTROL)
         self._control_acquired = False
+        self._active_action_sequence = None
         self.action_gateway.reset()
 
     def read_state(self, max_age_ms: int | None = None) -> RobotState:
@@ -389,9 +411,13 @@ class DummyRobot:
         )
         enqueued_ns = self.clock_ns()
         self._emit_action_stage(sequence, ActionStage.SEND_ENQUEUED, enqueued_ns)
+        previous_active_sequence = self._active_action_sequence
+        self._active_action_sequence = sequence
         try:
             self.transport.send(packet)
         except BaseException as exc:
+            if self._active_action_sequence == sequence:
+                self._active_action_sequence = previous_active_sequence
             self._emit_action_stage(
                 sequence, ActionStage.FAILED, self.clock_ns(), detail=str(exc)
             )
@@ -442,6 +468,7 @@ class DummyRobot:
         )
         response = self._send_wait(packet)
         self._expect_ack(response, MessageType.SET_JOINT_TARGET)
+        self._active_action_sequence = sequence
         return AppliedAction(
             result.requested,
             result.applied,
@@ -457,10 +484,48 @@ class DummyRobot:
         self._require_control()
         self._expect_ack(self._request(MessageType.HEARTBEAT), MessageType.HEARTBEAT)
 
+    def refresh_target(self, action_sequence: int) -> None:
+        """Refresh exactly one active motion target from a healthy control tick.
+
+        This is deliberately separate from HEARTBEAT: a lease heartbeat must
+        never make an old target live forever after the control loop stalls.
+        The firmware accepts the refresh only while ``action_sequence`` is the
+        currently active target.
+        """
+
+        self._require_control()
+        if self._active_action_sequence != action_sequence:
+            raise CommandRejected(
+                "TARGET_KEEPALIVE rejected locally: BAD_SEQUENCE "
+                f"active={self._active_action_sequence} requested={action_sequence}",
+                result=ResultCode.BAD_SEQUENCE,
+            )
+        try:
+            self._expect_ack(
+                self._request(
+                    MessageType.TARGET_KEEPALIVE,
+                    pack_target_keepalive(action_sequence),
+                ),
+                MessageType.TARGET_KEEPALIVE,
+            )
+        except CommandRejected as exc:
+            # A refresh can already be inside the reliable serial channel when
+            # the control thread observes exact fan-out and enqueues its next
+            # target. If that newer target won the final wire-order race, the
+            # old refresh is a safe no-op rather than a link failure. Every
+            # other rejection remains fail-closed.
+            if (
+                exc.result is ResultCode.BAD_SEQUENCE
+                and self._active_action_sequence != action_sequence
+            ):
+                return
+            raise
+
     def hold(self) -> None:
         self._require_connected()
         self._expect_ack(self._request(MessageType.HOLD), MessageType.HOLD)
         self._wait_for_mode(ControlMode.HOLD)
+        self._active_action_sequence = None
         self.action_gateway.reset()
 
     def request_priority_hold(self) -> None:
@@ -480,6 +545,7 @@ class DummyRobot:
         self._expect_ack(self._request(MessageType.ESTOP), MessageType.ESTOP)
         self._wait_for_mode(ControlMode.FAULT)
         self._control_acquired = False
+        self._active_action_sequence = None
         self.action_gateway.reset()
 
     def health(self) -> RobotHealth:
@@ -534,7 +600,7 @@ class DummyRobot:
     def _hello_with_retry(self, deadline: float) -> Packet:
         payload = pack_hello(
             self.config.config_hash_bytes,
-            CAPABILITY_MULTI_CHANNEL_SEQUENCE,
+            CAPABILITY_MULTI_CHANNEL_SEQUENCE | CAPABILITY_TARGET_KEEPALIVE,
         )
         last_timeout: RobotError | None = None
         while True:
@@ -595,9 +661,15 @@ class DummyRobot:
                 ):
                     raise CommandRejected(
                         "ACQUIRE_CONTROL rejected: CAN feedback bootstrap is not ready "
-                        f"(can_status=0x{self.read_state().can_transport_status:02x})"
+                        f"(can_status=0x{self.read_state().can_transport_status:02x})",
+                        result=ack.result,
+                        detail=ack.detail,
                     )
-                raise CommandRejected(f"{ack.request_type.name} rejected: {ack.result.name} detail={ack.detail}")
+                raise CommandRejected(
+                    f"{ack.request_type.name} rejected: {ack.result.name} detail={ack.detail}",
+                    result=ack.result,
+                    detail=ack.detail,
+                )
             if response.session_id != packet.session_id:
                 raise RobotError("response belongs to a stale control session")
             return response
@@ -851,6 +923,17 @@ class DummyRobot:
                     oldest = next(iter(self._action_stages))
                     if oldest != sequence:
                         self._action_stages.pop(oldest, None)
+            if (
+                stage
+                in {
+                    ActionStage.SUPERSEDED,
+                    ActionStage.PREEMPTED_BY_SAFETY,
+                    ActionStage.REJECTED,
+                    ActionStage.FAILED,
+                }
+                and self._active_action_sequence == sequence
+            ):
+                self._active_action_sequence = None
         if listener is not None:
             listener(
                 ActionLifecycleUpdate(

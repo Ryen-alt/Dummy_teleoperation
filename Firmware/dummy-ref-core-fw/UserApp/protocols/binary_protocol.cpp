@@ -189,6 +189,7 @@ bool IsKnownMessage(uint8_t raw_type)
         case MessageType::Hold:
         case MessageType::EmergencyStop:
         case MessageType::ClearFault:
+        case MessageType::TargetKeepalive:
         case MessageType::HelloAck:
         case MessageType::State:
         case MessageType::Ack:
@@ -230,4 +231,3 @@ bool StreamDecoder::Feed(uint8_t byte, Packet& packet)
 }
 
 } // namespace dummy::protocol
-

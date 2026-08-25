@@ -19,6 +19,7 @@ HELLO_ACK = struct.Struct("<32sI32s")
 ACQUIRE_CONTROL = struct.Struct("<I")
 SET_MODE = struct.Struct("<B")
 JOINT_TARGET = struct.Struct("<7f6fHH")
+TARGET_KEEPALIVE = struct.Struct("<I")
 ACK = struct.Struct("<BBH")
 ACTION_PROGRESS = struct.Struct("<IB3xQI")
 ACTION_PROGRESS_RECORD = struct.Struct("<IB3xIII")
@@ -43,6 +44,7 @@ class MessageType(enum.IntEnum):
     HOLD = 0x07
     ESTOP = 0x08
     CLEAR_FAULT = 0x09
+    TARGET_KEEPALIVE = 0x0A
     HELLO_ACK = 0x81
     STATE = 0x82
     ACK = 0x83
@@ -76,6 +78,7 @@ class ActionProgressStage(enum.IntEnum):
 
 ACK_DETAIL_FEEDBACK_NOT_READY = 1
 CAPABILITY_MULTI_CHANNEL_SEQUENCE = 1 << 0
+CAPABILITY_TARGET_KEEPALIVE = 1 << 1
 
 
 @dataclass(frozen=True)
@@ -282,6 +285,21 @@ def unpack_joint_target(payload: bytes) -> tuple[np.ndarray, np.ndarray, int, in
     if not np.isfinite(action).all() or not np.isfinite(velocity).all():
         raise ProtocolError("joint target contains NaN or Inf")
     return action, velocity, values[13], values[14]
+
+
+def pack_target_keepalive(action_sequence: int) -> bytes:
+    if not 0 < action_sequence <= 0xFFFFFFFF:
+        raise ProtocolError("target keepalive action sequence must be uint32 and non-zero")
+    return TARGET_KEEPALIVE.pack(action_sequence)
+
+
+def unpack_target_keepalive(payload: bytes) -> int:
+    if len(payload) != TARGET_KEEPALIVE.size:
+        raise ProtocolError("invalid TARGET_KEEPALIVE payload length")
+    action_sequence = TARGET_KEEPALIVE.unpack(payload)[0]
+    if action_sequence == 0:
+        raise ProtocolError("target keepalive action sequence must be non-zero")
+    return action_sequence
 
 
 def pack_state(state: RobotState) -> bytes:
