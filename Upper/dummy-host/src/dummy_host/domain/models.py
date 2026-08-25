@@ -113,6 +113,8 @@ class ActionProgressFlags(IntEnum):
     CAN_TX_COMPLETE_EXACT = 1 << 1
     POST_COMMAND_FEEDBACK = 1 << 2
     SUPERSEDED = 1 << 3
+    PREEMPTED_BY_SAFETY = 1 << 4
+    FAILED = 1 << 5
 
 
 @dataclass(frozen=True)

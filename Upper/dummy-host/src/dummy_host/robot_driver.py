@@ -805,6 +805,24 @@ class DummyRobot:
                 if emitted:
                     self._enqueue_priority_hold()
                 continue
+            if progress.flags & int(ActionProgressFlags.PREEMPTED_BY_SAFETY):
+                self._emit_action_stage(
+                    progress.sequence,
+                    ActionStage.PREEMPTED_BY_SAFETY,
+                    state.monotonic_ns,
+                    detail="firmware safety transition preempted CAN fan-out",
+                )
+                continue
+            if progress.flags & int(ActionProgressFlags.FAILED):
+                emitted = self._emit_action_stage(
+                    progress.sequence,
+                    ActionStage.FAILED,
+                    state.monotonic_ns,
+                    detail="firmware CAN execution failed",
+                )
+                if emitted:
+                    self._enqueue_priority_hold()
+                continue
             if progress.flags & int(ActionProgressFlags.CAN_QUEUED_EXACT):
                 self._emit_action_stage(
                     progress.sequence,
@@ -843,6 +861,8 @@ class DummyRobot:
             ActionProgressStage.CAN_TX_COMPLETE_EXACT: ActionStage.CAN_TX_COMPLETE_EXACT,
             ActionProgressStage.POST_COMMAND_FEEDBACK: ActionStage.POST_COMMAND_FEEDBACK,
             ActionProgressStage.SUPERSEDED: ActionStage.SUPERSEDED,
+            ActionProgressStage.PREEMPTED_BY_SAFETY: ActionStage.PREEMPTED_BY_SAFETY,
+            ActionProgressStage.FAILED: ActionStage.FAILED,
         }
         emitted = self._emit_action_stage(
             sequence,
@@ -855,7 +875,10 @@ class DummyRobot:
                 else None
             ),
         )
-        if emitted and stage is ActionProgressStage.SUPERSEDED:
+        if emitted and stage in {
+            ActionProgressStage.SUPERSEDED,
+            ActionProgressStage.FAILED,
+        }:
             self._enqueue_priority_hold()
 
     def _action_watchdog_loop(self) -> None:

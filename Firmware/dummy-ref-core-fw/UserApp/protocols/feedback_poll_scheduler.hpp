@@ -46,7 +46,7 @@ struct CanDispatchConfig
 {
     uint32_t response_timeout_us = 4000U;
     uint32_t node_quiet_us = 5000U;
-    uint32_t dispatch_tick_hz = 700U;
+    uint32_t scheduler_watchdog_hz = 1000U;
     uint32_t target_hz_per_node = 50U;
     uint32_t position_hz_per_node = 40U;
     uint32_t temperature_hz_per_node = 1U;
@@ -71,14 +71,13 @@ struct CanDispatchDiagnostics
     bool config_valid = true;
 };
 
-// v2.1 CAN traffic planner. A 700 Hz task calls Next(), but frequencies are
-// intentionally lower than the timer ceiling:
+// v2.2 event-driven CAN traffic planner. TX-complete and RX-response wake the
+// task immediately; the 1 kHz timer is only a watchdog/deadline fallback:
 //   - active target:       50 Hz/node (350 frames/s)
 //   - position feedback:  40 Hz/node (280 requests/s)
 //   - temperature:         1 Hz/node (7 requests/s)
-// Only one feedback transaction may be outstanding. Every normal and
-// transition action is admitted one frame at a time through the non-blocking
-// transport; missed ticks are never replayed as a burst.
+// Only one feedback transaction and one CAN frame may be outstanding. Target
+// and position rates describe complete seven-node cycles, not timer slots.
 class CanDispatchScheduler
 {
 public:
@@ -109,10 +108,12 @@ private:
     uint8_t SelectTargetNode(uint32_t now_us) const;
     uint8_t SelectPositionNode(uint32_t now_us) const;
     uint8_t SelectTemperatureNode(uint32_t now_us) const;
-    void ConsumeResponses(const FeedbackResponseEvents& responses);
+    void ConsumeResponses(const FeedbackResponseEvents& responses,
+                          uint32_t now_us);
     void CountUnexpectedResponses(uint8_t mask, CanDispatchAction action,
                                   uint8_t expected_node);
     static uint32_t PeriodUs(uint32_t hz_per_node);
+    static uint32_t CyclePeriodUs(uint32_t hz_per_node);
     static bool DeadlineDue(uint32_t now_us, uint32_t deadline_us);
     void InitializeDeadlines(uint32_t now_us);
     void AdvanceDeadline(uint32_t& deadline_us, uint32_t hz_per_node,
@@ -130,6 +131,13 @@ private:
     uint8_t next_target_node_ = 1U;
     uint8_t next_position_node_ = 1U;
     uint8_t next_temperature_node_ = 1U;
+    bool target_fanout_active_ = false;
+    uint8_t target_fanout_node_ = 1U;
+    uint32_t target_fanout_started_us_ = 0U;
+    bool position_sweep_active_ = false;
+    uint8_t position_sweep_start_node_ = 1U;
+    uint8_t position_sweep_node_ = 1U;
+    uint8_t position_sweep_count_ = 0U;
     std::array<uint32_t, kActuatorNodeCount> last_node_tx_us_{};
     std::array<bool, kActuatorNodeCount> node_transmitted_{};
     bool query_pending_ = false;

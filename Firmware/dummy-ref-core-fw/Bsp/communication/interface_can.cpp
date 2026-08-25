@@ -65,6 +65,33 @@ void ReleaseTxToken(CAN_HandleTypeDef* hcan)
     if (semaphore != nullptr)
         (void) osSemaphoreRelease(semaphore);
 }
+
+void PushTxCompletion(CAN_context* ctx, CanTxCompletionStatus status,
+                      uint8_t mailbox_idx)
+{
+    if (ctx == nullptr)
+        return;
+    const uint8_t write = ctx->tx_completion_write;
+    const uint8_t next = static_cast<uint8_t>(
+        (write + 1U) % kCanTxCompletionCapacity);
+    if (next == ctx->tx_completion_read)
+    {
+        ++ctx->tx_completion_overflow_count;
+    }
+    else
+    {
+        auto& completion = ctx->tx_completion_ring[write];
+        completion = {};
+        if (ctx->active_tx_metadata_valid)
+            completion.metadata = ctx->active_tx_metadata;
+        completion.status = status;
+        completion.mailbox_index = mailbox_idx;
+        ctx->tx_completion_write = next;
+    }
+    ctx->active_tx_metadata = {};
+    ctx->active_tx_metadata_valid = false;
+    NotifyCanDispatcherFromIsr();
+}
 }
 
 
@@ -140,11 +167,14 @@ void tx_complete_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
     CAN_context* ctx = get_can_ctx(hcan);
     if (ctx == nullptr)
         return;
-    (void) mailbox_idx;
+    const bool was_in_flight = ctx->tx_in_flight;
+    if (was_in_flight || ctx->active_tx_metadata_valid)
+        PushTxCompletion(ctx, CanTxCompletionStatus::Complete, mailbox_idx);
     ctx->tx_in_flight = false;
     ctx->tx_msg_cnt++;
     ctx->TxMailboxCompleteCallbackCnt++;
-    ReleaseTxToken(hcan);
+    if (was_in_flight)
+        ReleaseTxToken(hcan);
 }
 
 void tx_aborted_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
@@ -152,13 +182,16 @@ void tx_aborted_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
     CAN_context* ctx = get_can_ctx(hcan);
     if (ctx == nullptr)
         return;
-    (void) mailbox_idx;
+    const bool was_in_flight = ctx->tx_in_flight;
+    if (was_in_flight || ctx->active_tx_metadata_valid)
+        PushTxCompletion(ctx, CanTxCompletionStatus::Aborted, mailbox_idx);
     ctx->tx_in_flight = false;
     ctx->TxMailboxAbortCallbackCnt++;
     // An aborted transfer never reaches a mailbox-complete callback. Return
     // the single-flight token so a transient CAN error cannot deadlock every
     // subsequent feedback and motion command.
-    ReleaseTxToken(hcan);
+    if (was_in_flight)
+        ReleaseTxToken(hcan);
 }
 
 void tx_error(CAN_context* ctx, uint8_t mailbox_idx)
@@ -166,6 +199,7 @@ void tx_error(CAN_context* ctx, uint8_t mailbox_idx)
     if (ctx == nullptr || ctx->handle == nullptr)
         return;
     ctx->unexpected_errors++;
+    PushTxCompletion(ctx, CanTxCompletionStatus::Error, mailbox_idx);
     ctx->tx_in_flight = false;
     (void) HAL_CAN_AbortTxRequest(ctx->handle, 1UL << mailbox_idx);
     // Auto retransmission is disabled. A transmit error therefore has no
@@ -205,6 +239,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
     }
 
     OnCanMessage(ctx, &headerRx, data);
+    NotifyCanDispatcherFromIsr();
 }
 
 void HAL_CAN_RxFifo0FullCallback(CAN_HandleTypeDef* hcan)
@@ -274,7 +309,8 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* hcan)
 CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
                               CAN_TxHeaderTypeDef* txHeader,
                               CanTxQueuedCallback on_queued,
-                              void* callback_context)
+                              void* callback_context,
+                              const CanTxMetadata* metadata)
 {
     if (canCtx == nullptr || canCtx->handle == nullptr || txData == nullptr ||
         txHeader == nullptr)
@@ -330,6 +366,9 @@ CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
         canCtx->tx_in_flight = true;
         canCtx->tx_started_ms = HAL_GetTick();
         canCtx->tx_queued_count++;
+        canCtx->active_tx_metadata = metadata == nullptr
+            ? CanTxMetadata{} : *metadata;
+        canCtx->active_tx_metadata_valid = metadata != nullptr;
         if (on_queued != nullptr)
             on_queued(callback_context);
     }
@@ -348,13 +387,14 @@ CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
 
 bool CanSendMessage(CAN_context* canCtx, uint8_t* txData,
                     CAN_TxHeaderTypeDef* txHeader,
-                    CanTxQueuedCallback on_queued, void* callback_context)
+                    CanTxQueuedCallback on_queued, void* callback_context,
+                    const CanTxMetadata* metadata)
 {
     const uint32_t started_ms = HAL_GetTick();
     do
     {
         const CanTxStatus status = CanTrySendMessage(
-            canCtx, txData, txHeader, on_queued, callback_context);
+            canCtx, txData, txHeader, on_queued, callback_context, metadata);
         if (status == CanTxStatus::Queued)
             return true;
         if (status == CanTxStatus::Invalid)
@@ -362,4 +402,22 @@ bool CanSendMessage(CAN_context* canCtx, uint8_t* txData,
         osDelay(1U);
     } while (HAL_GetTick() - started_ms < kCanBlockingCompatibilityWaitMs);
     return false;
+}
+
+bool CanTakeTxCompletion(CAN_context* canCtx, CanTxCompletion& completion)
+{
+    if (canCtx == nullptr)
+        return false;
+    taskENTER_CRITICAL();
+    if (canCtx->tx_completion_read == canCtx->tx_completion_write)
+    {
+        taskEXIT_CRITICAL();
+        return false;
+    }
+    const uint8_t read = canCtx->tx_completion_read;
+    completion = canCtx->tx_completion_ring[read];
+    canCtx->tx_completion_read = static_cast<uint8_t>(
+        (read + 1U) % kCanTxCompletionCapacity);
+    taskEXIT_CRITICAL();
+    return true;
 }

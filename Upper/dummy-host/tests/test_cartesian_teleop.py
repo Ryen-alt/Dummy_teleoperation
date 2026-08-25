@@ -570,7 +570,7 @@ def test_cartesian_fake_mcu_reuses_joint_gateway_and_records_semantics(
         source,
         recorder,
         profile,
-        duration_s=0.56,
+        duration_s=config.target_ttl_ms / 1000.0 + 0.46,
         teleop_mode="cartesian",
         kinematics=kinematics,
     )

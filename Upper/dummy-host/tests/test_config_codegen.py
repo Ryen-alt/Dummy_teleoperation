@@ -24,7 +24,7 @@ def test_render_firmware_header_contains_safety_critical_values(config: RobotCon
     assert "constexpr float kGripperVelocityLimitPerS = 0.2F;" in header
     assert "constexpr uint32_t kFeedbackHoldMs = 100U;" in header
     assert "constexpr uint32_t kFeedbackFaultMs = 500U;" in header
-    assert "constexpr uint32_t kCanDispatchTickHz = 700U;" in header
+    assert "constexpr uint32_t kCanSchedulerWatchdogHz = 1000U;" in header
     assert "constexpr uint32_t kCanTargetHzPerNode = 50U;" in header
     assert "constexpr uint32_t kCanPositionHzPerNode = 40U;" in header
     assert "constexpr uint32_t kCanTemperatureHzPerNode = 1U;" in header

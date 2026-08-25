@@ -20,7 +20,7 @@ def test_config_is_deterministic_and_calibrated(config) -> None:
     assert tuple(config.cameras) == ("wrist",)
     assert config.cameras["wrist"].model == "D435"
     assert config.config_version == 7
-    assert config.can_dispatch_tick_hz == 700
+    assert config.can_scheduler_watchdog_hz == 1000
     assert config.can_target_hz_per_node == 50
     assert config.can_position_hz_per_node == 40
     assert config.can_temperature_hz_per_node == 1
@@ -33,32 +33,29 @@ def test_config_is_deterministic_and_calibrated(config) -> None:
     assert config.external_target_execution_ready
 
 
-def test_can_dispatch_rate_outside_reviewed_range_is_rejected(tmp_path) -> None:
+def test_can_scheduler_watchdog_rate_outside_reviewed_range_is_rejected(tmp_path) -> None:
     source = Path(__file__).parents[1] / "configs" / "robot_config.yaml"
     raw = yaml.safe_load(source.read_text(encoding="utf-8"))
-    raw["can_dispatch_tick_hz"] = 1001
+    raw["can_scheduler_watchdog_hz"] = 5001
     bad = tmp_path / "bad-feedback-rate.yaml"
     bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
     try:
         load_robot_config(bad)
     except ConfigError as exc:
-        assert "can_dispatch_tick_hz" in str(exc)
+        assert "can_scheduler_watchdog_hz" in str(exc)
     else:
         raise AssertionError("unsafe feedback polling rate was accepted")
 
 
-def test_per_node_can_rates_must_fit_dispatch_capacity(tmp_path) -> None:
+def test_event_driven_can_rates_are_not_limited_by_watchdog_slots(tmp_path) -> None:
     source = Path(__file__).parents[1] / "configs" / "robot_config.yaml"
     raw = yaml.safe_load(source.read_text(encoding="utf-8"))
-    raw["can_dispatch_tick_hz"] = 600
+    raw["can_scheduler_watchdog_hz"] = 1000
+    raw["can_target_hz_per_node"] = 60
     bad = tmp_path / "uneven-feedback-rate.yaml"
     bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    try:
-        load_robot_config(bad)
-    except ConfigError as exc:
-        assert "capacity" in str(exc)
-    else:
-        raise AssertionError("oversubscribed CAN schedule was accepted")
+    config = load_robot_config(bad)
+    assert config.can_target_hz_per_node == 60
 
 
 def test_wrong_joint_order_is_rejected(tmp_path, config) -> None:

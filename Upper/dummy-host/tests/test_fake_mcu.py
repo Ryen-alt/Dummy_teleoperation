@@ -99,7 +99,7 @@ def test_target_keepalive_is_exact_and_heartbeat_does_not_refresh_target(config)
             robot.refresh_target((action.sequence + 1) & 0xFFFFFFFF or 1)
 
         # A lease heartbeat is intentionally unable to keep that motion target
-        # alive. Without another control-bound refresh, the 100 ms target TTL
+        # alive. Without another control-bound refresh, the configured target TTL
         # still fails closed into HOLD.
         robot.heartbeat()
         deadline = time.monotonic() + 0.3

@@ -52,7 +52,7 @@ void CtrlStepMotor::SetEnable(bool _enable)
 }
 
 
-bool CtrlStepMotor::TrySetEnable(bool _enable)
+bool CtrlStepMotor::TrySetEnable(bool _enable, const CanTxMetadata* metadata)
 {
     uint8_t mode = 0x01;
     CAN_TxHeaderTypeDef request_header = txHeader;
@@ -62,7 +62,8 @@ bool CtrlStepMotor::TrySetEnable(bool _enable)
     memcpy(request_data, &value, sizeof(value));
 
     const bool queued = CanTrySendMessage(
-        get_can_ctx(hcan), request_data, &request_header) == CanTxStatus::Queued;
+        get_can_ctx(hcan), request_data, &request_header, nullptr, nullptr,
+        metadata) == CanTxStatus::Queued;
     if (queued)
         state = _enable ? FINISH : STOP;
     return queued;
@@ -130,7 +131,8 @@ void CtrlStepMotor::SetPositionSetPoint(float _val)
 
 
 bool CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack,
-                                         bool non_blocking)
+                                         bool non_blocking,
+                                         const CanTxMetadata* metadata)
 {
     uint8_t mode = 0x05;
     txHeader.StdId = nodeID << 7 | mode;
@@ -145,7 +147,8 @@ bool CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack,
     canBuf[7] = 0U;
 
     if (non_blocking)
-        return CanTrySendMessage(get_can_ctx(hcan), canBuf, &txHeader) ==
+        return CanTrySendMessage(
+            get_can_ctx(hcan), canBuf, &txHeader, nullptr, nullptr, metadata) ==
             CanTxStatus::Queued;
     return CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
@@ -158,7 +161,8 @@ void CtrlStepMotor::SetPositionWithVelocityLimit(float _pos, float _vel)
 
 
 bool CtrlStepMotor::SendPositionWithVelocityLimit(float _pos, float _vel,
-                                                   bool non_blocking)
+                                                   bool non_blocking,
+                                                   const CanTxMetadata* metadata)
 {
     uint8_t mode = 0x07;
     txHeader.StdId = nodeID << 7 | mode;
@@ -172,7 +176,8 @@ bool CtrlStepMotor::SendPositionWithVelocityLimit(float _pos, float _vel,
         canBuf[i] = *(b + i - 4);
 
     if (non_blocking)
-        return CanTrySendMessage(get_can_ctx(hcan), canBuf, &txHeader) ==
+        return CanTrySendMessage(
+            get_can_ctx(hcan), canBuf, &txHeader, nullptr, nullptr, metadata) ==
             CanTxStatus::Queued;
     return CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
@@ -299,7 +304,7 @@ float CtrlStepMotor::GetTemp()
 }
 
 
-bool CtrlStepMotor::TryGetTemp()
+bool CtrlStepMotor::TryGetTemp(const CanTxMetadata* metadata)
 {
     constexpr uint8_t mode = 0x25;
     CAN_TxHeaderTypeDef request_header = txHeader;
@@ -307,7 +312,7 @@ bool CtrlStepMotor::TryGetTemp()
     uint8_t request_data[8] = {};
 
     return CanTrySendMessage(get_can_ctx(hcan), request_data, &request_header,
-                             RecordTemperatureRequest, &nodeID) ==
+                             RecordTemperatureRequest, &nodeID, metadata) ==
         CanTxStatus::Queued;
 }
 
@@ -328,11 +333,12 @@ void CtrlStepMotor::SetAngle(float _angle)
 }
 
 
-bool CtrlStepMotor::SetStreamingAngle(float _angle)
+bool CtrlStepMotor::SetStreamingAngle(float _angle,
+                                      const CanTxMetadata* metadata)
 {
     _angle = inverseDirection ? -_angle : _angle;
     const float stepMotorCnt = _angle / 360.0f * (float) reduction;
-    return SendPositionSetPoint(stepMotorCnt, false, true);
+    return SendPositionSetPoint(stepMotorCnt, false, true, metadata);
 }
 
 
@@ -344,11 +350,12 @@ void CtrlStepMotor::SetAngleWithVelocityLimit(float _angle, float _vel)
 }
 
 
-bool CtrlStepMotor::SetStreamingAngleWithVelocityLimit(float _angle, float _vel)
+bool CtrlStepMotor::SetStreamingAngleWithVelocityLimit(
+    float _angle, float _vel, const CanTxMetadata* metadata)
 {
     _angle = inverseDirection ? -_angle : _angle;
     const float stepMotorCnt = _angle / 360.0f * (float) reduction;
-    return SendPositionWithVelocityLimit(stepMotorCnt, _vel, true);
+    return SendPositionWithVelocityLimit(stepMotorCnt, _vel, true, metadata);
 }
 
 
@@ -364,7 +371,7 @@ void CtrlStepMotor::UpdateAngle()
 }
 
 
-bool CtrlStepMotor::TryUpdateAngle()
+bool CtrlStepMotor::TryUpdateAngle(const CanTxMetadata* metadata)
 {
     constexpr uint8_t mode = 0x23;
     CAN_TxHeaderTypeDef request_header = txHeader;
@@ -372,7 +379,7 @@ bool CtrlStepMotor::TryUpdateAngle()
     uint8_t request_data[8] = {};
 
     return CanTrySendMessage(get_can_ctx(hcan), request_data, &request_header,
-                             RecordPositionRequest, &nodeID) ==
+                             RecordPositionRequest, &nodeID, metadata) ==
         CanTxStatus::Queued;
 }
 

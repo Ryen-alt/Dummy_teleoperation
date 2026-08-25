@@ -25,12 +25,10 @@ uint32_t SaturatingIncrement(uint32_t value)
 CanDispatchScheduler::CanDispatchScheduler(const CanDispatchConfig& config)
     : config_(config)
 {
-    const uint64_t requested = static_cast<uint64_t>(kActuatorNodeCount) *
-        (config_.target_hz_per_node + config_.position_hz_per_node +
-         config_.temperature_hz_per_node);
-    config_valid_ = config_.dispatch_tick_hz >= kActuatorNodeCount &&
-        config_.dispatch_tick_hz <= 1000U &&
-        requested <= config_.dispatch_tick_hz;
+    config_valid_ = config_.scheduler_watchdog_hz >= 100U &&
+        config_.scheduler_watchdog_hz <= 5000U &&
+        config_.response_timeout_us != 0U &&
+        config_.target_hz_per_node != 0U;
 }
 
 uint8_t CanDispatchScheduler::NextNode(uint8_t node_id)
@@ -48,6 +46,14 @@ uint32_t CanDispatchScheduler::PeriodUs(uint32_t hz_per_node)
     return period_us == 0U ? uint32_t{1} : period_us;
 }
 
+uint32_t CanDispatchScheduler::CyclePeriodUs(uint32_t hz_per_node)
+{
+    if (hz_per_node == 0U)
+        return 0U;
+    return static_cast<uint32_t>(
+        (1000000ULL + hz_per_node / 2U) / hz_per_node);
+}
+
 bool CanDispatchScheduler::DeadlineDue(uint32_t now_us,
                                        uint32_t deadline_us)
 {
@@ -58,13 +64,15 @@ void CanDispatchScheduler::InitializeDeadlines(uint32_t now_us)
 {
     const auto initialize = [now_us](uint32_t hz_per_node)
     {
-        const uint32_t period_us = PeriodUs(hz_per_node);
+        const uint32_t period_us = CyclePeriodUs(hz_per_node);
         return period_us == 0U ? 0U : now_us + period_us;
     };
     next_target_deadline_us_ = initialize(config_.target_hz_per_node);
     next_position_deadline_us_ = initialize(config_.position_hz_per_node);
-    next_temperature_deadline_us_ = initialize(
+    const uint32_t temperature_period = PeriodUs(
         config_.temperature_hz_per_node);
+    next_temperature_deadline_us_ = temperature_period == 0U
+        ? 0U : now_us + temperature_period;
     deadlines_initialized_ = true;
 }
 
@@ -180,7 +188,8 @@ void CanDispatchScheduler::CountUnexpectedResponses(
     }
 }
 
-void CanDispatchScheduler::ConsumeResponses(const FeedbackResponseEvents& responses)
+void CanDispatchScheduler::ConsumeResponses(
+    const FeedbackResponseEvents& responses, uint32_t now_us)
 {
     for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
     {
@@ -210,9 +219,42 @@ void CanDispatchScheduler::ConsumeResponses(const FeedbackResponseEvents& respon
          (responses.temperature_mask & mask) != 0U);
     if (matched)
     {
+        const CanDispatchAction completed_action = pending_action_;
         query_pending_ = false;
         pending_action_ = CanDispatchAction::None;
         pending_node_id_ = 0U;
+        if (completed_action == CanDispatchAction::PositionRequest &&
+            position_sweep_active_)
+        {
+            ++position_sweep_count_;
+            if (position_sweep_count_ >= kActuatorNodeCount)
+            {
+                position_sweep_active_ = false;
+                position_sweep_count_ = 0U;
+                position_sweep_start_node_ = NextNode(
+                    position_sweep_start_node_);
+                const uint32_t period_us = CyclePeriodUs(
+                    config_.position_hz_per_node);
+                if (period_us == 0U)
+                {
+                    next_position_deadline_us_ = 0U;
+                }
+                else
+                {
+                    const uint32_t lateness_us =
+                        now_us - next_position_deadline_us_;
+                    next_position_deadline_us_ =
+                        DeadlineDue(now_us, next_position_deadline_us_) &&
+                        lateness_us >= period_us
+                        ? now_us + period_us
+                        : next_position_deadline_us_ + period_us;
+                }
+            }
+            else
+            {
+                position_sweep_node_ = NextNode(position_sweep_node_);
+            }
+        }
     }
 }
 
@@ -223,6 +265,13 @@ void CanDispatchScheduler::SetMode(CanDispatchMode mode)
     mode_ = mode;
     transition_node_ = 1U;
     deadlines_initialized_ = false;
+    target_fanout_active_ = false;
+    target_fanout_node_ = 1U;
+    position_sweep_active_ = false;
+    position_sweep_count_ = 0U;
+    query_pending_ = false;
+    pending_action_ = CanDispatchAction::None;
+    pending_node_id_ = 0U;
     if (mode == CanDispatchMode::Stream || mode == CanDispatchMode::Hold)
         transition_ = Transition::HoldTargets;
     else if (mode == CanDispatchMode::Fault)
@@ -241,7 +290,7 @@ CanDispatchStep CanDispatchScheduler::Next(
             diagnostics_.idle_slot_count);
         return {};
     }
-    ConsumeResponses(responses);
+    ConsumeResponses(responses, now_us);
     if (transition_ == Transition::None && !deadlines_initialized_)
         InitializeDeadlines(now_us);
 
@@ -256,7 +305,10 @@ CanDispatchStep CanDispatchScheduler::Next(
         {
             diagnostics_.position_timed_out[index] = SaturatingIncrement(
                 diagnostics_.position_timed_out[index]);
-            const uint32_t period_us = PeriodUs(
+            position_sweep_active_ = false;
+            position_sweep_count_ = 0U;
+            position_sweep_start_node_ = NextNode(position_sweep_start_node_);
+            const uint32_t period_us = CyclePeriodUs(
                 config_.position_hz_per_node);
             next_position_deadline_us_ = period_us == 0U
                 ? 0U : now_us + period_us;
@@ -275,9 +327,9 @@ CanDispatchStep CanDispatchScheduler::Next(
         pending_node_id_ = 0U;
     }
 
-    // Emergency disable preempts a read transaction. CAN arbitration still
-    // protects an in-progress response, while the non-blocking transport will
-    // defer the disable by at most one dispatcher tick if TX is occupied.
+    // Emergency disable and HOLD transitions always outrank normal traffic.
+    // The Bsp layer keeps exactly one frame in flight, so the next completion
+    // interrupt is the only unavoidable safety delay.
     if (transition_ == Transition::Disable)
     {
         step.action = CanDispatchAction::DisableBroadcast;
@@ -285,9 +337,6 @@ CanDispatchStep CanDispatchScheduler::Next(
         return step;
     }
 
-    // HOLD fan-out is safety traffic as well. It may preempt a pending read
-    // transaction; queries remain single-outstanding, but must never delay a
-    // commanded safe position transition.
     if (transition_ == Transition::HoldTargets)
     {
         if (NodeQuiet(transition_node_, now_us))
@@ -302,30 +351,6 @@ CanDispatchStep CanDispatchScheduler::Next(
         return step;
     }
 
-    if (query_pending_)
-    {
-        // "One outstanding query" applies to feedback transactions, not to
-        // write-only actuator targets. Keep the 50 Hz/node command stream
-        // moving while the previous position/temperature response is in
-        // flight; the CAN single-flight admission layer still serializes the
-        // actual mailbox writes.
-        if (mode_ == CanDispatchMode::Stream &&
-            next_target_deadline_us_ != 0U &&
-            DeadlineDue(now_us, next_target_deadline_us_))
-        {
-            const uint8_t node_id = SelectTargetNode(now_us);
-            if (node_id != 0U)
-            {
-                step.action = CanDispatchAction::ActuatorTarget;
-                step.node_id = node_id;
-                return step;
-            }
-        }
-        diagnostics_.idle_slot_count = SaturatingIncrement(
-            diagnostics_.idle_slot_count);
-        return step;
-    }
-
     if (transition_ == Transition::Enable)
     {
         if (AllNodesQuiet(now_us))
@@ -334,7 +359,11 @@ CanDispatchStep CanDispatchScheduler::Next(
             step.transition = true;
             return step;
         }
+        diagnostics_.idle_slot_count = SaturatingIncrement(
+            diagnostics_.idle_slot_count);
+        return step;
     }
+
     if (transition_ != Transition::None)
     {
         diagnostics_.idle_slot_count = SaturatingIncrement(
@@ -342,37 +371,68 @@ CanDispatchStep CanDispatchScheduler::Next(
         return step;
     }
 
-    // Earliest-deadline-first among the due traffic classes. Lateness is
-    // measured with wrap-safe uint32 arithmetic; query classes are excluded
-    // while one response is outstanding.
-    bool selected = false;
-    uint32_t greatest_lateness_us = 0U;
-    const auto consider = [&](CanDispatchAction action, uint32_t deadline_us,
-                              uint8_t node_id)
+    // A 50 Hz target deadline starts one frozen seven-node fan-out. Once
+    // started, TX-complete notifications drive nodes 2..7 immediately; the
+    // watchdog timer is no longer the throughput limiter.
+    if (mode_ == CanDispatchMode::Stream && !target_fanout_active_ &&
+        next_target_deadline_us_ != 0U &&
+        DeadlineDue(now_us, next_target_deadline_us_))
     {
-        if (deadline_us == 0U || node_id == 0U ||
-            !DeadlineDue(now_us, deadline_us))
-            return;
-        const uint32_t lateness_us = now_us - deadline_us;
-        if (!selected || lateness_us > greatest_lateness_us)
+        target_fanout_active_ = true;
+        target_fanout_node_ = 1U;
+        target_fanout_started_us_ = now_us;
+    }
+    if (target_fanout_active_)
+    {
+        if (NodeQuiet(target_fanout_node_, now_us))
         {
-            selected = true;
-            greatest_lateness_us = lateness_us;
-            step.action = action;
-            step.node_id = node_id;
+            step.action = CanDispatchAction::ActuatorTarget;
+            step.node_id = target_fanout_node_;
+            return step;
         }
-    };
-    consider(CanDispatchAction::TemperatureRequest,
-             next_temperature_deadline_us_,
-             SelectTemperatureNode(now_us));
-    consider(CanDispatchAction::PositionRequest,
-             next_position_deadline_us_,
-             SelectPositionNode(now_us));
-    if (mode_ == CanDispatchMode::Stream)
-        consider(CanDispatchAction::ActuatorTarget,
-                 next_target_deadline_us_, SelectTargetNode(now_us));
-    if (selected)
+        diagnostics_.idle_slot_count = SaturatingIncrement(
+            diagnostics_.idle_slot_count);
         return step;
+    }
+
+    if (query_pending_)
+    {
+        diagnostics_.idle_slot_count = SaturatingIncrement(
+            diagnostics_.idle_slot_count);
+        return step;
+    }
+
+    // Position feedback is a complete rotating sweep. Each response wakes the
+    // dispatcher and immediately schedules the next node. A timeout discards
+    // the rest of the sweep and re-bases its 25 ms deadline.
+    if (!position_sweep_active_ && next_position_deadline_us_ != 0U &&
+        DeadlineDue(now_us, next_position_deadline_us_))
+    {
+        position_sweep_active_ = true;
+        position_sweep_count_ = 0U;
+        position_sweep_node_ = position_sweep_start_node_;
+    }
+    if (position_sweep_active_)
+    {
+        if (NodeQuiet(position_sweep_node_, now_us))
+        {
+            step.action = CanDispatchAction::PositionRequest;
+            step.node_id = position_sweep_node_;
+            return step;
+        }
+        diagnostics_.idle_slot_count = SaturatingIncrement(
+            diagnostics_.idle_slot_count);
+        return step;
+    }
+
+    if (next_temperature_deadline_us_ != 0U &&
+        DeadlineDue(now_us, next_temperature_deadline_us_) &&
+        NodeQuiet(next_temperature_node_, now_us))
+    {
+        step.action = CanDispatchAction::TemperatureRequest;
+        step.node_id = next_temperature_node_;
+        return step;
+    }
 
     diagnostics_.idle_slot_count = SaturatingIncrement(diagnostics_.idle_slot_count);
     return step;
@@ -398,21 +458,33 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
 
     if (step.action == CanDispatchAction::ActuatorTarget)
     {
-        if (!step.transition)
-            AdvanceDeadline(next_target_deadline_us_,
-                            config_.target_hz_per_node, now_us);
         diagnostics_.target_queued[step.node_id - 1U] = SaturatingIncrement(
             diagnostics_.target_queued[step.node_id - 1U]);
         if (!step.transition)
-            next_target_node_ = NextNode(step.node_id);
+        {
+            if (step.node_id < kActuatorNodeCount)
+            {
+                target_fanout_node_ = NextNode(step.node_id);
+            }
+            else
+            {
+                target_fanout_active_ = false;
+                target_fanout_node_ = 1U;
+                const uint32_t period_us = CyclePeriodUs(
+                    config_.target_hz_per_node);
+                const uint32_t lateness_us = now_us - next_target_deadline_us_;
+                next_target_deadline_us_ =
+                    DeadlineDue(now_us, next_target_deadline_us_) &&
+                    lateness_us >= period_us
+                    ? now_us + period_us
+                    : next_target_deadline_us_ + period_us;
+            }
+        }
     }
     else if (step.action == CanDispatchAction::PositionRequest)
     {
-        AdvanceDeadline(next_position_deadline_us_,
-                        config_.position_hz_per_node, now_us);
         diagnostics_.position_requested[step.node_id - 1U] = SaturatingIncrement(
             diagnostics_.position_requested[step.node_id - 1U]);
-        next_position_node_ = NextNode(step.node_id);
         query_pending_ = true;
         pending_action_ = step.action;
         pending_node_id_ = step.node_id;
@@ -468,6 +540,13 @@ void CanDispatchScheduler::Reset()
     next_target_node_ = 1U;
     next_position_node_ = 1U;
     next_temperature_node_ = 1U;
+    target_fanout_active_ = false;
+    target_fanout_node_ = 1U;
+    target_fanout_started_us_ = 0U;
+    position_sweep_active_ = false;
+    position_sweep_start_node_ = 1U;
+    position_sweep_node_ = 1U;
+    position_sweep_count_ = 0U;
     last_node_tx_us_.fill(0U);
     node_transmitted_.fill(false);
     query_pending_ = false;

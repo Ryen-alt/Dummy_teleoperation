@@ -4,6 +4,8 @@
 #include "fibre/protocol.hpp"
 #include "can.h"
 
+struct CanTxMetadata;
+
 class CtrlStepMotor
 {
 public:
@@ -32,12 +34,14 @@ public:
     void SetAngle(float _angle);
     // Streaming control targets are already supervised by the 200 Hz firmware
     // executor. Suppress the motor-board ACK to keep CAN feedback deterministic.
-    bool SetStreamingAngle(float _angle);
-    bool SetStreamingAngleWithVelocityLimit(float _angle, float _vel);
+    bool SetStreamingAngle(float _angle,
+                           const CanTxMetadata* metadata = nullptr);
+    bool SetStreamingAngleWithVelocityLimit(
+        float _angle, float _vel, const CanTxMetadata* metadata = nullptr);
     void SetAngleWithVelocityLimit(float _angle, float _vel);
     // CAN Command
     void SetEnable(bool _enable);
-    bool TrySetEnable(bool _enable);
+    bool TrySetEnable(bool _enable, const CanTxMetadata* metadata = nullptr);
     void SetEnableTemp(bool _enable);
     void DoCalibration();
     void SetCurrentSetPoint(float _val);
@@ -57,11 +61,11 @@ public:
     void SetEnableStallProtect(bool _enable);
     void Reboot();
     float GetTemp();
-    bool TryGetTemp();
+    bool TryGetTemp(const CanTxMetadata* metadata = nullptr);
     void EraseConfigs();
 
     void UpdateAngle();
-    bool TryUpdateAngle();
+    bool TryUpdateAngle(const CanTxMetadata* metadata = nullptr);
     void UpdateAngleCallback(float _pos, bool _isFinished);
 
 
@@ -99,8 +103,11 @@ public:
 
 
 private:
-    bool SendPositionSetPoint(float _val, bool request_ack, bool non_blocking);
-    bool SendPositionWithVelocityLimit(float _pos, float _vel, bool non_blocking);
+    bool SendPositionSetPoint(float _val, bool request_ack, bool non_blocking,
+                              const CanTxMetadata* metadata = nullptr);
+    bool SendPositionWithVelocityLimit(
+        float _pos, float _vel, bool non_blocking,
+        const CanTxMetadata* metadata = nullptr);
 
     CAN_HandleTypeDef* hcan;
     uint8_t canBuf[8] = {};

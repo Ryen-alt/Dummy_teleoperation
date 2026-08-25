@@ -7,6 +7,7 @@
 #include "protocols/feedback_safety_supervisor.hpp"
 #include "protocols/feedback_poll_scheduler.hpp"
 #include "protocols/joint_space_mapping.hpp"
+#include "protocols/monotonic_micros.hpp"
 
 #include <algorithm>
 #include <array>
@@ -19,7 +20,8 @@ SSD1306 oled(&hi2c0);
 MPU6050 mpu6050(&hi2c1);
 // 5 User-Timers, can choose from htim7/htim10/htim11/htim13/htim14
 Timer timerCtrlLoop(&htim7, 200);
-Timer timerCanDispatch(&htim10, dummy::generated_config::kCanDispatchTickHz);
+Timer timerCanDispatch(
+    &htim10, dummy::generated_config::kCanSchedulerWatchdogHz);
 // 2x2-channel PWMs, used htim9 & htim12, each has 2-channel outputs
 PWM pwm(21000, 21000);
 
@@ -63,13 +65,14 @@ dummy::protocol::FeedbackSafetyConfig MakeFeedbackSafetyConfig()
 dummy::protocol::FeedbackSafetySupervisor feedback_safety_supervisor(
     MakeFeedbackSafetyConfig());
 
-static_assert(dummy::generated_config::kCanDispatchTickHz == 700U,
-              "v2.1 CAN dispatch frequency plan is reviewed at 700 Hz");
+static_assert(dummy::generated_config::kCanSchedulerWatchdogHz == 1000U,
+              "v2.2 CAN watchdog frequency is reviewed at 1000 Hz");
 
 dummy::protocol::CanDispatchConfig MakeCanDispatchConfig()
 {
     dummy::protocol::CanDispatchConfig config{};
-    config.dispatch_tick_hz = dummy::generated_config::kCanDispatchTickHz;
+    config.scheduler_watchdog_hz =
+        dummy::generated_config::kCanSchedulerWatchdogHz;
     config.target_hz_per_node = dummy::generated_config::kCanTargetHzPerNode;
     config.position_hz_per_node = dummy::generated_config::kCanPositionHzPerNode;
     config.temperature_hz_per_node =
@@ -254,17 +257,125 @@ void ThreadControlLoopFixUpdate(void* argument)
 
 
 osThreadId_t canDispatchTaskHandle;
+void NotifyCanDispatcherFromIsr()
+{
+    if (canDispatchTaskHandle == nullptr)
+        return;
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    vTaskNotifyGiveFromISR(
+        TaskHandle_t(canDispatchTaskHandle), &higher_priority_task_woken);
+    portYIELD_FROM_ISR(higher_priority_task_woken);
+}
+
 void ThreadCanDispatch(void* argument)
 {
     (void) argument;
     dummy::protocol::ActuatorApplicationTracker application_tracker;
     ScheduledActuatorRequest target_fanout{};
     bool target_fanout_active = false;
+    uint32_t fanout_generation = 0U;
+    dummy::protocol::ActuatorApplicationTracker completion_tracker;
+    uint32_t completion_generation = 0U;
+    uint32_t completion_sequence = 0U;
+    uint32_t completion_first_enqueue_us = 0U;
+    uint32_t observed_completion_overflow_count = 0U;
+    std::array<uint32_t, dummy::protocol::kActuatorNodeCount>
+        target_tx_complete_count{};
+    uint32_t can_diagnostics_window_start_us = micros();
+    uint32_t max_fanout_us = 0U;
+    uint32_t safety_preemption_count = 0U;
+    uint32_t max_safety_wait_us = 0U;
     for (;;)
     {
-        // Clear accumulated notifications: v2.1 never replays a delayed CAN
-        // burst. All rate and timeout consequences remain visible in telemetry.
+        // TX-complete, RX-response and the 1 kHz watchdog all wake this task.
+        // One iteration admits at most one frame; completion interrupts drive
+        // a seven-node fan-out without turning the timer into a throughput cap.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        CAN_context* can_context = get_can_ctx(&hcan1);
+        if (can_context != nullptr &&
+            can_context->tx_completion_overflow_count !=
+                observed_completion_overflow_count)
+        {
+            observed_completion_overflow_count =
+                can_context->tx_completion_overflow_count;
+            if (target_fanout_active && target_fanout.sequence != 0U)
+                dummy::protocol::RecordBinaryTargetFailed(
+                    target_fanout.sequence,
+                    dummy::protocol::BinaryControlMonotonicMicros());
+            if (completion_sequence != 0U)
+                dummy::protocol::RecordBinaryTargetFailed(
+                    completion_sequence,
+                    dummy::protocol::BinaryControlMonotonicMicros());
+            target_fanout = {};
+            target_fanout_active = false;
+            application_tracker.Reset();
+            completion_tracker.Reset();
+            completion_sequence = 0U;
+            dummy::protocol::RequestBinaryRuntimeHold();
+        }
+        CanTxCompletion completion{};
+        while (CanTakeTxCompletion(can_context, completion))
+        {
+            const uint64_t completed_us =
+                dummy::protocol::BinaryControlMonotonicMicros();
+            if (completion.metadata.channel == CanTxChannel::Safety &&
+                completion.status == CanTxCompletionStatus::Complete)
+            {
+                max_safety_wait_us = std::max(
+                    max_safety_wait_us,
+                    static_cast<uint32_t>(completed_us -
+                        completion.metadata.enqueued_time_us));
+            }
+            if (completion.metadata.channel != CanTxChannel::Target ||
+                completion.metadata.action_sequence == 0U)
+                continue;
+            if (completion.status != CanTxCompletionStatus::Complete)
+            {
+                dummy::protocol::RecordBinaryTargetFailed(
+                    completion.metadata.action_sequence, completed_us);
+                dummy::protocol::RequestBinaryRuntimeHold();
+                completion_tracker.Reset();
+                continue;
+            }
+            if (completion.metadata.node_id >= 1U &&
+                completion.metadata.node_id <=
+                    dummy::protocol::kActuatorNodeCount)
+                ++target_tx_complete_count[
+                    completion.metadata.node_id - 1U];
+            if (completion_generation !=
+                completion.metadata.fanout_generation)
+            {
+                completion_generation =
+                    completion.metadata.fanout_generation;
+                completion_sequence = completion.metadata.action_sequence;
+                completion_first_enqueue_us =
+                    completion.metadata.enqueued_time_us;
+                completion_tracker.Reset();
+            }
+            const bool tx_complete_exact =
+                completion_tracker.RecordTransmission(
+                    completion.metadata.action_sequence,
+                    completion.metadata.node_id, true);
+            if (tx_complete_exact)
+            {
+                const uint32_t elapsed_us = static_cast<uint32_t>(
+                    completed_us - completion_first_enqueue_us);
+                max_fanout_us = std::max(max_fanout_us, elapsed_us);
+                if (elapsed_us > 10000U)
+                {
+                    dummy::protocol::RecordBinaryTargetFailed(
+                        completion.metadata.action_sequence, completed_us);
+                    dummy::protocol::RequestBinaryRuntimeHold();
+                }
+                else
+                {
+                    dummy::protocol::RecordBinaryTargetCanTxCompleteExact(
+                        completion.metadata.action_sequence, completed_us);
+                }
+                completion_tracker.Reset();
+                completion_sequence = 0U;
+            }
+        }
         const ScheduledActuatorRequest scheduled = ReadScheduledActuatorRequest();
         dummy::protocol::CanDispatchMode dispatch_mode =
             dummy::protocol::CanDispatchMode::Bootstrap;
@@ -278,9 +389,12 @@ void ThreadCanDispatch(void* argument)
         if (dispatch_mode != can_dispatch_scheduler.mode())
         {
             if (target_fanout_active && target_fanout.sequence != 0U)
-                dummy::protocol::RecordBinaryTargetSuperseded(
+            {
+                dummy::protocol::RecordBinaryTargetPreemptedBySafety(
                     target_fanout.sequence,
                     dummy::protocol::BinaryControlMonotonicMicros());
+                ++safety_preemption_count;
+            }
             target_fanout = {};
             target_fanout_active = false;
             application_tracker.Reset();
@@ -292,9 +406,21 @@ void ThreadCanDispatch(void* argument)
         dummy::protocol::LatchCoherentRobotMeasurement();
         const auto coherent = dummy::protocol::ReadCoherentFeedbackStatus();
         if (coherent.valid)
+        {
+            uint64_t earliest_sample_us = 0U;
+            const uint64_t coherent_now_us =
+                dummy::protocol::BinaryControlMonotonicMicros();
+            for (const uint32_t sample_low_us : coherent.position_sample_us)
+            {
+                const uint64_t sample_us =
+                    dummy::protocol::ExtendRecentMicros32(
+                        coherent_now_us, sample_low_us);
+                earliest_sample_us = earliest_sample_us == 0U
+                    ? sample_us : std::min(earliest_sample_us, sample_us);
+            }
             dummy::protocol::RecordBinaryCoherentSweep(
-                coherent.sweep_id,
-                dummy::protocol::BinaryControlMonotonicMicros());
+                coherent.sweep_id, coherent_now_us, earliest_sample_us);
+        }
         const auto step = can_dispatch_scheduler.Next(now_us, responses);
         if (step.timed_out_action ==
             dummy::protocol::CanDispatchAction::PositionRequest)
@@ -307,6 +433,25 @@ void ThreadCanDispatch(void* argument)
 
         bool queued = false;
         ScheduledActuatorRequest latest = scheduled;
+        CanTxMetadata tx_metadata{};
+        tx_metadata.session_epoch =
+            dummy::protocol::ReadBinaryControlSnapshot(
+                dummy::protocol::BinaryControlMonotonicMicros()).session_epoch;
+        tx_metadata.node_id = step.node_id;
+        tx_metadata.enqueued_time_us = now_us;
+        if (step.action == dummy::protocol::CanDispatchAction::ActuatorTarget)
+            tx_metadata.channel = step.transition
+                ? CanTxChannel::Safety : CanTxChannel::Target;
+        else if (step.action == dummy::protocol::CanDispatchAction::PositionRequest)
+            tx_metadata.channel = CanTxChannel::Position;
+        else if (step.action == dummy::protocol::CanDispatchAction::TemperatureRequest)
+            tx_metadata.channel = CanTxChannel::Temperature;
+        else if (step.action == dummy::protocol::CanDispatchAction::EnableBroadcast ||
+                 step.action == dummy::protocol::CanDispatchAction::DisableBroadcast)
+            tx_metadata.channel =
+                step.action == dummy::protocol::CanDispatchAction::DisableBroadcast &&
+                dispatch_mode == dummy::protocol::CanDispatchMode::Fault
+                ? CanTxChannel::Emergency : CanTxChannel::Safety;
         switch (step.action)
         {
             case dummy::protocol::CanDispatchAction::ActuatorTarget:
@@ -323,14 +468,19 @@ void ThreadCanDispatch(void* argument)
                         {
                             target_fanout = candidate;
                             target_fanout_active = true;
+                            ++fanout_generation;
+                            if (fanout_generation == 0U)
+                                ++fanout_generation;
                             application_tracker.Reset();
                         }
                     }
                     if (target_fanout_active)
                     {
                         latest = target_fanout;
+                        tx_metadata.action_sequence = latest.sequence;
+                        tx_metadata.fanout_generation = fanout_generation;
                         queued = robot.ApplyExternalUrdfTargetNodeRad(
-                            step.node_id, latest.position);
+                            step.node_id, latest.position, &tx_metadata);
                     }
                 }
                 else
@@ -338,22 +488,24 @@ void ThreadCanDispatch(void* argument)
                     latest = ReadScheduledActuatorRequest();
                     if (latest.mode == scheduled.mode)
                         queued = robot.ApplyExternalUrdfTargetNodeRad(
-                            step.node_id, latest.position);
+                            step.node_id, latest.position, &tx_metadata);
                 }
                 break;
             case dummy::protocol::CanDispatchAction::PositionRequest:
-                queued = robot.TryRequestPositionFeedback(step.node_id);
+                queued = robot.TryRequestPositionFeedback(
+                    step.node_id, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::TemperatureRequest:
-                queued = robot.TryRequestTemperatureFeedback(step.node_id);
+                queued = robot.TryRequestTemperatureFeedback(
+                    step.node_id, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::EnableBroadcast:
                 latest = ReadScheduledActuatorRequest();
                 if (latest.mode == ScheduledActuatorMode::Stream)
-                    queued = robot.TrySetExternalEnable(true);
+                    queued = robot.TrySetExternalEnable(true, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::DisableBroadcast:
-                queued = robot.TrySetExternalEnable(false);
+                queued = robot.TrySetExternalEnable(false, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::None:
                 break;
@@ -389,7 +541,6 @@ void ThreadCanDispatch(void* argument)
         }
 
         const auto diagnostics = can_dispatch_scheduler.diagnostics();
-        const CAN_context* can_context = get_can_ctx(&hcan1);
         uint8_t runtime_status = dummy::protocol::kCanRuntimeDispatcherAlive;
         if (can_context != nullptr && can_context->tx_queued_count != 0U)
             runtime_status |= dummy::protocol::kCanRuntimeTxQueued;
@@ -416,6 +567,39 @@ void ThreadCanDispatch(void* argument)
         if (can_context != nullptr && can_context->tx_recovery_count != 0U)
             runtime_status |= dummy::protocol::kCanRuntimeTxRecovered;
         dummy::protocol::PublishCanRuntimeStatus(runtime_status);
+
+        dummy::protocol::CanDiagnosticsPayload can_diagnostics{};
+        can_diagnostics.window_start_us = can_diagnostics_window_start_us;
+        can_diagnostics.window_duration_us =
+            static_cast<uint32_t>(now_us - can_diagnostics_window_start_us);
+        for (size_t index = 0;
+             index < dummy::protocol::kActuatorNodeCount; ++index)
+        {
+            can_diagnostics.target_tx_complete[index] =
+                target_tx_complete_count[index];
+            can_diagnostics.position_response[index] =
+                diagnostics.position_responded[index];
+            can_diagnostics.temperature_response[index] =
+                diagnostics.temperature_responded[index];
+            can_diagnostics.position_timeout_count +=
+                diagnostics.position_timed_out[index];
+            can_diagnostics.temperature_timeout_count +=
+                diagnostics.temperature_timed_out[index];
+        }
+        if (can_context != nullptr)
+        {
+            can_diagnostics.tx_abort_count =
+                can_context->TxMailboxAbortCallbackCnt;
+            can_diagnostics.tx_error_count =
+                can_context->tx_enqueue_error_count +
+                can_context->tx_completion_overflow_count;
+            can_diagnostics.tx_recovery_count =
+                can_context->tx_recovery_count;
+        }
+        can_diagnostics.safety_preemption_count = safety_preemption_count;
+        can_diagnostics.max_safety_wait_us = max_safety_wait_us;
+        can_diagnostics.max_fanout_us = max_fanout_us;
+        dummy::protocol::PublishCanDiagnostics(can_diagnostics);
     }
 }
 
@@ -501,10 +685,7 @@ void OnTimer7Callback()
 
 void OnTimer10CanDispatchCallback()
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-    vTaskNotifyGiveFromISR(TaskHandle_t(canDispatchTaskHandle), &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    NotifyCanDispatcherFromIsr();
 }
 
 osThreadId_t rgbTaskHandle;

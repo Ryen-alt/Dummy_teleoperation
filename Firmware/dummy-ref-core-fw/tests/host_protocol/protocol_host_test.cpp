@@ -748,7 +748,8 @@ void TestCanDispatcherTransitionsAndFrequencyPlan()
     FeedbackResponseEvents responses{};
     std::array<uint32_t, kActuatorNodeCount> last_node_tx{};
     std::array<bool, kActuatorNodeCount> node_seen{};
-    for (size_t tick = 0; tick < 7000U; ++tick)
+    const uint32_t end_us = now_us + 10000000U;
+    while (now_us < end_us)
     {
         const CanDispatchStep step = scheduler.Next(now_us, responses);
         responses = {};
@@ -769,8 +770,14 @@ void TestCanDispatcherTransitionsAndFrequencyPlan()
             else if (step.action == CanDispatchAction::TemperatureRequest)
                 responses.temperature_mask = static_cast<uint8_t>(
                     1U << (step.node_id - 1U));
+            // Model a TX-complete/RX-response wake much sooner than the 1 ms
+            // watchdog. No parallel mailbox is used.
+            now_us += 100U;
         }
-        now_us += 1429U;
+        else
+        {
+            now_us += 1000U;
+        }
     }
 
     const CanDispatchDiagnostics after = scheduler.diagnostics();
@@ -849,16 +856,24 @@ void TestCanDispatcherDoesNotBurstAfterDeferredDeadline()
     assert(due.action == CanDispatchAction::ActuatorTarget);
     scheduler.OnQueued(due, now_us);
 
-    // The stale deadlines were collapsed to one due frame. A second target
-    // must not be emitted on the immediately following dispatcher tick.
-    const CanDispatchStep after = scheduler.Next(now_us + 1429U);
+    // One overdue cycle becomes exactly one atomic seven-node fan-out. Nodes
+    // 2..7 follow TX-complete wakes immediately, but no historical cycle is
+    // replayed after that fan-out finishes.
+    for (uint8_t node_id = 2U; node_id <= kActuatorNodeCount; ++node_id)
+    {
+        const CanDispatchStep next = scheduler.Next(now_us + node_id * 100U);
+        assert(next.action == CanDispatchAction::ActuatorTarget);
+        assert(next.node_id == node_id);
+        scheduler.OnQueued(next, now_us + node_id * 100U);
+    }
+    const CanDispatchStep after = scheduler.Next(now_us + 1000U);
     assert(after.action == CanDispatchAction::None);
 }
 
 void TestCanDispatcherRejectsInvalidRatePlanWithoutFallback()
 {
     CanDispatchConfig config{};
-    config.dispatch_tick_hz = 100U;
+    config.scheduler_watchdog_hz = 99U;
     CanDispatchScheduler scheduler(config);
     scheduler.SetMode(CanDispatchMode::Stream);
     for (uint32_t tick = 0; tick < 1000U; ++tick)

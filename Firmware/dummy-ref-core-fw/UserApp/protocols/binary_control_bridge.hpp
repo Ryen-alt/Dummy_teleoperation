@@ -13,6 +13,7 @@ namespace dummy::protocol
 struct BinaryControlSnapshot
 {
     ExecutorTarget target{};
+    uint32_t session_epoch = 0;
     ControlMode mode = ControlMode::Disabled;
     bool hello_valid = false;
     bool lease_active = false;
@@ -28,7 +29,11 @@ void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us);
 void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us);
 bool TryStartBinaryTargetDispatch(uint32_t sequence);
 void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us);
-void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us);
+void RecordBinaryTargetPreemptedBySafety(uint32_t sequence, uint64_t now_us);
+void RecordBinaryTargetFailed(uint32_t sequence, uint64_t now_us);
+void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us,
+                               uint64_t earliest_sample_us);
+void RequestBinaryRuntimeHold();
 void ApplyBinarySafetyOutcome(const FeedbackSafetyOutput& safety);
 FeedbackSafetyOutput ReadBinarySafetyTelemetry();
 bool BinaryControlLeaseActive();

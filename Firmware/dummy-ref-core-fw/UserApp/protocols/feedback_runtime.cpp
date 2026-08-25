@@ -14,6 +14,7 @@ uint8_t runtime_status = 0U;
 bool feedback_ready = false;
 uint32_t readiness_sweep_id = 0U;
 uint8_t consecutive_coherent_sweeps = 0U;
+CanDiagnosticsPayload can_diagnostics{};
 
 uint8_t NodeMask(uint8_t node_id)
 {
@@ -137,6 +138,21 @@ bool ReadCanFeedbackReady()
     const bool ready = feedback_ready;
     taskEXIT_CRITICAL();
     return ready;
+}
+
+void PublishCanDiagnostics(const CanDiagnosticsPayload& diagnostics)
+{
+    taskENTER_CRITICAL();
+    can_diagnostics = diagnostics;
+    taskEXIT_CRITICAL();
+}
+
+CanDiagnosticsPayload ReadCanDiagnostics()
+{
+    taskENTER_CRITICAL();
+    const CanDiagnosticsPayload snapshot = can_diagnostics;
+    taskEXIT_CRITICAL();
+    return snapshot;
 }
 
 } // namespace dummy::protocol

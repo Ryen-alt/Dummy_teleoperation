@@ -41,6 +41,7 @@ struct ProcessResult
     bool target_updated = false;
     bool entered_hold = false;
     bool emergency_stop_requested = false;
+    bool can_diagnostics_requested = false;
 };
 
 class ControlSession

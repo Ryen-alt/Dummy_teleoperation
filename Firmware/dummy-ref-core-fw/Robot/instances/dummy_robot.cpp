@@ -112,7 +112,8 @@ void DummyRobot::MoveJoints(DOF6Kinematic::Joint6D_t _joints)
 
 
 bool DummyRobot::ApplyExternalUrdfTargetNodeRad(
-    uint8_t node_id, const std::array<float, 7>& target)
+    uint8_t node_id, const std::array<float, 7>& target,
+    const CanTxMetadata* metadata)
 {
     constexpr float kRadiansToDegrees = 57.295779513082320876F;
     if (node_id >= 1U && node_id <= 6U)
@@ -123,11 +124,12 @@ bool DummyRobot::ApplyExternalUrdfTargetNodeRad(
             kRadiansToDegrees;
         targetJoints.a[index] = target_degrees;
         return motorJ[node_id]->SetStreamingAngle(
-            target_degrees - initPose.a[index]);
+            target_degrees - initPose.a[index], metadata);
     }
     if (node_id == 7U && hand != nullptr)
         return hand->SetStreamingNormalizedPosition(
-            target[6], dummy::generated_config::kGripperVelocityLimitPerS);
+            target[6], dummy::generated_config::kGripperVelocityLimitPerS,
+            metadata);
     return false;
 }
 
@@ -271,29 +273,32 @@ void DummyRobot::RequestTemperatureFeedback(uint8_t node_id)
 }
 
 
-bool DummyRobot::TryRequestPositionFeedback(uint8_t node_id)
+bool DummyRobot::TryRequestPositionFeedback(
+    uint8_t node_id, const CanTxMetadata* metadata)
 {
     if (node_id >= 1U && node_id <= 6U)
-        return motorJ[node_id]->TryUpdateAngle();
+        return motorJ[node_id]->TryUpdateAngle(metadata);
     if (hand != nullptr && node_id == hand->nodeID)
-        return hand->TryUpdateAngle();
+        return hand->TryUpdateAngle(metadata);
     return false;
 }
 
 
-bool DummyRobot::TryRequestTemperatureFeedback(uint8_t node_id)
+bool DummyRobot::TryRequestTemperatureFeedback(
+    uint8_t node_id, const CanTxMetadata* metadata)
 {
     if (node_id >= 1U && node_id <= 6U)
-        return motorJ[node_id]->TryGetTemp();
+        return motorJ[node_id]->TryGetTemp(metadata);
     if (hand != nullptr && node_id == hand->nodeID)
-        return hand->TryGetTemp();
+        return hand->TryGetTemp(metadata);
     return false;
 }
 
 
-bool DummyRobot::TrySetExternalEnable(bool enable)
+bool DummyRobot::TrySetExternalEnable(
+    bool enable, const CanTxMetadata* metadata)
 {
-    const bool queued = motorJ[ALL]->TrySetEnable(enable);
+    const bool queued = motorJ[ALL]->TrySetEnable(enable, metadata);
     if (queued)
         isEnabled = enable;
     return queued;
@@ -499,14 +504,17 @@ void StepHand::SetNormalizedPosition(float normalized, float max_velocity_per_s)
 
 
 bool StepHand::SetStreamingNormalizedPosition(float normalized,
-                                              float max_velocity_per_s)
+                                              float max_velocity_per_s,
+                                              const CanTxMetadata* metadata)
 {
-    return SendNormalizedPosition(normalized, max_velocity_per_s, true);
+    return SendNormalizedPosition(
+        normalized, max_velocity_per_s, true, metadata);
 }
 
 
 bool StepHand::SendNormalizedPosition(float normalized, float max_velocity_per_s,
-                                      bool streaming)
+                                      bool streaming,
+                                      const CanTxMetadata* metadata)
 {
     if (normalized < 0.0F) normalized = 0.0F;
     else if (normalized > 1.0F) normalized = 1.0F;
@@ -521,7 +529,8 @@ bool StepHand::SendNormalizedPosition(float normalized, float max_velocity_per_s
         fabsf(travel_degrees) / 360.0F * static_cast<float>(reduction) *
         max_velocity_per_s;
     if (streaming)
-        return SetStreamingAngleWithVelocityLimit(target_angle, motor_velocity);
+        return SetStreamingAngleWithVelocityLimit(
+            target_angle, motor_velocity, metadata);
     SetAngleWithVelocityLimit(target_angle, motor_velocity);
     return true;
 }

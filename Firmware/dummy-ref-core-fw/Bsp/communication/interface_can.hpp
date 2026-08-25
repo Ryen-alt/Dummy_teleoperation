@@ -5,6 +5,43 @@
 #include <stm32f4xx_hal.h>
 #include <cmsis_os.h>
 
+enum class CanTxChannel : uint8_t
+{
+    Untracked = 0,
+    Emergency = 1,
+    Safety = 2,
+    Target = 3,
+    Position = 4,
+    Temperature = 5,
+    Diagnostics = 6,
+};
+
+enum class CanTxCompletionStatus : uint8_t
+{
+    Complete,
+    Aborted,
+    Error,
+};
+
+struct CanTxMetadata
+{
+    CanTxChannel channel = CanTxChannel::Untracked;
+    uint32_t session_epoch = 0;
+    uint32_t action_sequence = 0;
+    uint32_t fanout_generation = 0;
+    uint32_t enqueued_time_us = 0;
+    uint8_t node_id = 0;
+};
+
+struct CanTxCompletion
+{
+    CanTxMetadata metadata{};
+    CanTxCompletionStatus status = CanTxCompletionStatus::Complete;
+    uint8_t mailbox_index = 0;
+};
+
+constexpr size_t kCanTxCompletionCapacity = 16U;
+
 struct CAN_context
 {
     CAN_HandleTypeDef* handle = nullptr;
@@ -23,6 +60,12 @@ struct CAN_context
     uint32_t tx_enqueue_error_count = 0;
     volatile uint32_t tx_started_ms = 0;
     volatile bool tx_in_flight = false;
+    CanTxMetadata active_tx_metadata{};
+    volatile bool active_tx_metadata_valid = false;
+    CanTxCompletion tx_completion_ring[kCanTxCompletionCapacity]{};
+    volatile uint8_t tx_completion_read = 0;
+    volatile uint8_t tx_completion_write = 0;
+    uint32_t tx_completion_overflow_count = 0;
 
     uint8_t node_id_rng_state = 0;
 
@@ -62,7 +105,8 @@ enum class CanTxStatus : uint8_t
 CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
                               CAN_TxHeaderTypeDef* txHeader,
                               CanTxQueuedCallback on_queued = nullptr,
-                              void* callback_context = nullptr);
+                              void* callback_context = nullptr,
+                              const CanTxMetadata* metadata = nullptr);
 
 // Returns true only when the frame was accepted by a hardware TX mailbox. The
 // optional callback runs in the same critical section as the mailbox enqueue.
@@ -70,7 +114,10 @@ CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
 // realtime dispatch uses CanTrySendMessage().
 bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader,
                     CanTxQueuedCallback on_queued = nullptr,
-                    void* callback_context = nullptr);
+                    void* callback_context = nullptr,
+                    const CanTxMetadata* metadata = nullptr);
+bool CanTakeTxCompletion(CAN_context* canCtx, CanTxCompletion& completion);
+void NotifyCanDispatcherFromIsr();
 void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* data);
 
 #endif // __INTERFACE_CAN_HPP

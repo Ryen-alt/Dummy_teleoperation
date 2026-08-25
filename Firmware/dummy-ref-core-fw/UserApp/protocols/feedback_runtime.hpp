@@ -3,6 +3,7 @@
 
 #include "can_feedback_monitor.hpp"
 #include "feedback_poll_scheduler.hpp"
+#include "binary_protocol.hpp"
 
 #include <array>
 #include <cstdint>
@@ -38,6 +39,8 @@ void PublishCanRuntimeStatus(uint8_t status);
 uint8_t ReadCanRuntimeStatus();
 void PublishCanFeedbackReady(bool ready);
 bool ReadCanFeedbackReady();
+void PublishCanDiagnostics(const CanDiagnosticsPayload& diagnostics);
+CanDiagnosticsPayload ReadCanDiagnostics();
 
 } // namespace dummy::protocol
 

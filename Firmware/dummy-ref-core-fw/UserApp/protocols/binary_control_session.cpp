@@ -242,6 +242,14 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
         }
         case MessageType::ClearFault:
             return Ack(request, ResultCode::Unsupported);
+        case MessageType::GetCanDiagnostics:
+        {
+            if (request.header.payload_length != 0U)
+                return Ack(request, ResultCode::BadLength);
+            ProcessResult result = Ack(request);
+            result.can_diagnostics_requested = true;
+            return result;
+        }
         default:
             return Ack(request, ResultCode::Unsupported);
     }

@@ -63,7 +63,9 @@ public:
 
     void SetPercent(float _percent);
     void SetNormalizedPosition(float normalized, float max_velocity_per_s);
-    bool SetStreamingNormalizedPosition(float normalized, float max_velocity_per_s);
+    bool SetStreamingNormalizedPosition(
+        float normalized, float max_velocity_per_s,
+        const CanTxMetadata* metadata = nullptr);
     void SetGripCurrent(float _current);
     void DriveWithCurrent(float _direction);
     void HandCalibration();
@@ -93,7 +95,8 @@ public:
 
 private:
     bool SendNormalizedPosition(float normalized, float max_velocity_per_s,
-                                bool streaming);
+                                bool streaming,
+                                const CanTxMetadata* metadata = nullptr);
     bool isCalibrating = false;
 };
 
@@ -176,17 +179,21 @@ public:
     void MoveJoints(DOF6Kinematic::Joint6D_t _joints);
     // The binary host-facing target is expressed in URDF joint coordinates.
     bool ApplyExternalUrdfTargetNodeRad(uint8_t node_id,
-                                       const std::array<float, 7>& target);
+                                       const std::array<float, 7>& target,
+                                       const CanTxMetadata* metadata = nullptr);
     void HoldCurrentPosition();
     void SetJointSpeed(float _speed);
     void SetJointAcceleration(float _acc);
     void RequestPositionFeedback(uint8_t node_id);
     void RequestTemperatureFeedback(uint8_t node_id);
-    bool TryRequestPositionFeedback(uint8_t node_id);
-    bool TryRequestTemperatureFeedback(uint8_t node_id);
+    bool TryRequestPositionFeedback(
+        uint8_t node_id, const CanTxMetadata* metadata = nullptr);
+    bool TryRequestTemperatureFeedback(
+        uint8_t node_id, const CanTxMetadata* metadata = nullptr);
     // Realtime binary control uses a single non-blocking broadcast after its
     // per-node hold targets have been admitted by the CAN dispatcher.
-    bool TrySetExternalEnable(bool enable);
+    bool TrySetExternalEnable(
+        bool enable, const CanTxMetadata* metadata = nullptr);
     void UpdateJointAnglesCallback();
     void UpdateJointPose6D();
     void Reboot();

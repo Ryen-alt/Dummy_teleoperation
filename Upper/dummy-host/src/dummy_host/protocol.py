@@ -82,6 +82,8 @@ class ActionProgressStage(enum.IntEnum):
     CAN_TX_COMPLETE_EXACT = 2
     POST_COMMAND_FEEDBACK = 3
     SUPERSEDED = 4
+    PREEMPTED_BY_SAFETY = 5
+    FAILED = 6
 
 
 ACK_DETAIL_FEEDBACK_NOT_READY = 1

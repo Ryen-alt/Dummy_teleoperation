@@ -164,12 +164,16 @@ enum class ActionProgressStage : uint8_t
     CanTxCompleteExact = 2,
     PostCommandFeedback = 3,
     Superseded = 4,
+    PreemptedBySafety = 5,
+    Failed = 6,
 };
 
 constexpr uint8_t kActionProgressCanQueuedExact = 1U << 0;
 constexpr uint8_t kActionProgressCanTxCompleteExact = 1U << 1;
 constexpr uint8_t kActionProgressPostCommandFeedback = 1U << 2;
 constexpr uint8_t kActionProgressSuperseded = 1U << 3;
+constexpr uint8_t kActionProgressPreemptedBySafety = 1U << 4;
+constexpr uint8_t kActionProgressFailed = 1U << 5;
 constexpr uint8_t kStateRepeated = 1U << 0;
 
 struct ActionProgressPayload
