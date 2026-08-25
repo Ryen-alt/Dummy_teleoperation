@@ -59,7 +59,7 @@ def test_simulated_bringup_closes_in_hold(config: RobotConfig) -> None:
     plan = make_joint_bringup_plan(config, joint=1, delta_deg=0.2, duration_s=0.12)
     result = run_simulated_bringup(config, plan)
     assert result.actions_sent >= 1
-    assert result.last_applied_sequence == result.last_sequence
+    assert result.last_post_command_feedback_sequence == result.last_sequence
     assert result.final_mode == "HOLD"
 
 
@@ -152,7 +152,6 @@ def test_real_bringup_preserves_primary_error_when_release_cleanup_fails(
                 position_valid=True,
                 gripper_valid=True,
                 mode=ControlMode.TELEOP,
-                last_applied_sequence=0,
             )
 
         def connect(self) -> None:

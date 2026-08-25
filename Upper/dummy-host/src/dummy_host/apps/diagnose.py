@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 
@@ -56,13 +57,23 @@ def main() -> None:
                     f"follow={state.following_error.tolist()} "
                     f"can_age_ms={state.feedback_age_ms.tolist()} "
                     f"can_loss={state.feedback_loss_count.tolist()} "
+                    f"can_status=0x{state.can_transport_status:02x} "
+                    f"sweep={state.coherent_sweep_id} "
+                    f"sweep_skew_us={state.feedback_max_skew_us} "
+                    f"post_feedback={state.last_post_command_feedback_sequence} "
                     f"hold=0x{state.hold_reason_bits:04x} "
                     f"fault=0x{state.fault_bits:04x} "
                     f"node_fault={[hex(int(v)) for v in state.node_fault_bits]} "
-                    f"applied={state.last_applied_sequence} "
+                    f"can_exact={state.last_can_queued_exact_sequence} "
                     f"state_age_ms={(time.monotonic_ns() - state.monotonic_ns) / 1e6:.1f} "
                     f"camera=({camera_text})"
                 )
+                transport = robot.health().details.get("transport", {})
+                if transport:
+                    print(
+                        "serial_transport="
+                        + json.dumps(transport, sort_keys=True, separators=(",", ":"))
+                    )
                 time.sleep(args.interval)
     except KeyboardInterrupt:
         pass

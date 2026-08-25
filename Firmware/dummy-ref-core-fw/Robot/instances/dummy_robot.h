@@ -182,6 +182,11 @@ public:
     void SetJointAcceleration(float _acc);
     void RequestPositionFeedback(uint8_t node_id);
     void RequestTemperatureFeedback(uint8_t node_id);
+    bool TryRequestPositionFeedback(uint8_t node_id);
+    bool TryRequestTemperatureFeedback(uint8_t node_id);
+    // Realtime binary control uses a single non-blocking broadcast after its
+    // per-node hold targets have been admitted by the CAN dispatcher.
+    bool TrySetExternalEnable(bool enable);
     void UpdateJointAnglesCallback();
     void UpdateJointPose6D();
     void Reboot();

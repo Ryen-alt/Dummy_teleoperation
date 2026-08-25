@@ -37,6 +37,7 @@ public:
     void SetAngleWithVelocityLimit(float _angle, float _vel);
     // CAN Command
     void SetEnable(bool _enable);
+    bool TrySetEnable(bool _enable);
     void SetEnableTemp(bool _enable);
     void DoCalibration();
     void SetCurrentSetPoint(float _val);
@@ -56,9 +57,11 @@ public:
     void SetEnableStallProtect(bool _enable);
     void Reboot();
     float GetTemp();
+    bool TryGetTemp();
     void EraseConfigs();
 
     void UpdateAngle();
+    bool TryUpdateAngle();
     void UpdateAngleCallback(float _pos, bool _isFinished);
 
 
@@ -96,8 +99,8 @@ public:
 
 
 private:
-    bool SendPositionSetPoint(float _val, bool request_ack);
-    bool SendPositionWithVelocityLimit(float _pos, float _vel);
+    bool SendPositionSetPoint(float _val, bool request_ack, bool non_blocking);
+    bool SendPositionWithVelocityLimit(float _pos, float _vel, bool non_blocking);
 
     CAN_HandleTypeDef* hcan;
     uint8_t canBuf[8] = {};

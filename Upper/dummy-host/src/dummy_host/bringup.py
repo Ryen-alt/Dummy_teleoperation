@@ -71,7 +71,7 @@ class JointBringupPlan:
 class BringupRunResult:
     actions_sent: int
     last_sequence: int
-    last_applied_sequence: int
+    last_post_command_feedback_sequence: int
     final_mode: str
     scheduler: SchedulerStats
 
@@ -131,11 +131,13 @@ def run_simulated_bringup(config: RobotConfig, plan: JointBringupPlan) -> Bringu
     target = np.asarray(plan.final_requested_action, dtype=np.float32)
     velocity_limit = config.joint_velocity_limit_rad_s.copy()
     velocity_limit[plan.joint - 1] = np.float32(plan.max_velocity_rad_s)
-    deadline_ns = time.monotonic_ns() + int(plan.duration_s * 1e9)
 
     try:
         robot.connect()
         robot.acquire_control(ControlMode.TELEOP)
+        # WAIT_FEEDBACK_READY and ACQUIRE are preparation, not part of the
+        # requested motion duration.
+        deadline_ns = time.monotonic_ns() + int(plan.duration_s * 1e9)
 
         def tick(now_ns: int) -> None:
             nonlocal actions_sent, last_sequence
@@ -160,7 +162,9 @@ def run_simulated_bringup(config: RobotConfig, plan: JointBringupPlan) -> Bringu
     return BringupRunResult(
         actions_sent=actions_sent,
         last_sequence=last_sequence,
-        last_applied_sequence=0 if final_state is None else final_state.last_applied_sequence,
+        last_post_command_feedback_sequence=(
+            0 if final_state is None else final_state.last_post_command_feedback_sequence
+        ),
         final_mode="UNKNOWN" if final_state is None else final_state.mode.name,
         scheduler=stats,
     )
@@ -239,7 +243,9 @@ def run_real_bringup(
                     "applied": applied.applied.tolist(),
                     "sequence": applied.sequence,
                     "last_received_sequence": final_state.last_received_sequence,
-                    "last_applied_sequence": final_state.last_applied_sequence,
+                    "last_post_command_feedback_sequence": (
+                        final_state.last_post_command_feedback_sequence
+                    ),
                     "state_position": final_state.position.tolist(),
                     "state_velocity": final_state.velocity.tolist(),
                     "following_error": final_state.following_error.tolist(),
@@ -297,7 +303,9 @@ def run_real_bringup(
     return BringupRunResult(
         actions_sent=actions_sent,
         last_sequence=last_sequence,
-        last_applied_sequence=0 if final_state is None else final_state.last_applied_sequence,
+        last_post_command_feedback_sequence=(
+            0 if final_state is None else final_state.last_post_command_feedback_sequence
+        ),
         final_mode="UNKNOWN" if final_state is None else final_state.mode.name,
         scheduler=stats,
     )

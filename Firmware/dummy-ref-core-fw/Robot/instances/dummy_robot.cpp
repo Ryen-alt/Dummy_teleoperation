@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 
 #include "communication.hpp"
 #include "dummy_robot.h"
@@ -188,9 +189,12 @@ bool DummyRobot::MoveL(float _x, float _y, float _z, float _a, float _b, float _
 {
     DOF6Kinematic::Pose6D_t pose6D(_x, _y, _z, _a, _b, _c);
     DOF6Kinematic::IKSolves_t ikSolves{};
-    DOF6Kinematic::Joint6D_t lastJoint6D{};
+    // Singular branches use the previous joints to keep the free base/wrist
+    // axes continuous.  A zero seed causes avoidable jumps toward zero.
+    DOF6Kinematic::Joint6D_t lastJoint6D = currentJoints;
 
-    dof6Solver->SolveIK(pose6D, lastJoint6D, ikSolves);
+    if (!dof6Solver->SolveIK(pose6D, lastJoint6D, ikSolves))
+        return false;
 
     bool valid[8];
     int validCnt = 0;
@@ -199,13 +203,22 @@ bool DummyRobot::MoveL(float _x, float _y, float _z, float _a, float _b, float _
     {
         valid[i] = true;
 
+        // solFlag==0 means the analytic branch is unreachable.  -1 means a
+        // singular but defined branch whose free axis was anchored above.
+        for (int flag = 0; flag < 3; ++flag)
+        {
+            if (ikSolves.solFlag[i][flag] == 0)
+                valid[i] = false;
+        }
+
         for (int j = 1; j <= 6; j++)
         {
-            if (ikSolves.config[i].a[j - 1] > motorJ[j]->angleLimitMax ||
+            if (!std::isfinite(ikSolves.config[i].a[j - 1]) ||
+                ikSolves.config[i].a[j - 1] > motorJ[j]->angleLimitMax ||
                 ikSolves.config[i].a[j - 1] < motorJ[j]->angleLimitMin)
             {
                 valid[i] = false;
-                continue;
+                break;
             }
         }
 
@@ -255,6 +268,35 @@ void DummyRobot::RequestTemperatureFeedback(uint8_t node_id)
         motorJ[node_id]->GetTemp();
     else if (hand != nullptr && node_id == hand->nodeID)
         hand->GetTemp();
+}
+
+
+bool DummyRobot::TryRequestPositionFeedback(uint8_t node_id)
+{
+    if (node_id >= 1U && node_id <= 6U)
+        return motorJ[node_id]->TryUpdateAngle();
+    if (hand != nullptr && node_id == hand->nodeID)
+        return hand->TryUpdateAngle();
+    return false;
+}
+
+
+bool DummyRobot::TryRequestTemperatureFeedback(uint8_t node_id)
+{
+    if (node_id >= 1U && node_id <= 6U)
+        return motorJ[node_id]->TryGetTemp();
+    if (hand != nullptr && node_id == hand->nodeID)
+        return hand->TryGetTemp();
+    return false;
+}
+
+
+bool DummyRobot::TrySetExternalEnable(bool enable)
+{
+    const bool queued = motorJ[ALL]->TrySetEnable(enable);
+    if (queued)
+        isEnabled = enable;
+    return queued;
 }
 
 

@@ -32,6 +32,12 @@ bool HashMatches(const uint8_t* lhs, const std::array<uint8_t, 32>& rhs)
         difference |= static_cast<uint8_t>(lhs[index] ^ rhs[index]);
     return difference == 0;
 }
+
+bool IsNewerSequence(uint32_t candidate, uint32_t previous)
+{
+    const uint32_t delta = candidate - previous;
+    return delta != 0U && delta < 0x80000000U;
+}
 } // namespace
 
 ControlSession::ControlSession(const SessionConfig& config, const char* firmware_version)
@@ -73,17 +79,19 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
             return Ack(request, ResultCode::BadConfig);
         if (fault_bits_ != 0)
             return Ack(request, ResultCode::FaultActive);
+        if (!control_ready_)
+            return Ack(request, ResultCode::BadMode,
+                       kAckDetailFeedbackNotReady);
         if (lease_active_ && request.header.session_id != session_id_)
             return Ack(request, ResultCode::LeaseConflict);
         if (payload.lease_ms == 0 || payload.lease_ms > config_.max_lease_ms)
             return Ack(request, ResultCode::OutOfRange);
-        if (request.header.sequence <= hello_sequence_)
+        if (!IsNewerSequence(request.header.sequence, hello_sequence_))
             return Ack(request, ResultCode::BadSequence);
 
         session_id_ = request.header.session_id;
         last_command_sequence_ = request.header.sequence;
         last_received_sequence_ = 0;
-        last_applied_sequence_ = 0;
         lease_duration_ms_ = payload.lease_ms;
         lease_active_ = true;
         mode_ = ControlMode::Hold;
@@ -142,8 +150,6 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
                 return Ack(request, ResultCode::BadLength);
             if (mode_ != ControlMode::Teleop && mode_ != ControlMode::Policy)
                 return Ack(request, ResultCode::BadMode);
-            if (request.header.sequence <= last_received_sequence_)
-                return Ack(request, ResultCode::BadSequence);
             const ResultCode target_result = ValidateTarget(payload);
             if (target_result != ResultCode::Ok)
                 return Ack(request, target_result);
@@ -186,12 +192,6 @@ bool ControlSession::Tick(uint64_t now_us)
     return false;
 }
 
-void ControlSession::MarkTargetApplied(uint32_t sequence)
-{
-    if (active_target_.valid && sequence == active_target_.sequence)
-        last_applied_sequence_ = sequence;
-}
-
 void ControlSession::SetFault(uint16_t fault_bits)
 {
     fault_bits_ |= fault_bits;
@@ -228,7 +228,6 @@ StatePayload ControlSession::MakeState(const std::array<float, 7>& position,
     std::copy(position.begin(), position.end(), state.position);
     std::copy(velocity.begin(), velocity.end(), state.velocity);
     state.last_received_sequence = last_received_sequence_;
-    state.last_applied_sequence = last_applied_sequence_;
     state.mode = static_cast<uint8_t>(mode_);
     state.validity = validity;
     state.fault_bits = fault_bits_;
@@ -314,7 +313,7 @@ bool ControlSession::ValidateSessionAndSequence(const Packet& request, ProcessRe
         result = Ack(request, ResultCode::BadSession);
         return false;
     }
-    if (request.header.sequence <= last_command_sequence_)
+    if (!IsNewerSequence(request.header.sequence, last_command_sequence_))
     {
         result = Ack(request, ResultCode::BadSequence);
         return false;

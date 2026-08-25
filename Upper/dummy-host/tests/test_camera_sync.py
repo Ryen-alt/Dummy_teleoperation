@@ -99,7 +99,6 @@ def test_camera_manager_builds_role_stable_observation(config) -> None:
         velocity_valid=False,
         gripper_valid=True,
         last_received_sequence=0,
-        last_applied_sequence=0,
         target_age_ms=0,
         config_hash=config.config_hash,
     )

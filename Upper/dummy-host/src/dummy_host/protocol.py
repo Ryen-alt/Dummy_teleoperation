@@ -6,10 +6,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .domain.models import ActionProgressRecord
 from .schema import ControlMode, RobotState
 
 MAGIC = 0x4459
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 4
 MAX_DECODED_FRAME = 512
 HEADER = struct.Struct("<HBBHHIIQ")
 CRC = struct.Struct("<I")
@@ -19,7 +20,13 @@ ACQUIRE_CONTROL = struct.Struct("<I")
 SET_MODE = struct.Struct("<B")
 JOINT_TARGET = struct.Struct("<7f6fHH")
 ACK = struct.Struct("<BBH")
-STATE = struct.Struct("<Q7f7fIIBBHI32s7f7I7I7I7H7H7BBHH")
+ACTION_PROGRESS = struct.Struct("<IB3xQI")
+ACTION_PROGRESS_RECORD = struct.Struct("<IB3xIII")
+ACTION_PROGRESS_CAPACITY = 6
+STATE = struct.Struct(
+    "<Q7f7fIBBHI32s7f7I7I7I7H7H7BBHH7Q7IIIQ4B"
+    + "IB3xIII" * ACTION_PROGRESS_CAPACITY
+)
 
 
 class ProtocolError(ValueError):
@@ -59,6 +66,15 @@ class ResultCode(enum.IntEnum):
     FAULT_ACTIVE = 11
     LEASE_CONFLICT = 12
     UNSUPPORTED = 13
+
+
+class ActionProgressStage(enum.IntEnum):
+    CAN_QUEUED_EXACT = 1
+    POST_COMMAND_FEEDBACK = 2
+    SUPERSEDED = 3
+
+
+ACK_DETAIL_FEEDBACK_NOT_READY = 1
 
 
 @dataclass(frozen=True)
@@ -272,12 +288,29 @@ def pack_state(state: RobotState) -> bytes:
     hash_bytes = bytes.fromhex(state.config_hash)
     if state.position.shape != (7,) or state.velocity.shape != (7,) or len(hash_bytes) != 32:
         raise ProtocolError("invalid STATE values")
+    progress = list(state.action_progress)
+    if len(progress) > ACTION_PROGRESS_CAPACITY:
+        raise ProtocolError("STATE action progress replay exceeds capacity")
+    progress.extend(
+        ActionProgressRecord(0, 0)
+        for _ in range(ACTION_PROGRESS_CAPACITY - len(progress))
+    )
+    packed_progress: list[int] = []
+    for record in progress:
+        packed_progress.extend(
+            (
+                record.sequence,
+                record.flags,
+                record.can_queued_mcu_us & 0xFFFFFFFF,
+                record.post_feedback_mcu_us & 0xFFFFFFFF,
+                record.feedback_sweep_id,
+            )
+        )
     return STATE.pack(
         state.mcu_time_us,
         *state.position.astype(np.float32),
         *state.velocity.astype(np.float32),
         state.last_received_sequence,
-        state.last_applied_sequence,
         int(state.mode),
         validity,
         state.fault_bits,
@@ -290,10 +323,44 @@ def pack_state(state: RobotState) -> bytes:
         *(int(value) for value in state.consecutive_feedback_loss),
         *(int(value) for value in state.node_fault_bits),
         *(int(value) for value in state.node_validity),
-        0,
+        state.can_transport_status,
         state.hold_reason_bits,
         state.telemetry_validity,
+        *(int(value) for value in state.feedback_sample_mcu_us),
+        *(int(value) for value in state.feedback_sweep_id),
+        state.coherent_sweep_id,
+        state.feedback_max_skew_us,
+        state.coherent_reference_mcu_us,
+        int(state.state_repeated),
+        len(state.action_progress),
+        0,
+        0,
+        *packed_progress,
     )
+
+
+def unpack_action_progress(payload: bytes) -> tuple[int, ActionProgressStage, int, int]:
+    if len(payload) != ACTION_PROGRESS.size:
+        raise ProtocolError("invalid ACTION_PROGRESS EVENT payload length")
+    sequence, raw_stage, stage_time_us, sweep_id = ACTION_PROGRESS.unpack(payload)
+    try:
+        stage = ActionProgressStage(raw_stage)
+    except ValueError as exc:
+        raise ProtocolError("unknown ACTION_PROGRESS stage") from exc
+    if sequence == 0:
+        raise ProtocolError("ACTION_PROGRESS sequence must be non-zero")
+    return sequence, stage, stage_time_us, sweep_id
+
+
+def _extend_low_mcu_time(reference_us: int, low_us: int) -> int:
+    if low_us == 0:
+        return 0
+    candidate = (reference_us & ~0xFFFFFFFF) | low_us
+    if candidate > reference_us and candidate - reference_us > 0x80000000:
+        candidate -= 1 << 32
+    elif reference_us > candidate and reference_us - candidate > 0x80000000:
+        candidate += 1 << 32
+    return candidate
 
 
 def unpack_state(payload: bytes, monotonic_ns: int) -> RobotState:
@@ -302,16 +369,16 @@ def unpack_state(payload: bytes, monotonic_ns: int) -> RobotState:
     values = STATE.unpack(payload)
     position = np.asarray(values[1:8], dtype=np.float32)
     velocity = np.asarray(values[8:15], dtype=np.float32)
-    following_error = np.asarray(values[22:29], dtype=np.float32)
+    following_error = np.asarray(values[21:28], dtype=np.float32)
     if (
         not np.isfinite(position).all()
         or not np.isfinite(velocity).all()
         or not np.isfinite(following_error).all()
     ):
         raise ProtocolError("STATE contains NaN or Inf")
-    validity = values[18]
+    validity = values[17]
     try:
-        mode = ControlMode(values[17])
+        mode = ControlMode(values[16])
     except ValueError as exc:
         raise ProtocolError("STATE contains an invalid control mode") from exc
     return RobotState(
@@ -320,23 +387,40 @@ def unpack_state(payload: bytes, monotonic_ns: int) -> RobotState:
         monotonic_ns=monotonic_ns,
         mcu_time_us=values[0],
         mode=mode,
-        fault_bits=values[19],
+        fault_bits=values[18],
         position_valid=bool(validity & 0x01),
         velocity_valid=bool(validity & 0x02),
         gripper_valid=bool(validity & 0x04),
         last_received_sequence=values[15],
-        last_applied_sequence=values[16],
-        target_age_ms=values[20],
-        config_hash=values[21].hex(),
+        target_age_ms=values[19],
+        config_hash=values[20].hex(),
         following_error=following_error,
-        following_error_duration_ms=np.asarray(values[29:36], dtype=np.uint32),
-        feedback_age_ms=np.asarray(values[36:43], dtype=np.uint32),
-        feedback_loss_count=np.asarray(values[43:50], dtype=np.uint32),
-        consecutive_feedback_loss=np.asarray(values[50:57], dtype=np.uint16),
-        node_fault_bits=np.asarray(values[57:64], dtype=np.uint16),
-        node_validity=np.asarray(values[64:71], dtype=np.uint8),
-        hold_reason_bits=values[72],
-        telemetry_validity=values[73],
+        following_error_duration_ms=np.asarray(values[28:35], dtype=np.uint32),
+        feedback_age_ms=np.asarray(values[35:42], dtype=np.uint32),
+        feedback_loss_count=np.asarray(values[42:49], dtype=np.uint32),
+        consecutive_feedback_loss=np.asarray(values[49:56], dtype=np.uint16),
+        node_fault_bits=np.asarray(values[56:63], dtype=np.uint16),
+        node_validity=np.asarray(values[63:70], dtype=np.uint8),
+        can_transport_status=values[70],
+        hold_reason_bits=values[71],
+        telemetry_validity=values[72],
+        feedback_sample_mcu_us=np.asarray(values[73:80], dtype=np.uint64),
+        feedback_sweep_id=np.asarray(values[80:87], dtype=np.uint32),
+        coherent_sweep_id=values[87],
+        feedback_max_skew_us=values[88],
+        coherent_reference_mcu_us=values[89],
+        state_repeated=bool(values[90] & 0x01),
+        action_progress=tuple(
+            ActionProgressRecord(
+                values[94 + index * 5],
+                values[95 + index * 5],
+                _extend_low_mcu_time(values[0], values[96 + index * 5]),
+                _extend_low_mcu_time(values[0], values[97 + index * 5]),
+                values[98 + index * 5],
+            )
+            for index in range(min(values[91], ACTION_PROGRESS_CAPACITY))
+            if values[94 + index * 5] != 0
+        ),
     )
 
 

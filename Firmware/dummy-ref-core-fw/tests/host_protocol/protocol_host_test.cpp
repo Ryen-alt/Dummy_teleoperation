@@ -61,6 +61,14 @@ ResultCode ResponseCode(const ProcessResult& result)
     return static_cast<ResultCode>(payload.result);
 }
 
+uint16_t ResponseDetail(const ProcessResult& result)
+{
+    AckPayload payload{};
+    assert(result.response.header.payload_length == sizeof(payload));
+    std::memcpy(&payload, result.response.payload.data(), sizeof(payload));
+    return payload.detail;
+}
+
 SessionConfig MakeConfig(bool verified)
 {
     SessionConfig config{};
@@ -77,9 +85,9 @@ SessionConfig MakeConfig(bool verified)
 Packet DecodeHelloVector()
 {
     const auto wire = FromHex(
-        "06594402012401013944332211887766550807060504030201"
+        "06594404012401013944332211887766550807060504030201"
         "cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d"
-        "40421a73f5043d4a5a5aa5a5ca8f978e00");
+        "40421a73f5043d4a5a5aa5a5e1d29f3f00");
     Packet packet{};
     const DecodeStatus status = DecodePacket(wire.data(), wire.size(), packet);
     if (status != DecodeStatus::Ok)
@@ -101,9 +109,9 @@ void TestCodecVectors()
     std::array<uint8_t, 600> output{};
     const size_t length = EncodePacket(hello, output.data(), output.size());
     const auto expected = FromHex(
-        "06594402012401013944332211887766550807060504030201"
+        "06594404012401013944332211887766550807060504030201"
         "cefed4f980ea7592d9108bfbc5575d1d0aebc5cf319cf41d"
-        "40421a73f5043d4a5a5aa5a5ca8f978e00");
+        "40421a73f5043d4a5a5aa5a5e1d29f3f00");
     assert(length == expected.size());
     assert(std::equal(expected.begin(), expected.end(), output.begin()));
 
@@ -112,10 +120,10 @@ void TestCodecVectors()
     assert(DecodePacket(output.data(), length, invalid) == DecodeStatus::BadCrc);
 
     const auto target_wire = FromHex(
-        "06594402063801012544332211897766551007060504030201"
+        "06594404063801012544332211897766551007060504030201"
         "cdcccc3dcdcc4c3e9a9999bf9a99993ecdccccbe0101023f01"
         "0f403f3333b33e3333b33e3333b33e0101023f0101073f33"
-        "33333f64020305a0621ac500");
+        "33333f640203058fa8714400");
     Packet target_packet{};
     assert(DecodePacket(target_wire.data(), target_wire.size(), target_packet) == DecodeStatus::Ok);
     assert(target_packet.header.message_type == static_cast<uint8_t>(MessageType::SetJointTarget));
@@ -151,30 +159,50 @@ void TestMeasuredVelocityUsesOnlyValidMonotonicIntervals()
 {
     MeasuredStateEstimator fast_estimator;
     std::array<float, 7> fast_position{};
-    assert(!fast_estimator.Update(fast_position, 1000U, true).valid);
+    std::array<uint32_t, 7> fast_time{};
+    fast_time.fill(1000U);
+    assert(!fast_estimator.Update(fast_position, fast_time, 1U, true).valid);
     fast_position[0] = 1.0F;
-    assert(!fast_estimator.Update(fast_position, 1500U, true).valid);
+    fast_time.fill(1500U);
+    assert(!fast_estimator.Update(fast_position, fast_time, 2U, true).valid);
 
     MeasuredStateEstimator estimator(100000U);
     std::array<float, 7> position{};
-    assert(!estimator.Update(position, 1000U, true).valid);
+    std::array<uint32_t, 7> sample_time{};
+    sample_time.fill(1000U);
+    assert(!estimator.Update(position, sample_time, 1U, true).valid);
 
     position[0] = 0.01F;
     position[6] = 0.1F;
-    const VelocityEstimate moving = estimator.Update(position, 51000U, true);
+    sample_time.fill(51000U);
+    sample_time[6] = 101000U;
+    const VelocityEstimate moving = estimator.Update(
+        position, sample_time, 2U, true);
     assert(moving.valid);
     assert(std::fabs(moving.velocity[0] - 0.2F) < 1e-6F);
-    assert(std::fabs(moving.velocity[6] - 2.0F) < 1e-6F);
+    assert(std::fabs(moving.velocity[6] - 1.0F) < 1e-6F);
 
-    // A repeated timestamp and a long feedback gap both invalidate exactly one
-    // interval and rebase the next estimate instead of emitting a spike.
-    assert(!estimator.Update(position, 51000U, true).valid);
+    // Re-sending the same coherent sweep reuses the prior derivative and is
+    // explicitly labelled repeated instead of producing a zero/spike pair.
+    position[0] = 99.0F;
+    const VelocityEstimate repeated = estimator.Update(
+        position, sample_time, 2U, true);
+    assert(repeated.valid);
+    assert(repeated.repeated);
+    assert(std::fabs(repeated.velocity[0] - 0.2F) < 1e-6F);
+
+    // A long per-node feedback gap invalidates exactly one interval and
+    // rebases the next estimate instead of emitting a spike.
     position[0] = 0.02F;
-    assert(!estimator.Update(position, 200000U, true).valid);
-    assert(!estimator.Update(position, 250000U, false).valid);
-    assert(!estimator.Update(position, 300000U, true).valid);
+    sample_time.fill(200000U);
+    assert(!estimator.Update(position, sample_time, 3U, true).valid);
+    sample_time.fill(250000U);
+    assert(!estimator.Update(position, sample_time, 4U, false).valid);
+    sample_time.fill(300000U);
+    assert(!estimator.Update(position, sample_time, 5U, true).valid);
     position[0] = 0.03F;
-    assert(estimator.Update(position, 350000U, true).valid);
+    sample_time.fill(350000U);
+    assert(estimator.Update(position, sample_time, 6U, true).valid);
 }
 
 void TestCanFeedbackMonitorTracksAgeAndLossWithoutInventingFaultSources()
@@ -225,6 +253,43 @@ void TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap()
     assert(status[0].position_age_ms == 1U);
 }
 
+void TestCanFeedbackMonitorPublishesOnlyCompleteLowSkewSweep()
+{
+    // This vector intentionally spans 42 ms, so make the acceptance threshold
+    // explicit and verify equality at the configured boundary.
+    CanFeedbackMonitor monitor(42000U);
+    uint32_t now_us = 1000U;
+    for (uint8_t node = 1U; node <= 7U; ++node)
+    {
+        monitor.OnPositionRequest(node, now_us);
+        monitor.OnPositionResponse(node, now_us + 100U);
+        now_us += 4000U;
+    }
+    auto coherent = monitor.CoherentSnapshot();
+    assert(coherent.valid);
+    assert(coherent.sweep_id == 1U);
+    assert(coherent.max_skew_us == 24000U);
+    for (uint8_t node = 1U; node <= 7U; ++node)
+        assert(coherent.position_sweep_id[node - 1U] == coherent.sweep_id);
+
+    // A partial next sweep cannot replace the last complete snapshot.
+    monitor.OnPositionRequest(1U, now_us);
+    monitor.OnPositionResponse(1U, now_us + 100U);
+    const auto partial = monitor.CoherentSnapshot();
+    assert(partial.valid);
+    assert(partial.sweep_id == coherent.sweep_id);
+
+    CanFeedbackMonitor excessive_skew;
+    now_us = 1000U;
+    for (uint8_t node = 1U; node <= 7U; ++node)
+    {
+        excessive_skew.OnPositionRequest(node, now_us);
+        excessive_skew.OnPositionResponse(node, now_us + 100U);
+        now_us += 6000U;
+    }
+    assert(!excessive_skew.CoherentSnapshot().valid);
+}
+
 void TestStateValidityBitsComeFromOneFeedbackSnapshot()
 {
     assert(PositionFeedbackValidityBits(false, false) == 0U);
@@ -232,6 +297,17 @@ void TestStateValidityBitsComeFromOneFeedbackSnapshot()
     assert(PositionFeedbackValidityBits(false, true) == kStateGripperValid);
     assert(PositionFeedbackValidityBits(true, true) ==
         (kStatePositionValid | kStateGripperValid));
+}
+
+void TestCanTransportStatusSurvivesStatePayloadCopy()
+{
+    StatePayload source{};
+    source.can_transport_status = 0xA5U;
+    std::array<uint8_t, sizeof(StatePayload)> bytes{};
+    std::memcpy(bytes.data(), &source, sizeof(source));
+    StatePayload restored{};
+    std::memcpy(&restored, bytes.data(), sizeof(restored));
+    assert(restored.can_transport_status == 0xA5U);
 }
 
 FeedbackSafetyConfig MakeSafetyConfig()
@@ -320,6 +396,7 @@ void TestUnverifiedConfigurationCannotAcquire()
 void TestSessionTargetAndTimeout()
 {
     ControlSession session(MakeConfig(true), "test-fw");
+    session.SetControlReady(true);
     const Packet hello = MakeConfiguredHello();
     session.Process(hello, 1000);
 
@@ -351,9 +428,6 @@ void TestSessionTargetAndTimeout()
     assert(result.target_updated);
     assert(session.active_target().valid);
     assert(std::fabs(session.active_target().target[2] + 1.2F) < 1e-6F);
-    session.MarkTargetApplied(command.header.sequence);
-    assert(session.last_applied_sequence() == command.header.sequence);
-
     assert(!session.Tick(103999));
     assert(session.Tick(104000));
     assert(session.mode() == ControlMode::Hold);
@@ -363,6 +437,7 @@ void TestSessionTargetAndTimeout()
 void TestTelemetryMovesToLatestHelloAfterRelease()
 {
     ControlSession session(MakeConfig(true), "test-fw");
+    session.SetControlReady(true);
     const Packet first_hello = MakeConfiguredHello();
     session.Process(first_hello, 1000);
     assert(session.telemetry_session_id() == first_hello.header.session_id);
@@ -389,6 +464,7 @@ void TestTelemetryMovesToLatestHelloAfterRelease()
 void TestBadSequenceAndTargetAreRejected()
 {
     ControlSession session(MakeConfig(true), "test-fw");
+    session.SetControlReady(true);
     const Packet hello = MakeConfiguredHello();
     session.Process(hello, 1);
     Packet acquire = MakePacket(MessageType::AcquireControl, hello.header.session_id,
@@ -415,6 +491,30 @@ void TestBadSequenceAndTargetAreRejected()
     Packet repeated = MakePacket(MessageType::Heartbeat, hello.header.session_id,
                                  hello.header.sequence + 3);
     assert(ResponseCode(session.Process(repeated, 5)) == ResultCode::BadSequence);
+}
+
+void TestSequenceWrapUsesUint32SerialArithmetic()
+{
+    ControlSession session(MakeConfig(true), "test-fw");
+    session.SetControlReady(true);
+    Packet hello = MakeConfiguredHello();
+    hello.header.sequence = 0xFFFFFFFDU;
+    session.Process(hello, 1U);
+
+    Packet acquire = MakePacket(
+        MessageType::AcquireControl, hello.header.session_id, 0xFFFFFFFEU);
+    SetPayload(acquire, AcquireControlPayload{500U});
+    assert(ResponseCode(session.Process(acquire, 2U)) == ResultCode::Ok);
+
+    Packet mode = MakePacket(
+        MessageType::SetMode, hello.header.session_id, 0xFFFFFFFFU);
+    SetPayload(mode, SetModePayload{static_cast<uint8_t>(ControlMode::Teleop)});
+    assert(ResponseCode(session.Process(mode, 3U)) == ResultCode::Ok);
+
+    Packet heartbeat = MakePacket(
+        MessageType::Heartbeat, hello.header.session_id, 1U);
+    assert(ResponseCode(session.Process(heartbeat, 4U)) == ResultCode::Ok);
+    assert(ResponseCode(session.Process(heartbeat, 5U)) == ResultCode::BadSequence);
 }
 
 Packet MakeConfiguredHello()
@@ -455,50 +555,243 @@ void TestUrdfJointSpaceMapping()
                      (dummy::generated_config::kJointZeroOffsetRad[5] - kProbe)) < 1e-6F);
 }
 
-void TestCanSlotSchedulerUsesOneFrameAndPhaseOffsets()
+void TestControlAcquisitionRequiresFeedbackBootstrap()
 {
-    // At 700 total slots/s, alternating leaves 350 feedback slots/s. One
-    // temperature query per 50 feedback slots gives exactly 1 Hz per node.
-    constexpr uint32_t kTemperatureFeedbackSlotInterval = 50;
-    CanSlotScheduler scheduler(kTemperatureFeedbackSlotInterval);
-    std::array<uint32_t, kActuatorNodeCount> target_counts{};
-    std::array<uint32_t, kActuatorNodeCount> position_counts{};
-    std::array<uint32_t, kActuatorNodeCount> temperature_counts{};
+    ControlSession session(MakeConfig(true), "test-fw");
+    const Packet hello = MakeConfiguredHello();
+    session.Process(hello, 1000U);
+    Packet acquire = MakePacket(MessageType::AcquireControl,
+                                hello.header.session_id,
+                                hello.header.sequence + 1U);
+    SetPayload(acquire, AcquireControlPayload{500U});
+    const ProcessResult rejected = session.Process(acquire, 2000U);
+    assert(ResponseCode(rejected) == ResultCode::BadMode);
+    assert(ResponseDetail(rejected) == kAckDetailFeedbackNotReady);
+    assert(!session.lease_active());
 
-    for (uint32_t slot = 0; slot < 700; ++slot)
+    session.SetControlReady(true);
+    assert(ResponseCode(session.Process(acquire, 3000U)) == ResultCode::Ok);
+    assert(session.lease_active());
+}
+
+void TestCanDispatcherTransitionsAndFrequencyPlan()
+{
+    CanDispatchScheduler scheduler;
+    scheduler.SetMode(CanDispatchMode::Stream);
+    uint32_t now_us = 0U;
+    std::vector<uint8_t> transition_nodes;
+    bool enabled = false;
+    for (size_t tick = 0; tick < 30U && !enabled; ++tick)
     {
-        const CanSlotRequest request = scheduler.Next();
-        assert(request.node_id >= 1 && request.node_id <= kActuatorNodeCount);
-        if (request.kind == CanSlotKind::ActuatorTarget)
-            ++target_counts[request.node_id - 1U];
-        else if (request.kind == CanSlotKind::PositionFeedback)
-            ++position_counts[request.node_id - 1U];
-        else
-            ++temperature_counts[request.node_id - 1U];
+        const CanDispatchStep step = scheduler.Next(now_us);
+        if (step.action != CanDispatchAction::None)
+        {
+            assert(step.transition);
+            scheduler.OnQueued(step, now_us);
+            if (step.action == CanDispatchAction::ActuatorTarget)
+                transition_nodes.push_back(step.node_id);
+            else if (step.action == CanDispatchAction::EnableBroadcast)
+                enabled = true;
+        }
+        now_us += 1429U;
+    }
+    assert((transition_nodes == std::vector<uint8_t>{1U, 2U, 3U, 4U, 5U, 6U, 7U}));
+    assert(enabled);
+
+    const CanDispatchDiagnostics before = scheduler.diagnostics();
+    FeedbackResponseEvents responses{};
+    std::array<uint32_t, kActuatorNodeCount> last_node_tx{};
+    std::array<bool, kActuatorNodeCount> node_seen{};
+    for (size_t tick = 0; tick < 7000U; ++tick)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            if (step.node_id >= 1U && step.node_id <= kActuatorNodeCount)
+            {
+                const size_t index = step.node_id - 1U;
+                if (node_seen[index])
+                    assert(now_us - last_node_tx[index] >= 5000U);
+                node_seen[index] = true;
+                last_node_tx[index] = now_us;
+            }
+            scheduler.OnQueued(step, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            else if (step.action == CanDispatchAction::TemperatureRequest)
+                responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+        }
+        now_us += 1429U;
     }
 
+    const CanDispatchDiagnostics after = scheduler.diagnostics();
+    uint32_t total_temperatures = 0U;
     for (size_t index = 0; index < kActuatorNodeCount; ++index)
     {
-        assert(target_counts[index] == 50U);
-        assert(position_counts[index] == 49U);
-        assert(temperature_counts[index] == 1U);
+        const uint32_t targets = after.target_queued[index] -
+            before.target_queued[index];
+        const uint32_t positions = after.position_requested[index] -
+            before.position_requested[index];
+        const uint32_t temperatures = after.temperature_requested[index] -
+            before.temperature_requested[index];
+        total_temperatures += temperatures;
+        assert(targets >= 490U && targets <= 500U);
+        assert(positions >= 390U && positions <= 400U);
+        assert(temperatures >= 9U && temperatures <= 10U);
+        assert(after.position_responded[index] >= positions - 1U);
     }
+    assert(total_temperatures >= 69U && total_temperatures <= 70U);
+}
 
-    scheduler.Reset();
-    for (uint8_t target_node = 1; target_node <= 7; ++target_node)
+void TestCanDispatcherWaitsForResponseAndTimesOut()
+{
+    CanDispatchScheduler scheduler;
+    uint32_t now_us = 0U;
+    CanDispatchStep request{};
+    for (size_t tick = 0; tick < 20U; ++tick)
     {
-        const CanSlotRequest target = scheduler.Next();
-        assert(target.kind == CanSlotKind::ActuatorTarget);
-        assert(target.node_id == target_node);
-
-        const CanSlotRequest feedback = scheduler.Next();
-        assert(feedback.kind == CanSlotKind::PositionFeedback);
-        const uint8_t expected_feedback_node = static_cast<uint8_t>(
-            ((static_cast<uint32_t>(target_node) - 1U + 3U) %
-             kActuatorNodeCount) + 1U);
-        assert(feedback.node_id == expected_feedback_node);
-        assert(feedback.node_id != target.node_id);
+        request = scheduler.Next(now_us);
+        if (request.action == CanDispatchAction::PositionRequest)
+            break;
+        now_us += 1429U;
     }
+    assert(request.action == CanDispatchAction::PositionRequest);
+    scheduler.OnQueued(request, now_us);
+
+    CanDispatchStep waiting = scheduler.Next(now_us + 1000U);
+    assert(waiting.action == CanDispatchAction::None);
+    assert(waiting.timed_out_action == CanDispatchAction::None);
+
+    CanDispatchStep timeout = scheduler.Next(now_us + 4000U);
+    assert(timeout.timed_out_action == CanDispatchAction::PositionRequest);
+    assert(timeout.timed_out_node_id == request.node_id);
+    assert(timeout.action == CanDispatchAction::None);
+    assert(scheduler.diagnostics().position_timed_out[request.node_id - 1U] == 1U);
+}
+
+void TestCanDispatcherDoesNotBurstAfterDeferredDeadline()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.position_hz_per_node = 0U;
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    scheduler.SetMode(CanDispatchMode::Stream);
+    uint32_t now_us = 0U;
+
+    // Complete the seven-node HOLD plus enable transition first.
+    while (scheduler.mode() == CanDispatchMode::Stream)
+    {
+        const CanDispatchStep transition = scheduler.Next(now_us);
+        if (!transition.transition)
+            break;
+        scheduler.OnQueued(transition, now_us);
+        now_us += 1429U;
+    }
+
+    CanDispatchStep due{};
+    for (size_t tick = 0; tick < 50U; ++tick)
+    {
+        due = scheduler.Next(now_us);
+        now_us += 1429U;
+        if (due.action == CanDispatchAction::ActuatorTarget)
+            scheduler.OnDeferred();
+    }
+    assert(due.action == CanDispatchAction::ActuatorTarget);
+    scheduler.OnQueued(due, now_us);
+
+    // The stale deadlines were collapsed to one due frame. A second target
+    // must not be emitted on the immediately following dispatcher tick.
+    const CanDispatchStep after = scheduler.Next(now_us + 1429U);
+    assert(after.action == CanDispatchAction::None);
+}
+
+void TestCanDispatcherRejectsInvalidRatePlanWithoutFallback()
+{
+    CanDispatchConfig config{};
+    config.dispatch_tick_hz = 100U;
+    CanDispatchScheduler scheduler(config);
+    scheduler.SetMode(CanDispatchMode::Stream);
+    for (uint32_t tick = 0; tick < 1000U; ++tick)
+        assert(scheduler.Next(tick * 10000U).action == CanDispatchAction::None);
+    const auto diagnostics = scheduler.diagnostics();
+    assert(!diagnostics.config_valid);
+    assert(diagnostics.idle_slot_count == 1000U);
+}
+
+void TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery()
+{
+    CanDispatchScheduler scheduler;
+    uint32_t now_us = 0U;
+    FeedbackResponseEvents responses{};
+    for (size_t tick = 0; tick < 100U; ++tick)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        assert(step.action != CanDispatchAction::ActuatorTarget);
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            else if (step.action == CanDispatchAction::TemperatureRequest)
+                responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+        }
+        now_us += 1429U;
+    }
+    const auto bootstrap = scheduler.diagnostics();
+    for (size_t index = 0; index < kActuatorNodeCount; ++index)
+    {
+        assert(bootstrap.position_requested[index] >= 2U);
+        assert(bootstrap.position_responded[index] >= 2U);
+    }
+
+    // Leave one feedback query outstanding, then verify a FAULT produces an
+    // immediate disable decision instead of waiting for the 4 ms timeout.
+    CanDispatchStep pending{};
+    for (size_t tick = 0; tick < 20U; ++tick)
+    {
+        pending = scheduler.Next(now_us);
+        if (pending.action == CanDispatchAction::PositionRequest)
+            break;
+        now_us += 1429U;
+    }
+    assert(pending.action == CanDispatchAction::PositionRequest);
+    scheduler.OnQueued(pending, now_us);
+    scheduler.SetMode(CanDispatchMode::Fault);
+    const CanDispatchStep fault = scheduler.Next(now_us + 1U);
+    assert(fault.action == CanDispatchAction::DisableBroadcast);
+    assert(fault.transition);
+
+    CanDispatchScheduler hold_scheduler;
+    CanDispatchStep hold_pending{};
+    uint32_t hold_now_us = 0U;
+    for (size_t tick = 0; tick < 20U; ++tick)
+    {
+        hold_pending = hold_scheduler.Next(hold_now_us);
+        if (hold_pending.action == CanDispatchAction::PositionRequest)
+            break;
+        hold_now_us += 1429U;
+    }
+    assert(hold_pending.action == CanDispatchAction::PositionRequest);
+    hold_scheduler.OnQueued(hold_pending, hold_now_us);
+    hold_scheduler.SetMode(CanDispatchMode::Hold);
+    CanDispatchStep hold{};
+    for (uint32_t wait_us = 1U; wait_us <= 5001U; wait_us += 1000U)
+    {
+        hold = hold_scheduler.Next(hold_now_us + wait_us);
+        assert(hold.action == CanDispatchAction::None ||
+               hold.action == CanDispatchAction::ActuatorTarget);
+        if (hold.action == CanDispatchAction::ActuatorTarget)
+            break;
+    }
+    assert(hold.action == CanDispatchAction::ActuatorTarget);
+    assert(hold.transition);
 }
 
 void TestActuatorApplicationTrackerRequiresEverySuccessfulNode()
@@ -517,6 +810,12 @@ void TestActuatorApplicationTrackerRequiresEverySuccessfulNode()
 
     tracker.Reset();
     assert(!tracker.RecordTransmission(11U, 1U, true));
+
+    // Even a sequence superseded before its first successful node write is
+    // reported exactly, rather than disappearing from the lifecycle.
+    assert(!tracker.RecordTransmission(12U, 1U, false));
+    assert(!tracker.RecordTransmission(13U, 1U, true));
+    assert(tracker.TakeSupersededSequence() == 12U);
 }
 
 void TestLatestTargetExecutorIsBoundedAndHolds()
@@ -582,6 +881,7 @@ void TestExecutorRejectsInvalidRuntimeLimits()
 void TestLatestTargetWinsBeforeApplication()
 {
     ControlSession session(MakeConfig(true), "test-fw");
+    session.SetControlReady(true);
     const Packet hello = MakeConfiguredHello();
     session.Process(hello, 1000);
     Packet acquire = MakePacket(MessageType::AcquireControl, hello.header.session_id,
@@ -616,17 +916,12 @@ void TestLatestTargetWinsBeforeApplication()
     assert(session.active_target().sequence == latest.header.sequence);
     assert(std::fabs(session.active_target().target[0] - 0.2F) < 1e-6F);
     assert(session.last_received_sequence() == latest.header.sequence);
-    assert(session.last_applied_sequence() == 0);
-
-    session.MarkTargetApplied(first.header.sequence);
-    assert(session.last_applied_sequence() == 0);
-    session.MarkTargetApplied(latest.header.sequence);
-    assert(session.last_applied_sequence() == latest.header.sequence);
 }
 
 void TestLeaseTimeoutAndSessionIndependentEstop()
 {
     ControlSession session(MakeConfig(true), "test-fw");
+    session.SetControlReady(true);
     const Packet hello = MakeConfiguredHello();
     session.Process(hello, 1000);
     Packet acquire = MakePacket(MessageType::AcquireControl, hello.header.session_id,
@@ -657,15 +952,23 @@ int main()
     TestMeasuredVelocityUsesOnlyValidMonotonicIntervals();
     TestCanFeedbackMonitorTracksAgeAndLossWithoutInventingFaultSources();
     TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap();
+    TestCanFeedbackMonitorPublishesOnlyCompleteLowSkewSweep();
     TestStateValidityBitsComeFromOneFeedbackSnapshot();
+    TestCanTransportStatusSurvivesStatePayloadCopy();
     TestFeedbackSafetyPersistenceSeparatesHoldFromLatchedFault();
-    TestCanSlotSchedulerUsesOneFrameAndPhaseOffsets();
+    TestControlAcquisitionRequiresFeedbackBootstrap();
+    TestCanDispatcherTransitionsAndFrequencyPlan();
+    TestCanDispatcherWaitsForResponseAndTimesOut();
+    TestCanDispatcherDoesNotBurstAfterDeferredDeadline();
+    TestCanDispatcherRejectsInvalidRatePlanWithoutFallback();
+    TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery();
     TestActuatorApplicationTrackerRequiresEverySuccessfulNode();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();
     TestTelemetryMovesToLatestHelloAfterRelease();
     TestBadSequenceAndTargetAreRejected();
+    TestSequenceWrapUsesUint32SerialArithmetic();
     TestLatestTargetExecutorIsBoundedAndHolds();
     TestExecutorRejectsInvalidRuntimeLimits();
     TestLatestTargetWinsBeforeApplication();

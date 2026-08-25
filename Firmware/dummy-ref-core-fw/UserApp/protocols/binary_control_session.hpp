@@ -55,10 +55,9 @@ public:
     uint32_t telemetry_session_id() const
     { return lease_active_ ? session_id_ : hello_session_id_; }
     uint32_t last_received_sequence() const { return last_received_sequence_; }
-    uint32_t last_applied_sequence() const { return last_applied_sequence_; }
     const ActiveTarget& active_target() const { return active_target_; }
-
-    void MarkTargetApplied(uint32_t sequence);
+    void SetControlReady(bool ready) { control_ready_ = ready; }
+    bool control_ready() const { return control_ready_; }
     void SetFault(uint16_t fault_bits);
     void RequestSafetyHold(uint16_t hold_reason_bits);
     bool ClearFault(bool hardware_safe);
@@ -84,12 +83,12 @@ private:
     ActiveTarget active_target_{};
     bool hello_valid_ = false;
     bool lease_active_ = false;
+    bool control_ready_ = false;
     uint32_t hello_session_id_ = 0;
     uint32_t hello_sequence_ = 0;
     uint32_t session_id_ = 0;
     uint32_t last_command_sequence_ = 0;
     uint32_t last_received_sequence_ = 0;
-    uint32_t last_applied_sequence_ = 0;
     uint32_t lease_duration_ms_ = 0;
     uint64_t lease_deadline_us_ = 0;
     uint16_t fault_bits_ = 0;

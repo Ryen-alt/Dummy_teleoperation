@@ -24,7 +24,11 @@ def test_render_firmware_header_contains_safety_critical_values(config: RobotCon
     assert "constexpr float kGripperVelocityLimitPerS = 0.2F;" in header
     assert "constexpr uint32_t kFeedbackHoldMs = 100U;" in header
     assert "constexpr uint32_t kFeedbackFaultMs = 500U;" in header
-    assert "constexpr uint32_t kFeedbackPollHz = 700U;" in header
+    assert "constexpr uint32_t kCanDispatchTickHz = 700U;" in header
+    assert "constexpr uint32_t kCanTargetHzPerNode = 50U;" in header
+    assert "constexpr uint32_t kCanPositionHzPerNode = 40U;" in header
+    assert "constexpr uint32_t kCanTemperatureHzPerNode = 1U;" in header
+    assert "constexpr uint32_t kCoherentMaxSkewUs = 30000U;" in header
     assert "kJointZeroOffsetRad" in header
     assert "kJointSign" in header
     assert "kJointReduction" in header
@@ -37,7 +41,7 @@ def test_urdf_coordinate_mapping_contract(config: RobotConfig) -> None:
     firmware_rest_rad = np.deg2rad(np.asarray([0.0, -70.0, 180.0, 0.0, 0.0, 0.0]))
     urdf_rest_rad = config.joint_sign * (firmware_rest_rad - config.joint_zero_offset_rad)
 
-    assert config.config_version == 6
+    assert config.config_version == 7
     np.testing.assert_array_equal(config.joint_reduction, np.full(6, 50.0))
     np.testing.assert_allclose(urdf_rest_rad, config.initial_pose_rad, atol=1e-6)
     np.testing.assert_allclose(

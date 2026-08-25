@@ -47,8 +47,8 @@ static uint8_t data[8];
 
 namespace
 {
-constexpr uint32_t kCanTxWaitTicks = 5U;
-constexpr uint32_t kCanTxRecoveryWaitTicks = 2U;
+constexpr uint32_t kCanTxStallMs = 5U;
+constexpr uint32_t kCanBlockingCompatibilityWaitMs = 8U;
 
 osSemaphoreId TxSemaphore(CAN_HandleTypeDef* hcan)
 {
@@ -137,10 +137,13 @@ bool StartCanServer(CAN_TypeDef* hcan)
 
 void tx_complete_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
 {
-//    CAN_context* ctx = get_can_ctx(hcan);
-//    if (!ctx) return;
-//    ctx->tx_msg_cnt++;
+    CAN_context* ctx = get_can_ctx(hcan);
+    if (ctx == nullptr)
+        return;
     (void) mailbox_idx;
+    ctx->tx_in_flight = false;
+    ctx->tx_msg_cnt++;
+    ctx->TxMailboxCompleteCallbackCnt++;
     ReleaseTxToken(hcan);
 }
 
@@ -150,6 +153,7 @@ void tx_aborted_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
     if (ctx == nullptr)
         return;
     (void) mailbox_idx;
+    ctx->tx_in_flight = false;
     ctx->TxMailboxAbortCallbackCnt++;
     // An aborted transfer never reaches a mailbox-complete callback. Return
     // the single-flight token so a transient CAN error cannot deadlock every
@@ -162,6 +166,7 @@ void tx_error(CAN_context* ctx, uint8_t mailbox_idx)
     if (ctx == nullptr || ctx->handle == nullptr)
         return;
     ctx->unexpected_errors++;
+    ctx->tx_in_flight = false;
     (void) HAL_CAN_AbortTxRequest(ctx->handle, 1UL << mailbox_idx);
     // Auto retransmission is disabled. A transmit error therefore has no
     // successful completion callback to restore the single-flight token.
@@ -266,41 +271,52 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* hcan)
         ctx->unexpected_errors++;
 }
 
-bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader,
-                    CanTxQueuedCallback on_queued, void* callback_context)
+CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
+                              CAN_TxHeaderTypeDef* txHeader,
+                              CanTxQueuedCallback on_queued,
+                              void* callback_context)
 {
     if (canCtx == nullptr || canCtx->handle == nullptr || txData == nullptr ||
         txHeader == nullptr)
-        return false;
+        return CanTxStatus::Invalid;
+
+    canCtx->tx_attempt_count++;
 
     const osSemaphoreId semaphore = TxSemaphore(canCtx->handle);
     if (semaphore == nullptr)
-        return false;
+        return CanTxStatus::Invalid;
 
-    osStatus semaphore_status = osSemaphoreAcquire(semaphore, kCanTxWaitTicks);
-    if (semaphore_status != osOK)
+    if (osSemaphoreAcquire(semaphore, 0U) != osOK)
     {
-        // A normal 1 Mbit/s frame completes far sooner than this timeout. If
-        // the token is still absent, recover a mailbox whose error/abort path
-        // failed to signal completion instead of blocking the realtime control
-        // task forever.
-        canCtx->unexpected_errors++;
+        canCtx->tx_busy_count++;
+        const uint32_t now_ms = HAL_GetTick();
         constexpr uint32_t kAllMailboxes =
             CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2;
-        if (HAL_CAN_GetTxMailboxesFreeLevel(canCtx->handle) < 3U)
-            (void) HAL_CAN_AbortTxRequest(canCtx->handle, kAllMailboxes);
-        else
-            ReleaseTxToken(canCtx->handle);
-
-        semaphore_status = osSemaphoreAcquire(semaphore, kCanTxRecoveryWaitTicks);
-        if (semaphore_status != osOK &&
+        if (canCtx->tx_in_flight &&
+            now_ms - canCtx->tx_started_ms >= kCanTxStallMs &&
             HAL_CAN_GetTxMailboxesFreeLevel(canCtx->handle) == 3U)
         {
+            // The peripheral is idle but the completion callback was lost.
+            canCtx->tx_in_flight = false;
+            canCtx->tx_recovery_count++;
             ReleaseTxToken(canCtx->handle);
-            semaphore_status = osSemaphoreAcquire(semaphore, 0U);
         }
-        if (semaphore_status != osOK)
-            return false;
+        else if (canCtx->tx_in_flight &&
+                 now_ms - canCtx->tx_started_ms >= kCanTxStallMs)
+        {
+            canCtx->tx_recovery_count++;
+            (void) HAL_CAN_AbortTxRequest(canCtx->handle, kAllMailboxes);
+        }
+        else if (!canCtx->tx_in_flight &&
+                 HAL_CAN_GetTxMailboxesFreeLevel(canCtx->handle) == 3U)
+        {
+            // Recover a token lost across a peripheral reset or an omitted HAL
+            // completion callback. Do not enqueue in this call; the dispatcher
+            // will retry on its next tick.
+            canCtx->tx_recovery_count++;
+            ReleaseTxToken(canCtx->handle);
+        }
+        return CanTxStatus::Busy;
     }
 
     // Keep send accounting atomic with mailbox admission. Without this, a
@@ -309,16 +325,41 @@ bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* t
     taskENTER_CRITICAL();
     const HAL_StatusTypeDef send_status = HAL_CAN_AddTxMessage(
         canCtx->handle, txHeader, txData, &canCtx->last_heartbeat_mailbox);
-    if (send_status == HAL_OK && on_queued != nullptr)
-        on_queued(callback_context);
+    if (send_status == HAL_OK)
+    {
+        canCtx->tx_in_flight = true;
+        canCtx->tx_started_ms = HAL_GetTick();
+        canCtx->tx_queued_count++;
+        if (on_queued != nullptr)
+            on_queued(callback_context);
+    }
     taskEXIT_CRITICAL();
     if (send_status != HAL_OK)
     {
         // No completion interrupt will be generated when the frame was never
         // queued, so restore the token immediately.
         canCtx->unexpected_errors++;
+        canCtx->tx_enqueue_error_count++;
         ReleaseTxToken(canCtx->handle);
-        return false;
+        return CanTxStatus::Error;
     }
-    return true;
+    return CanTxStatus::Queued;
+}
+
+bool CanSendMessage(CAN_context* canCtx, uint8_t* txData,
+                    CAN_TxHeaderTypeDef* txHeader,
+                    CanTxQueuedCallback on_queued, void* callback_context)
+{
+    const uint32_t started_ms = HAL_GetTick();
+    do
+    {
+        const CanTxStatus status = CanTrySendMessage(
+            canCtx, txData, txHeader, on_queued, callback_context);
+        if (status == CanTxStatus::Queued)
+            return true;
+        if (status == CanTxStatus::Invalid)
+            return false;
+        osDelay(1U);
+    } while (HAL_GetTick() - started_ms < kCanBlockingCompatibilityWaitMs);
+    return false;
 }

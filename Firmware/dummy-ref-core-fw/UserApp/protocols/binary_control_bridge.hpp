@@ -22,7 +22,11 @@ struct BinaryControlSnapshot
 // protected because USB parsing and the 200 Hz control task run concurrently.
 uint64_t BinaryControlMonotonicMicros();
 BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us);
-void MarkBinaryTargetApplied(uint32_t sequence);
+void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
+                                      uint32_t coherent_sweep_id);
+void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us);
+void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us);
+void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us);
 void ApplyBinarySafetyOutcome(const FeedbackSafetyOutput& safety);
 FeedbackSafetyOutput ReadBinarySafetyTelemetry();
 bool BinaryControlLeaseActive();

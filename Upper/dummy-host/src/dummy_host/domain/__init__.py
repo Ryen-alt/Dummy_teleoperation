@@ -5,6 +5,10 @@ from .episode import EpisodeError, EpisodeManager, EpisodeSnapshot, EpisodeStatu
 from .models import (
     ActionProposal,
     ActionSpace,
+    ActionStage,
+    ActionLifecycleUpdate,
+    ActionProgressFlags,
+    ActionProgressRecord,
     AppliedAction,
     ControlMode,
     FaultBits,
@@ -20,6 +24,10 @@ from .models import (
 __all__ = [
     "ActionProposal",
     "ActionSpace",
+    "ActionStage",
+    "ActionLifecycleUpdate",
+    "ActionProgressFlags",
+    "ActionProgressRecord",
     "AppliedAction",
     "ControlMode",
     "FaultBits",

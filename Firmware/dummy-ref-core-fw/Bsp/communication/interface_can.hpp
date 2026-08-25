@@ -16,6 +16,13 @@ struct CAN_context
 
     uint32_t last_heartbeat_mailbox = 0;
     uint32_t tx_msg_cnt = 0;
+    uint32_t tx_attempt_count = 0;
+    uint32_t tx_queued_count = 0;
+    uint32_t tx_busy_count = 0;
+    uint32_t tx_recovery_count = 0;
+    uint32_t tx_enqueue_error_count = 0;
+    volatile uint32_t tx_started_ms = 0;
+    volatile bool tx_in_flight = false;
 
     uint8_t node_id_rng_state = 0;
 
@@ -41,8 +48,26 @@ struct CAN_context
 struct CAN_context* get_can_ctx(CAN_HandleTypeDef* hcan);
 bool StartCanServer(CAN_TypeDef* hcan);
 using CanTxQueuedCallback = void (*)(void* context);
+enum class CanTxStatus : uint8_t
+{
+    Queued,
+    Busy,
+    Error,
+    Invalid,
+};
+
+// Realtime control must never wait for a CAN mailbox. This function makes one
+// admission attempt and returns immediately. A stalled single-flight token is
+// recovered asynchronously after the reviewed timeout.
+CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
+                              CAN_TxHeaderTypeDef* txHeader,
+                              CanTxQueuedCallback on_queued = nullptr,
+                              void* callback_context = nullptr);
+
 // Returns true only when the frame was accepted by a hardware TX mailbox. The
 // optional callback runs in the same critical section as the mailbox enqueue.
+// This compatibility API may wait and is restricted to startup/maintenance;
+// realtime dispatch uses CanTrySendMessage().
 bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* txHeader,
                     CanTxQueuedCallback on_queued = nullptr,
                     void* callback_context = nullptr);

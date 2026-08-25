@@ -13,14 +13,14 @@ namespace dummy::generated_config
 {
 constexpr char kRobotId[] = "dummy_v2_001";
 constexpr char kRobotCalibrationId[] = "dummy_v2_001-arm-gripper-20260821-v2";
-constexpr uint32_t kConfigVersion = 6U;
+constexpr uint32_t kConfigVersion = 7U;
 constexpr bool kHardwareParametersVerified = true;
 constexpr bool kExternalTargetExecutionReady = true;
 constexpr std::array<uint8_t, 32> kConfigSha256 = {
-    0x4b, 0xa2, 0x77, 0x32, 0xf4, 0x24, 0x27, 0x02,
-    0x81, 0x70, 0xe8, 0xfb, 0xd9, 0x56, 0x90, 0xa2,
-    0xb1, 0xfe, 0xc6, 0x0e, 0x70, 0x6f, 0xd4, 0x15,
-    0xf4, 0xd1, 0x1f, 0x29, 0xa3, 0x30, 0xf2, 0x58,
+    0x8d, 0xd7, 0x6d, 0xc8, 0xe3, 0x9c, 0x73, 0x0f,
+    0x79, 0x8b, 0x36, 0x05, 0x2a, 0xeb, 0xfd, 0x15,
+    0xa0, 0xde, 0xba, 0xe5, 0x27, 0xf9, 0x7e, 0xb1,
+    0xff, 0x17, 0x9e, 0xe0, 0x3b, 0x96, 0xaa, 0xc1,
 };
 
 constexpr std::array<float, 6> kJointZeroOffsetRad = {0.0F, -1.2740901F, 3.141593F, 0.0F, 0.0F, 0.0F};
@@ -45,15 +45,19 @@ constexpr float kTemperatureFaultC = 75.0F;
 constexpr uint32_t kTemperatureFaultMs = 1000U;
 constexpr uint32_t kHostControlRateHz = 20U;
 constexpr uint32_t kFirmwareLoopHz = 200U;
-constexpr uint32_t kFeedbackPollHz = 700U;
+constexpr uint32_t kCanDispatchTickHz = 700U;
+constexpr uint32_t kCanTargetHzPerNode = 50U;
+constexpr uint32_t kCanPositionHzPerNode = 40U;
+constexpr uint32_t kCanTemperatureHzPerNode = 1U;
+constexpr uint32_t kCoherentMaxSkewUs = 30000U;
 constexpr uint32_t kMaxStateAgeMs = 200U;
 constexpr uint16_t kTargetTtlMs = 100U;
 constexpr uint32_t kLeaseTimeoutMs = 500U;
 constexpr float kMaxTargetOvershootRad = 0.1F;
 
 static_assert(kFirmwareLoopHz == 200U, "firmware loop contract changed");
-static_assert(kFeedbackPollHz >= 7U && kFeedbackPollHz <= 1000U, "feedback poll rate is outside the reviewed range");
-static_assert(kFeedbackPollHz % 7U == 0U, "feedback poll rate must divide evenly across seven nodes");
+static_assert(kCanDispatchTickHz >= 7U && kCanDispatchTickHz <= 1000U, "CAN dispatcher rate is outside the reviewed range");
+static_assert(7U * (kCanTargetHzPerNode + kCanPositionHzPerNode + kCanTemperatureHzPerNode) <= kCanDispatchTickHz, "configured CAN traffic exceeds dispatcher capacity");
 static_assert(kTargetTtlMs > 0U, "target TTL must be positive");
 static_assert(kLeaseTimeoutMs >= kTargetTtlMs, "lease must not expire before target TTL");
 static_assert(kFeedbackFaultMs > kFeedbackHoldMs, "feedback FAULT must persist beyond HOLD");

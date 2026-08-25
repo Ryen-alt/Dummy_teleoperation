@@ -21,7 +21,6 @@ def make_state(config, now_ns: int) -> RobotState:
         velocity_valid=True,
         gripper_valid=True,
         last_received_sequence=0,
-        last_applied_sequence=0,
         target_age_ms=0,
         config_hash=config.config_hash,
     )
@@ -70,4 +69,3 @@ def test_stricter_per_command_velocity_limit_is_honored(config) -> None:
     limit[0] = 0.02
     result = safety.apply(requested, state, now, velocity_limit_rad_s=limit)
     assert result.applied[0] - state.position[0] <= 0.02 / config.control_rate_hz + 1e-7
-

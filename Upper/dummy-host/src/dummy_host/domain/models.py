@@ -43,6 +43,17 @@ class TelemetryValidityBits(IntEnum):
     TEMPERATURE = 1 << 2
 
 
+class CanRuntimeStatusBits(IntEnum):
+    DISPATCHER_ALIVE = 1 << 0
+    TX_QUEUED = 1 << 1
+    POSITION_REQUESTED = 1 << 2
+    POSITION_RESPONDED = 1 << 3
+    TX_DEFERRED = 1 << 4
+    QUERY_PENDING = 1 << 5
+    FEEDBACK_READY = 1 << 6
+    TX_RECOVERED = 1 << 7
+
+
 class NodeFaultBits(IntEnum):
     FEEDBACK_STALE = 1 << 0
     FOLLOWING_ERROR = 1 << 1
@@ -66,6 +77,59 @@ class ActionSpace(StrEnum):
     JOINT_VELOCITY = "joint_velocity"
     CARTESIAN_POSE = "cartesian_pose"
     CARTESIAN_TWIST = "cartesian_twist"
+
+
+class ActionStage(StrEnum):
+    RECEIVED = "received"
+    SAFETY_ACCEPTED = "safety_accepted"
+    SEND_ENQUEUED = "send_enqueued"
+    SERIAL_SEND_STARTED = "serial_send_started"
+    SERIAL_SEND_FINISHED = "serial_send_finished"
+    ACKNOWLEDGED = "acknowledged"
+    CAN_QUEUED_EXACT = "can_queued_exact"
+    POST_COMMAND_FEEDBACK = "post_command_feedback"
+    SUPERSEDED = "superseded"
+    PREEMPTED_BY_SAFETY = "preempted_by_safety"
+    REJECTED = "rejected"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ActionLifecycleUpdate:
+    sequence: int
+    stage: ActionStage
+    host_time_ns: int
+    mcu_time_us: int = 0
+    detail: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.sequence <= 0 or self.host_time_ns < 0 or self.mcu_time_us < 0:
+            raise ValueError("action lifecycle identifiers and timestamps are invalid")
+
+
+class ActionProgressFlags(IntEnum):
+    CAN_QUEUED_EXACT = 1 << 0
+    POST_COMMAND_FEEDBACK = 1 << 1
+    SUPERSEDED = 1 << 2
+
+
+@dataclass(frozen=True)
+class ActionProgressRecord:
+    sequence: int
+    flags: int
+    can_queued_mcu_us: int = 0
+    post_feedback_mcu_us: int = 0
+    feedback_sweep_id: int = 0
+
+    def __post_init__(self) -> None:
+        if min(
+            self.sequence,
+            self.flags,
+            self.can_queued_mcu_us,
+            self.post_feedback_mcu_us,
+            self.feedback_sweep_id,
+        ) < 0:
+            raise ValueError("action progress fields must be non-negative")
 
 
 def _frozen_array(value: np.ndarray, *, shape: tuple[int, ...], name: str) -> np.ndarray:
@@ -93,7 +157,6 @@ class RobotState:
     velocity_valid: bool
     gripper_valid: bool
     last_received_sequence: int
-    last_applied_sequence: int
     target_age_ms: int
     config_hash: str
     following_error: np.ndarray = field(
@@ -119,6 +182,18 @@ class RobotState:
     )
     hold_reason_bits: int = 0
     telemetry_validity: int = 0
+    can_transport_status: int = 0
+    feedback_sample_mcu_us: np.ndarray = field(
+        default_factory=lambda: np.zeros(7, dtype=np.uint64)
+    )
+    feedback_sweep_id: np.ndarray = field(
+        default_factory=lambda: np.zeros(7, dtype=np.uint32)
+    )
+    coherent_sweep_id: int = 0
+    feedback_max_skew_us: int = 0
+    coherent_reference_mcu_us: int = 0
+    state_repeated: bool = False
+    action_progress: tuple[ActionProgressRecord, ...] = ()
 
     def __post_init__(self) -> None:
         position = _frozen_array(self.position, shape=(7,), name="robot position")
@@ -133,16 +208,21 @@ class RobotState:
             ("consecutive_feedback_loss", self.consecutive_feedback_loss, np.uint16),
             ("node_fault_bits", self.node_fault_bits, np.uint16),
             ("node_validity", self.node_validity, np.uint8),
+            ("feedback_sample_mcu_us", self.feedback_sample_mcu_us, np.uint64),
+            ("feedback_sweep_id", self.feedback_sweep_id, np.uint32),
         )
         if (
             self.monotonic_ns < 0
             or self.mcu_time_us < 0
             or self.fault_bits < 0
             or self.last_received_sequence < 0
-            or self.last_applied_sequence < 0
             or self.target_age_ms < 0
             or self.hold_reason_bits < 0
             or self.telemetry_validity < 0
+            or not 0 <= self.can_transport_status <= 0xFF
+            or self.coherent_sweep_id < 0
+            or self.feedback_max_skew_us < 0
+            or self.coherent_reference_mcu_us < 0
         ):
             raise ValueError("robot timestamps, faults, sequences and ages must be non-negative")
         try:
@@ -161,6 +241,64 @@ class RobotState:
             frozen = array.copy()
             frozen.flags.writeable = False
             object.__setattr__(self, name, frozen)
+        progress = tuple(self.action_progress)
+        if len(progress) > 6 or any(
+            not isinstance(item, ActionProgressRecord) for item in progress
+        ):
+            raise ValueError("action_progress must contain at most six records")
+        object.__setattr__(self, "action_progress", progress)
+
+    @property
+    def coherent(self) -> bool:
+        return (
+            self.coherent_sweep_id > 0
+            and self.position_valid
+            and np.all(self.feedback_sweep_id == self.coherent_sweep_id)
+        )
+
+    @property
+    def last_can_queued_exact_sequence(self) -> int:
+        return next(
+            (
+                record.sequence
+                for record in reversed(self.action_progress)
+                if record.flags & int(ActionProgressFlags.CAN_QUEUED_EXACT)
+            ),
+            0,
+        )
+
+    @property
+    def last_can_queued_mcu_us(self) -> int:
+        return next(
+            (
+                record.can_queued_mcu_us
+                for record in reversed(self.action_progress)
+                if record.flags & int(ActionProgressFlags.CAN_QUEUED_EXACT)
+            ),
+            0,
+        )
+
+    @property
+    def last_post_command_feedback_sequence(self) -> int:
+        return next(
+            (
+                record.sequence
+                for record in reversed(self.action_progress)
+                if record.flags & int(ActionProgressFlags.POST_COMMAND_FEEDBACK)
+            ),
+            0,
+        )
+
+    @property
+    def last_post_command_feedback_mcu_us(self) -> int:
+        return next(
+            (
+                record.post_feedback_mcu_us
+                for record in reversed(self.action_progress)
+                if record.flags & int(ActionProgressFlags.POST_COMMAND_FEEDBACK)
+            ),
+            0,
+        )
 
 
 @dataclass(frozen=True)

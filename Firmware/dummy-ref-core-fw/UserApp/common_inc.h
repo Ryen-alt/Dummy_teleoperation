@@ -1,7 +1,7 @@
 #ifndef REF_STM32F4_COMMON_INC_H
 #define REF_STM32F4_COMMON_INC_H
 
-#define CONFIG_FW_VERSION 1.0
+#define CONFIG_FW_VERSION 2.0
 
 /*---------------------------- C Scope ---------------------------*/
 #ifdef __cplusplus

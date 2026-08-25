@@ -80,7 +80,11 @@ class RobotConfig:
     action_semantics: str
     control_rate_hz: int
     firmware_loop_hz: int
-    feedback_poll_hz: int
+    can_dispatch_tick_hz: int
+    can_target_hz_per_node: int
+    can_position_hz_per_node: int
+    can_temperature_hz_per_node: int
+    coherent_max_skew_ms: int
     joint_zero_offset_rad: np.ndarray
     joint_sign: np.ndarray
     joint_reduction: np.ndarray
@@ -475,11 +479,24 @@ def load_robot_config(
     feedback_fault_ms = _positive_int(raw, "feedback_fault_ms")
     if feedback_fault_ms <= feedback_hold_ms:
         raise ConfigError("feedback_fault_ms must be greater than feedback_hold_ms")
-    feedback_poll_hz = _positive_int(raw, "feedback_poll_hz")
-    if feedback_poll_hz < len(expected_order) or feedback_poll_hz > 1000:
-        raise ConfigError("feedback_poll_hz must be between 7 and 1000 Hz")
-    if feedback_poll_hz % len(expected_order) != 0:
-        raise ConfigError("feedback_poll_hz must divide evenly across seven nodes")
+    can_dispatch_tick_hz = _positive_int(raw, "can_dispatch_tick_hz")
+    can_target_hz = _positive_int(raw, "can_target_hz_per_node")
+    can_position_hz = _positive_int(raw, "can_position_hz_per_node")
+    can_temperature_hz = _positive_int(raw, "can_temperature_hz_per_node")
+    coherent_max_skew_ms = _positive_int(raw, "coherent_max_skew_ms")
+    if can_dispatch_tick_hz < len(expected_order) or can_dispatch_tick_hz > 1000:
+        raise ConfigError("can_dispatch_tick_hz must be between 7 and 1000 Hz")
+    scheduled_hz = len(expected_order) * (
+        can_target_hz + can_position_hz + can_temperature_hz
+    )
+    if scheduled_hz > can_dispatch_tick_hz:
+        raise ConfigError(
+            "configured per-node CAN rates exceed can_dispatch_tick_hz capacity"
+        )
+    if coherent_max_skew_ms * can_position_hz < 1000:
+        raise ConfigError(
+            "coherent_max_skew_ms is shorter than one configured position period"
+        )
 
     return RobotConfig(
         robot_id=robot_id,
@@ -492,7 +509,11 @@ def load_robot_config(
         action_semantics="absolute_joint_position",
         control_rate_hz=_positive_int(raw, "control_rate_hz"),
         firmware_loop_hz=_positive_int(raw, "firmware_loop_hz"),
-        feedback_poll_hz=feedback_poll_hz,
+        can_dispatch_tick_hz=can_dispatch_tick_hz,
+        can_target_hz_per_node=can_target_hz,
+        can_position_hz_per_node=can_position_hz,
+        can_temperature_hz_per_node=can_temperature_hz,
+        coherent_max_skew_ms=coherent_max_skew_ms,
         joint_zero_offset_rad=_array(raw, "joint_zero_offset_rad", 6),
         joint_sign=signs,
         joint_reduction=reduction,

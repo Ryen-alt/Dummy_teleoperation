@@ -25,7 +25,17 @@ struct BinaryRobotMeasurement
     std::array<float, 7> position{};
     std::array<float, 7> velocity{};
     uint8_t validity = 0;
+    std::array<uint32_t, 7> position_sample_us{};
+    std::array<uint32_t, 7> position_sweep_id{};
+    uint32_t coherent_sweep_id = 0;
+    uint32_t max_skew_us = 0;
+    bool repeated = false;
 };
+
+// Called by the CAN dispatcher immediately after consuming a completed sweep.
+// It freezes all seven positions before the next node request can make the
+// live motor objects temporally mixed.
+void LatchCoherentRobotMeasurement();
 
 // Builds measured position, velocity and validity from the exact safety
 // snapshot that will be serialized alongside them in STATE.

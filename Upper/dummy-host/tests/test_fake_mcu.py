@@ -9,7 +9,7 @@ from dummy_host.fake_mcu import FakeMcuTransport
 from dummy_host.protocol import MessageType, Packet, pack_hello
 from dummy_host.robot_driver import DummyRobot, RobotError
 from dummy_host.schema import ControlMode
-from dummy_host.domain.models import FaultBits, HoldReasonBits
+from dummy_host.domain.models import ActionStage, FaultBits, HoldReasonBits
 
 
 class DropFirstHelloTransport(FakeMcuTransport):
@@ -32,10 +32,26 @@ class HelloAckWithoutStateTransport(FakeMcuTransport):
             self._next_state_ns = None
 
 
+class ContinuousStateWithoutTargetAckTransport(FakeMcuTransport):
+    def _ack(self, request: Packet) -> None:
+        if request.message_type != MessageType.SET_JOINT_TARGET:
+            super()._ack(request)
+
+
+class ExactCanWithoutPostFeedbackTransport(FakeMcuTransport):
+    def _emit_state(self, sequence: int) -> None:
+        applied = self._last_applied
+        self._last_applied = 0
+        try:
+            super()._emit_state(sequence)
+        finally:
+            self._last_applied = applied
+
+
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
     robot = DummyRobot(config, FakeMcuTransport(config))
     with robot:
-        assert robot.firmware_version == "fake-mcu-v2"
+        assert robot.firmware_version == "fake-mcu-v2.1"
         robot.acquire_control(ControlMode.TELEOP)
         deadline = time.monotonic() + 0.5
         while robot.read_state().mode != ControlMode.TELEOP and time.monotonic() < deadline:
@@ -47,15 +63,143 @@ def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
         assert applied.sequence > 0
         assert applied.applied[0] > state.position[0]
         deadline = time.monotonic() + 0.5
-        while robot.read_state().last_applied_sequence != applied.sequence and time.monotonic() < deadline:
+        while (
+            robot.read_state().last_post_command_feedback_sequence != applied.sequence
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.005)
-        assert robot.read_state().last_applied_sequence == applied.sequence
+        assert robot.read_state().last_post_command_feedback_sequence == applied.sequence
         robot.heartbeat()
         robot.hold()
         deadline = time.monotonic() + 0.5
         while robot.read_state().mode != ControlMode.HOLD and time.monotonic() < deadline:
             time.sleep(0.005)
         assert robot.read_state().mode == ControlMode.HOLD
+
+
+def test_nonblocking_action_reports_exact_can_queue_and_post_feedback(config) -> None:
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    stages = []
+    robot.set_action_lifecycle_listener(stages.append)
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        state = robot.read_state()
+        action = state.position.copy()
+        action[0] += np.float32(0.005)
+        applied = robot.enqueue_absolute_action(action, source="test")
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            observed = {
+                update.stage for update in stages if update.sequence == applied.sequence
+            }
+            if ActionStage.POST_COMMAND_FEEDBACK in observed:
+                break
+            time.sleep(0.005)
+        observed = [
+            update.stage for update in stages if update.sequence == applied.sequence
+        ]
+        assert ActionStage.RECEIVED in observed
+        assert ActionStage.SAFETY_ACCEPTED in observed
+        assert ActionStage.SEND_ENQUEUED in observed
+        assert ActionStage.SERIAL_SEND_STARTED in observed
+        assert ActionStage.SERIAL_SEND_FINISHED in observed
+        assert ActionStage.ACKNOWLEDGED in observed
+        assert ActionStage.CAN_QUEUED_EXACT in observed
+        assert ActionStage.POST_COMMAND_FEEDBACK in observed
+
+
+def test_action_watchdog_expires_lost_ack_while_state_continues(config) -> None:
+    robot = DummyRobot(
+        config,
+        ContinuousStateWithoutTargetAckTransport(config),
+        response_timeout_s=0.03,
+        action_observation_timeout_s=0.05,
+    )
+    stages = []
+    robot.set_action_lifecycle_listener(stages.append)
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        target = robot.read_state().position.copy()
+        target[0] += np.float32(0.005)
+        applied = robot.enqueue_absolute_action(target, source="lost-ack")
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            if any(
+                update.sequence == applied.sequence
+                and update.stage is ActionStage.FAILED
+                for update in stages
+            ):
+                break
+            # Prove the periodic STATE stream remains healthy during timeout.
+            robot.read_state()
+            time.sleep(0.005)
+        failure = next(
+            update
+            for update in stages
+            if update.sequence == applied.sequence
+            and update.stage is ActionStage.FAILED
+        )
+        assert "ACK" in (failure.detail or "")
+
+
+def test_action_watchdog_expires_when_post_feedback_never_arrives(config) -> None:
+    robot = DummyRobot(
+        config,
+        ExactCanWithoutPostFeedbackTransport(config),
+        response_timeout_s=0.03,
+        action_observation_timeout_s=0.04,
+    )
+    stages = []
+    robot.set_action_lifecycle_listener(stages.append)
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        target = robot.read_state().position.copy()
+        target[0] += np.float32(0.005)
+        applied = robot.enqueue_absolute_action(target, source="missing-feedback")
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline and not any(
+            update.sequence == applied.sequence
+            and update.stage is ActionStage.FAILED
+            for update in stages
+        ):
+            time.sleep(0.005)
+        observed = {
+            update.stage for update in stages if update.sequence == applied.sequence
+        }
+        assert ActionStage.ACKNOWLEDGED in observed
+        assert ActionStage.CAN_QUEUED_EXACT in observed
+        assert ActionStage.POST_COMMAND_FEEDBACK not in observed
+        assert ActionStage.FAILED in observed
+
+
+def test_action_lifecycle_is_reinitialized_after_sequence_wrap(config) -> None:
+    transport = FakeMcuTransport(config)
+    robot = DummyRobot(config, transport)
+    stages = []
+    robot.set_action_lifecycle_listener(stages.append)
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        robot._sequence = 0
+        target = robot.read_state().position.copy()
+        target[0] += np.float32(0.002)
+        first = robot.enqueue_absolute_action(target, source="before-wrap")
+        assert first.sequence == 1
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline and not any(
+            update.sequence == 1
+            and update.stage is ActionStage.POST_COMMAND_FEEDBACK
+            for update in stages
+        ):
+            time.sleep(0.005)
+
+        robot._sequence = 0xFFFFFFFF
+        target[0] += np.float32(0.002)
+        wrapped = robot.enqueue_absolute_action(target, source="after-wrap")
+        assert wrapped.sequence == 1
+        assert sum(
+            update.sequence == 1 and update.stage is ActionStage.RECEIVED
+            for update in stages
+        ) == 2
 
 
 def test_connect_retries_a_lost_hello_and_waits_for_state(config) -> None:

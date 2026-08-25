@@ -3,6 +3,7 @@
 #include "protocols/binary_control_bridge.hpp"
 #include "protocols/external_target_executor.hpp"
 #include "protocols/feedback_runtime.hpp"
+#include "protocols/binary_state_bridge.hpp"
 #include "protocols/feedback_safety_supervisor.hpp"
 #include "protocols/feedback_poll_scheduler.hpp"
 #include "protocols/joint_space_mapping.hpp"
@@ -18,7 +19,7 @@ SSD1306 oled(&hi2c0);
 MPU6050 mpu6050(&hi2c1);
 // 5 User-Timers, can choose from htim7/htim10/htim11/htim13/htim14
 Timer timerCtrlLoop(&htim7, 200);
-Timer timerFeedbackPoll(&htim10, dummy::generated_config::kFeedbackPollHz);
+Timer timerCanDispatch(&htim10, dummy::generated_config::kCanDispatchTickHz);
 // 2x2-channel PWMs, used htim9 & htim12, each has 2-channel outputs
 PWM pwm(21000, 21000);
 
@@ -62,17 +63,22 @@ dummy::protocol::FeedbackSafetyConfig MakeFeedbackSafetyConfig()
 dummy::protocol::FeedbackSafetySupervisor feedback_safety_supervisor(
     MakeFeedbackSafetyConfig());
 
-static_assert(dummy::generated_config::kFeedbackPollHz % 2U == 0U,
-              "CAN slot rate must split evenly between targets and feedback");
-constexpr uint32_t kFeedbackSlotHz =
-    dummy::generated_config::kFeedbackPollHz / 2U;
-constexpr uint32_t kTemperatureFeedbackSlotInterval =
-    kFeedbackSlotHz /
-    static_cast<uint32_t>(dummy::protocol::kActuatorNodeCount);
-static_assert(kTemperatureFeedbackSlotInterval > 0U,
-              "feedback scheduler requires temperature slots");
-dummy::protocol::CanSlotScheduler can_slot_scheduler(
-    kTemperatureFeedbackSlotInterval);
+static_assert(dummy::generated_config::kCanDispatchTickHz == 700U,
+              "v2.1 CAN dispatch frequency plan is reviewed at 700 Hz");
+
+dummy::protocol::CanDispatchConfig MakeCanDispatchConfig()
+{
+    dummy::protocol::CanDispatchConfig config{};
+    config.dispatch_tick_hz = dummy::generated_config::kCanDispatchTickHz;
+    config.target_hz_per_node = dummy::generated_config::kCanTargetHzPerNode;
+    config.position_hz_per_node = dummy::generated_config::kCanPositionHzPerNode;
+    config.temperature_hz_per_node =
+        dummy::generated_config::kCanTemperatureHzPerNode;
+    return config;
+}
+
+dummy::protocol::CanDispatchScheduler can_dispatch_scheduler(
+    MakeCanDispatchConfig());
 
 enum class ScheduledActuatorMode : uint8_t
 {
@@ -101,9 +107,12 @@ void PublishStreamingActuatorTarget(const std::array<float, 7>& position,
     taskEXIT_CRITICAL();
 }
 
-void PublishActuatorMode(ScheduledActuatorMode mode)
+void PublishActuatorMode(ScheduledActuatorMode mode,
+                         const std::array<float, 7>& hold_position)
 {
     taskENTER_CRITICAL();
+    scheduled_actuator_request.position = hold_position;
+    scheduled_actuator_request.sequence = 0U;
     scheduled_actuator_request.mode = mode;
     taskEXIT_CRITICAL();
 }
@@ -118,11 +127,11 @@ ScheduledActuatorRequest ReadScheduledActuatorRequest()
 
 // This task now owns enable/HOLD/FAULT and per-node target writes in addition
 // to feedback polling, so give it the same reviewed stack budget as control.
-constexpr uint32_t kFeedbackPollStackBytes = 2000U;
-static_assert(kFeedbackPollStackBytes % sizeof(StackType_t) == 0U,
-              "feedback task stack must be word aligned");
-StaticTask_t feedback_poll_task_control_block{};
-StackType_t feedback_poll_task_stack[kFeedbackPollStackBytes / sizeof(StackType_t)]{};
+constexpr uint32_t kCanDispatchStackBytes = 2000U;
+static_assert(kCanDispatchStackBytes % sizeof(StackType_t) == 0U,
+              "CAN dispatcher stack must be word aligned");
+StaticTask_t can_dispatch_task_control_block{};
+StackType_t can_dispatch_task_stack[kCanDispatchStackBytes / sizeof(StackType_t)]{};
 }
 
 
@@ -179,6 +188,8 @@ void ThreadControlLoopFixUpdate(void* argument)
         safety_input.feedback = dummy::protocol::ReadCanFeedbackStatus(
             static_cast<uint32_t>(now_us));
         const auto safety = feedback_safety_supervisor.Update(safety_input);
+        dummy::protocol::PublishCanFeedbackReady(
+            safety.arm_position_valid && safety.gripper_position_valid);
         dummy::protocol::ApplyBinarySafetyOutcome(safety);
         const bool safety_stop = safety.hold_reason_bits != 0 || safety.fault_bits != 0;
 
@@ -192,19 +203,19 @@ void ThreadControlLoopFixUpdate(void* argument)
 
             if (fault_requested)
             {
-                PublishActuatorMode(ScheduledActuatorMode::Fault);
+                PublishActuatorMode(ScheduledActuatorMode::Fault, measured_position);
             }
             else if (hold_requested || !step.command_valid)
             {
                 // The CAN task owns all binary-mode actuator writes. Keeping
                 // HOLD latched in this mailbox prevents a delayed CAN task from
                 // missing a one-control-tick transition during lease release.
-                PublishActuatorMode(ScheduledActuatorMode::Hold);
+                PublishActuatorMode(ScheduledActuatorMode::Hold, measured_position);
             }
             else
             {
                 // Latest-value mailbox: the 200 Hz executor may overwrite an
-                // intermediate point before a node's 100 Hz slot. No stale
+                // intermediate point before a node's 50 Hz slot. No stale
                 // backlog is ever replayed onto the actuator bus.
                 PublishStreamingActuatorTarget(step.position, step.sequence);
             }
@@ -242,81 +253,136 @@ void ThreadControlLoopFixUpdate(void* argument)
 }
 
 
-osThreadId_t feedbackPollTaskHandle;
-void ThreadFeedbackPoll(void* argument)
+osThreadId_t canDispatchTaskHandle;
+void ThreadCanDispatch(void* argument)
 {
     (void) argument;
-    ScheduledActuatorMode processed_mode = ScheduledActuatorMode::Idle;
     dummy::protocol::ActuatorApplicationTracker application_tracker;
     for (;;)
     {
-        // Clear any accumulated notifications so a delayed task never emits a
-        // catch-up burst onto CAN. A missed slot remains visible as feedback age.
+        // Clear accumulated notifications: v2.1 never replays a delayed CAN
+        // burst. All rate and timeout consequences remain visible in telemetry.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        const auto request = can_slot_scheduler.Next();
-
         const ScheduledActuatorRequest scheduled = ReadScheduledActuatorRequest();
+        dummy::protocol::CanDispatchMode dispatch_mode =
+            dummy::protocol::CanDispatchMode::Bootstrap;
         if (scheduled.mode == ScheduledActuatorMode::Stream)
-        {
-            if (processed_mode != ScheduledActuatorMode::Stream)
-            {
-                application_tracker.Reset();
-                if (!robot.IsEnabled())
-                    robot.SetEnable(true);
-                processed_mode = ScheduledActuatorMode::Stream;
-                // Enabling is a one-time multi-frame transition. Give it this
-                // entire slot so no target/query is appended to the burst.
-                continue;
-            }
+            dispatch_mode = dummy::protocol::CanDispatchMode::Stream;
+        else if (scheduled.mode == ScheduledActuatorMode::Hold)
+            dispatch_mode = dummy::protocol::CanDispatchMode::Hold;
+        else if (scheduled.mode == ScheduledActuatorMode::Fault)
+            dispatch_mode = dummy::protocol::CanDispatchMode::Fault;
 
-            if (request.kind == dummy::protocol::CanSlotKind::ActuatorTarget)
-            {
-                // Re-read immediately before transmitting. If the realtime
-                // safety task published HOLD/FAULT meanwhile, skip this stale
-                // target and process the transition in the next (<= 1.43 ms)
-                // CAN slot.
-                const ScheduledActuatorRequest latest = ReadScheduledActuatorRequest();
-                if (latest.mode == ScheduledActuatorMode::Stream)
-                {
-                    const bool transmitted = robot.ApplyExternalUrdfTargetNodeRad(
-                        request.node_id, latest.position);
-                    if (application_tracker.RecordTransmission(
-                            latest.sequence, request.node_id, transmitted))
-                        dummy::protocol::MarkBinaryTargetApplied(latest.sequence);
-                }
-                else
-                {
-                    application_tracker.Reset();
-                }
-            }
-            else if (request.kind == dummy::protocol::CanSlotKind::PositionFeedback)
-                robot.RequestPositionFeedback(request.node_id);
-            else
-                robot.RequestTemperatureFeedback(request.node_id);
-        }
-        else
+        if (dispatch_mode != can_dispatch_scheduler.mode())
         {
             application_tracker.Reset();
-            if (scheduled.mode != processed_mode)
-            {
-                if (scheduled.mode == ScheduledActuatorMode::Hold)
-                    robot.HoldCurrentPosition();
-                else if (scheduled.mode == ScheduledActuatorMode::Fault)
-                    robot.commandHandler.EmergencyStop();
-                processed_mode = scheduled.mode;
-                // HOLD/FAULT can fan out to all nodes. Do not append another
-                // CAN frame until the following timer slot.
-                continue;
-            }
-
-            // With control inactive, reuse target slots for position queries.
-            // This preserves high-rate idle diagnostics without ever sending
-            // more than one normal-operation frame in a timer slot.
-            if (request.kind == dummy::protocol::CanSlotKind::TemperatureFeedback)
-                robot.RequestTemperatureFeedback(request.node_id);
-            else
-                robot.RequestPositionFeedback(request.node_id);
+            can_dispatch_scheduler.SetMode(dispatch_mode);
         }
+
+        const uint32_t now_us = micros();
+        const auto responses = dummy::protocol::ConsumeFeedbackResponseEvents();
+        dummy::protocol::LatchCoherentRobotMeasurement();
+        const auto coherent = dummy::protocol::ReadCoherentFeedbackStatus();
+        if (coherent.valid)
+            dummy::protocol::RecordBinaryCoherentSweep(
+                coherent.sweep_id,
+                dummy::protocol::BinaryControlMonotonicMicros());
+        const auto step = can_dispatch_scheduler.Next(now_us, responses);
+        if (step.timed_out_action ==
+            dummy::protocol::CanDispatchAction::PositionRequest)
+            dummy::protocol::RecordPositionFeedbackTimeout(
+                step.timed_out_node_id);
+        else if (step.timed_out_action ==
+                 dummy::protocol::CanDispatchAction::TemperatureRequest)
+            dummy::protocol::RecordTemperatureFeedbackTimeout(
+                step.timed_out_node_id);
+
+        bool queued = false;
+        ScheduledActuatorRequest latest = scheduled;
+        switch (step.action)
+        {
+            case dummy::protocol::CanDispatchAction::ActuatorTarget:
+                latest = ReadScheduledActuatorRequest();
+                if (latest.mode == scheduled.mode)
+                    queued = robot.ApplyExternalUrdfTargetNodeRad(
+                        step.node_id, latest.position);
+                break;
+            case dummy::protocol::CanDispatchAction::PositionRequest:
+                queued = robot.TryRequestPositionFeedback(step.node_id);
+                break;
+            case dummy::protocol::CanDispatchAction::TemperatureRequest:
+                queued = robot.TryRequestTemperatureFeedback(step.node_id);
+                break;
+            case dummy::protocol::CanDispatchAction::EnableBroadcast:
+                latest = ReadScheduledActuatorRequest();
+                if (latest.mode == ScheduledActuatorMode::Stream)
+                    queued = robot.TrySetExternalEnable(true);
+                break;
+            case dummy::protocol::CanDispatchAction::DisableBroadcast:
+                queued = robot.TrySetExternalEnable(false);
+                break;
+            case dummy::protocol::CanDispatchAction::None:
+                break;
+        }
+
+        if (step.action != dummy::protocol::CanDispatchAction::None)
+        {
+            if (queued)
+            {
+                can_dispatch_scheduler.OnQueued(step, now_us);
+                if (step.action == dummy::protocol::CanDispatchAction::ActuatorTarget &&
+                    latest.mode == ScheduledActuatorMode::Stream &&
+                    latest.sequence != 0U)
+                {
+                    const bool completed = application_tracker.RecordTransmission(
+                        latest.sequence, step.node_id, true);
+                    const uint32_t superseded =
+                        application_tracker.TakeSupersededSequence();
+                    if (superseded != 0U)
+                        dummy::protocol::RecordBinaryTargetSuperseded(
+                            superseded,
+                            dummy::protocol::BinaryControlMonotonicMicros());
+                    if (completed)
+                        dummy::protocol::RecordBinaryTargetCanQueuedExact(
+                            latest.sequence,
+                            dummy::protocol::BinaryControlMonotonicMicros(),
+                            coherent.sweep_id);
+                }
+            }
+            else
+            {
+                can_dispatch_scheduler.OnDeferred();
+            }
+        }
+
+        const auto diagnostics = can_dispatch_scheduler.diagnostics();
+        const CAN_context* can_context = get_can_ctx(&hcan1);
+        uint8_t runtime_status = dummy::protocol::kCanRuntimeDispatcherAlive;
+        if (can_context != nullptr && can_context->tx_queued_count != 0U)
+            runtime_status |= dummy::protocol::kCanRuntimeTxQueued;
+        bool position_requested = false;
+        bool position_responded = false;
+        for (size_t index = 0; index < dummy::protocol::kActuatorNodeCount; ++index)
+        {
+            position_requested = position_requested ||
+                diagnostics.position_requested[index] != 0U;
+            position_responded = position_responded ||
+                diagnostics.position_responded[index] != 0U;
+        }
+        if (position_requested)
+            runtime_status |= dummy::protocol::kCanRuntimePositionRequested;
+        if (position_responded)
+            runtime_status |= dummy::protocol::kCanRuntimePositionResponded;
+        if (diagnostics.deferred_send_count != 0U ||
+            (can_context != nullptr && can_context->tx_busy_count != 0U))
+            runtime_status |= dummy::protocol::kCanRuntimeTxDeferred;
+        if (diagnostics.query_pending)
+            runtime_status |= dummy::protocol::kCanRuntimeQueryPending;
+        if (dummy::protocol::ReadCanFeedbackReady())
+            runtime_status |= dummy::protocol::kCanRuntimeFeedbackReady;
+        if (can_context != nullptr && can_context->tx_recovery_count != 0U)
+            runtime_status |= dummy::protocol::kCanRuntimeTxRecovered;
+        dummy::protocol::PublishCanRuntimeStatus(runtime_status);
     }
 }
 
@@ -400,11 +466,11 @@ void OnTimer7Callback()
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-void OnTimer10FeedbackPollCallback()
+void OnTimer10CanDispatchCallback()
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-    vTaskNotifyGiveFromISR(TaskHandle_t(feedbackPollTaskHandle), &xHigherPriorityTaskWoken);
+    vTaskNotifyGiveFromISR(TaskHandle_t(canDispatchTaskHandle), &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
@@ -462,17 +528,17 @@ void Main(void)
     controlLoopFixUpdateHandle = osThreadNew(ThreadControlLoopFixUpdate, nullptr,
                                              &controlLoopTask_attributes);
 
-    const osThreadAttr_t feedbackPollTask_attributes = {
-        .name = "FeedbackPollTask",
-        .cb_mem = &feedback_poll_task_control_block,
-        .cb_size = sizeof(feedback_poll_task_control_block),
-        .stack_mem = feedback_poll_task_stack,
-        .stack_size = kFeedbackPollStackBytes,
+    const osThreadAttr_t canDispatchTask_attributes = {
+        .name = "CanDispatchTask",
+        .cb_mem = &can_dispatch_task_control_block,
+        .cb_size = sizeof(can_dispatch_task_control_block),
+        .stack_mem = can_dispatch_task_stack,
+        .stack_size = kCanDispatchStackBytes,
         .priority = (osPriority_t) osPriorityHigh,
     };
-    feedbackPollTaskHandle = osThreadNew(ThreadFeedbackPoll, nullptr,
-                                         &feedbackPollTask_attributes);
-    if (feedbackPollTaskHandle == nullptr)
+    canDispatchTaskHandle = osThreadNew(ThreadCanDispatch, nullptr,
+                                        &canDispatchTask_attributes);
+    if (canDispatchTaskHandle == nullptr)
         Error_Handler();
 
     const osThreadAttr_t ControlLoopUpdateTask_attributes = {
@@ -499,9 +565,9 @@ void Main(void)
 
     // Start Timer Callbacks.
     timerCtrlLoop.SetCallback(OnTimer7Callback);
-    timerFeedbackPoll.SetCallback(OnTimer10FeedbackPollCallback);
+    timerCanDispatch.SetCallback(OnTimer10CanDispatchCallback);
     timerCtrlLoop.Start();
-    timerFeedbackPoll.Start();
+    timerCanDispatch.Start();
 
     // System started, light switch-led up.
     Respond(*uart4StreamOutputPtr, "[sys] Heap remain: %d Bytes\n", xPortGetMinimumEverFreeHeapSize());

@@ -23,6 +23,7 @@ from dummy_host.protocol import (
     PROTOCOL_VERSION,
     STATE,
 )
+from dummy_host.domain import ActionProgressFlags, ActionProgressRecord
 from dummy_host.schema import ControlMode, RobotState
 
 
@@ -97,7 +98,7 @@ def test_shared_wire_vectors() -> None:
     assert encode_packet(packet).hex() == target["wire_hex"]
 
 
-def test_state_v2_safety_telemetry_round_trip(config) -> None:
+def test_state_v4_coherent_feedback_and_exact_action_progress_round_trip(config) -> None:
     state = RobotState(
         position=np.arange(7, dtype=np.float32) / 10,
         velocity=np.arange(7, dtype=np.float32) / 100,
@@ -109,7 +110,6 @@ def test_state_v2_safety_telemetry_round_trip(config) -> None:
         velocity_valid=True,
         gripper_valid=True,
         last_received_sequence=7,
-        last_applied_sequence=6,
         target_age_ms=12,
         config_hash=config.config_hash,
         following_error=np.arange(7, dtype=np.float32) / 1000,
@@ -121,6 +121,23 @@ def test_state_v2_safety_telemetry_round_trip(config) -> None:
         node_validity=np.ones(7, dtype=np.uint8),
         hold_reason_bits=8,
         telemetry_validity=7,
+        can_transport_status=0x6F,
+        feedback_sample_mcu_us=np.arange(7, dtype=np.uint64) + 1000,
+        feedback_sweep_id=np.full(7, 9, dtype=np.uint32),
+        coherent_sweep_id=9,
+        feedback_max_skew_us=20_000,
+        coherent_reference_mcu_us=1_003,
+        state_repeated=True,
+        action_progress=(
+            ActionProgressRecord(
+                sequence=6,
+                flags=int(ActionProgressFlags.CAN_QUEUED_EXACT)
+                | int(ActionProgressFlags.POST_COMMAND_FEEDBACK),
+                can_queued_mcu_us=2_000,
+                post_feedback_mcu_us=3_000,
+                feedback_sweep_id=9,
+            ),
+        ),
     )
     restored = unpack_state(pack_state(state), state.monotonic_ns)
     np.testing.assert_array_equal(restored.following_error, state.following_error)
@@ -128,3 +145,15 @@ def test_state_v2_safety_telemetry_round_trip(config) -> None:
     np.testing.assert_array_equal(restored.node_fault_bits, state.node_fault_bits)
     assert restored.hold_reason_bits == 8
     assert restored.telemetry_validity == 7
+    assert restored.can_transport_status == 0x6F
+    np.testing.assert_array_equal(
+        restored.feedback_sample_mcu_us, state.feedback_sample_mcu_us
+    )
+    np.testing.assert_array_equal(restored.feedback_sweep_id, state.feedback_sweep_id)
+    assert restored.coherent
+    assert restored.feedback_max_skew_us == 20_000
+    assert restored.coherent_reference_mcu_us == 1_003
+    assert restored.state_repeated
+    assert restored.last_can_queued_mcu_us == 2000
+    assert restored.last_post_command_feedback_sequence == 6
+    assert restored.last_post_command_feedback_mcu_us == 3000

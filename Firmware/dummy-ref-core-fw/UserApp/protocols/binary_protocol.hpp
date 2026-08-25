@@ -9,9 +9,10 @@ namespace dummy::protocol
 {
 
 constexpr uint16_t kMagic = 0x4459;
-constexpr uint8_t kProtocolVersion = 2;
+constexpr uint8_t kProtocolVersion = 4;
 constexpr size_t kMaxDecodedFrame = 512;
 constexpr size_t kCrcSize = 4;
+constexpr size_t kActionProgressReplayCapacity = 6;
 
 enum class MessageType : uint8_t
 {
@@ -59,6 +60,8 @@ enum class ResultCode : uint8_t
     LeaseConflict = 12,
     Unsupported = 13,
 };
+
+constexpr uint16_t kAckDetailFeedbackNotReady = 1U;
 
 enum class DecodeStatus : uint8_t
 {
@@ -125,13 +128,43 @@ struct AckPayload
     uint16_t detail;
 };
 
+enum class ActionProgressStage : uint8_t
+{
+    CanQueuedExact = 1,
+    PostCommandFeedback = 2,
+    Superseded = 3,
+};
+
+constexpr uint8_t kActionProgressCanQueuedExact = 1U << 0;
+constexpr uint8_t kActionProgressPostCommandFeedback = 1U << 1;
+constexpr uint8_t kActionProgressSuperseded = 1U << 2;
+constexpr uint8_t kStateRepeated = 1U << 0;
+
+struct ActionProgressPayload
+{
+    uint32_t action_sequence;
+    uint8_t stage;
+    uint8_t reserved[3];
+    uint64_t stage_time_us;
+    uint32_t feedback_sweep_id;
+};
+
+struct ActionProgressRecord
+{
+    uint32_t action_sequence;
+    uint8_t flags;
+    uint8_t reserved[3];
+    uint32_t can_queued_time_low_us;
+    uint32_t post_feedback_time_low_us;
+    uint32_t feedback_sweep_id;
+};
+
 struct StatePayload
 {
     uint64_t mcu_time_us;
     float position[7];
     float velocity[7];
     uint32_t last_received_sequence;
-    uint32_t last_applied_sequence;
     uint8_t mode;
     uint8_t validity;
     uint16_t fault_bits;
@@ -144,16 +177,28 @@ struct StatePayload
     uint16_t consecutive_feedback_loss[7];
     uint16_t node_fault_bits[7];
     uint8_t node_validity[7];
-    uint8_t reserved;
+    uint8_t can_transport_status;
     uint16_t hold_reason_bits;
     uint16_t telemetry_validity;
+    uint64_t feedback_sample_mcu_us[7];
+    uint32_t feedback_sweep_id[7];
+    uint32_t coherent_sweep_id;
+    uint32_t feedback_max_skew_us;
+    uint64_t coherent_reference_mcu_us;
+    uint8_t state_flags;
+    uint8_t action_progress_count;
+    uint8_t action_progress_head;
+    uint8_t progress_reserved;
+    ActionProgressRecord action_progress[kActionProgressReplayCapacity];
 };
 #pragma pack(pop)
 
 static_assert(sizeof(float) == 4, "protocol requires IEEE-754 binary32 floats");
 static_assert(sizeof(PacketHeader) == 24, "PacketHeader layout changed");
 static_assert(sizeof(JointTargetPayload) == 56, "JointTargetPayload layout changed");
-static_assert(sizeof(StatePayload) == 264, "StatePayload layout changed");
+static_assert(sizeof(ActionProgressPayload) == 20, "ActionProgressPayload layout changed");
+static_assert(sizeof(ActionProgressRecord) == 20, "ActionProgressRecord layout changed");
+static_assert(sizeof(StatePayload) == 484, "StatePayload layout changed");
 
 constexpr size_t kMaxPayload = kMaxDecodedFrame - sizeof(PacketHeader) - kCrcSize;
 

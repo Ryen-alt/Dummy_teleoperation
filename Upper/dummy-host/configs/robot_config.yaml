@@ -1,5 +1,5 @@
 robot_id: dummy_v2_001
-config_version: 6
+config_version: 7
 # Operator-confirmed arm/gripper calibration baseline. Changing a robot-safety
 # value changes the robot hash and requires regenerating/reflashing firmware.
 # Camera fields have their own rig hash and may be overridden by --camera-rig.
@@ -12,10 +12,14 @@ joint_unit: rad
 action_semantics: absolute_joint_position
 control_rate_hz: 20
 firmware_loop_hz: 200
-# Dedicated time-slotted CAN feedback scheduler. One unicast request is issued
-# per slot; seven temperature slots per second leave 693 position polls/s,
-# exactly 99 Hz per arm/gripper node without broadcast response bursts.
-feedback_poll_hz: 700
+# v2.1 deadline-driven CAN scheduler. Rates are outbound transactions per node;
+# position/temperature replies add roughly 287 frames/s on top of the 637
+# scheduled frames/s. There is no runtime fallback to a lower feedback rate.
+can_dispatch_tick_hz: 700
+can_target_hz_per_node: 50
+can_position_hz_per_node: 40
+can_temperature_hz_per_node: 1
+coherent_max_skew_ms: 30
 
 # 以下值已经过逐关节真机复核，并由上面的 calibration ID 冻结。
 # 2026-08-21 操作者真机复测确认 J1～J6 的正确减速比均为 50。

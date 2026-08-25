@@ -20,6 +20,8 @@ from .protocol import (
     unpack_joint_target,
 )
 from .domain.models import (
+    ActionProgressFlags,
+    ActionProgressRecord,
     FaultBits,
     HoldReasonBits,
     NodeFaultBits,
@@ -27,13 +29,23 @@ from .domain.models import (
     TelemetryValidityBits,
 )
 from .schema import ControlMode, RobotConfig, RobotState
-from .transport_serial import TransportClosed
+from .transport_serial import (
+    TransportClosed,
+    TransportTxUpdate,
+    TxOutcome,
+)
+
+
+def _is_newer_sequence(candidate: int, previous: int) -> bool:
+    delta = (candidate - previous) & 0xFFFFFFFF
+    return delta != 0 and delta < 0x80000000
 
 
 class FakeMcuTransport:
     """In-memory firmware peer used before any motor is connected."""
 
     is_simulated = True
+    firmware_version = "fake-mcu-v2.1"
 
     def __init__(
         self,
@@ -52,7 +64,14 @@ class FakeMcuTransport:
         self._fault_bits = 0
         self._hold_reason_bits = 0
         self._last_received = 0
+        self._has_received_target = False
         self._last_applied = 0
+        self._last_applied_mcu_us = 0
+        self._last_observed = 0
+        self._last_observed_mcu_us = 0
+        self._progress: list[ActionProgressRecord] = []
+        self._tx_observer: Callable[[TransportTxUpdate], None] | None = None
+        self._sweep_id = 0
         self._position = np.concatenate((config.initial_pose_rad, np.asarray([0.0], dtype=np.float32)))
         self._velocity = np.zeros(7, dtype=np.float32)
         self._feedback_age_ms = np.zeros(7, dtype=np.uint32)
@@ -118,6 +137,17 @@ class FakeMcuTransport:
     def send(self, packet: Packet) -> None:
         if not self._open:
             raise TransportClosed("fake MCU is closed")
+        tx_ns = self.clock_ns()
+        if self._tx_observer is not None:
+            self._tx_observer(
+                TransportTxUpdate(
+                    packet.sequence,
+                    TxOutcome.SENT,
+                    tx_ns,
+                    tx_ns,
+                    tx_ns,
+                )
+            )
         self._expire_deadlines()
         if packet.message_type == MessageType.HELLO:
             remote_hash, _ = unpack_hello(packet.payload)
@@ -128,12 +158,19 @@ class FakeMcuTransport:
             # control lease is acquired. Mirror that behavior so read-only and
             # dead-man-released startup paths are testable offline.
             self._session = packet.session_id
+            self._last_received = 0
+            self._has_received_target = False
+            self._progress.clear()
             self._next_state_ns = self.clock_ns() + self._state_period_ns
             self._rx.put(
                 self._response(
                     packet,
                     MessageType.HELLO_ACK,
-                    pack_hello_ack(self.config.config_hash_bytes, 0, "fake-mcu-v2"),
+                    pack_hello_ack(
+                        self.config.config_hash_bytes,
+                        0,
+                        self.firmware_version,
+                    ),
                 )
             )
             return
@@ -207,7 +244,9 @@ class FakeMcuTransport:
             except ValueError:
                 self._nack(packet, ResultCode.BAD_LENGTH)
                 return
-            if packet.sequence <= self._last_received:
+            if self._has_received_target and not _is_newer_sequence(
+                packet.sequence, self._last_received
+            ):
                 self._nack(packet, ResultCode.BAD_SEQUENCE)
                 return
             if valid_for_ms == 0 or valid_for_ms > self.config.target_ttl_ms:
@@ -224,7 +263,17 @@ class FakeMcuTransport:
                 self._nack(packet, ResultCode.OUT_OF_RANGE)
                 return
             self._last_received = packet.sequence
+            self._has_received_target = True
             self._last_applied = packet.sequence
+            self._last_applied_mcu_us = self.clock_ns() // 1_000
+            self._progress.append(
+                ActionProgressRecord(
+                    packet.sequence,
+                    int(ActionProgressFlags.CAN_QUEUED_EXACT),
+                    can_queued_mcu_us=self._last_applied_mcu_us,
+                )
+            )
+            self._progress = self._progress[-6:]
             self._hold_reason_bits = 0
             self._velocity = (action - self._position) * self.config.control_rate_hz
             self._position = action
@@ -263,6 +312,11 @@ class FakeMcuTransport:
             self.send(packet)
         return self._raw_decoder.dropped_frames - dropped_before
 
+    def set_tx_observer(
+        self, observer: Callable[[TransportTxUpdate], None] | None
+    ) -> None:
+        self._tx_observer = observer
+
     def _response(self, request: Packet, message_type: MessageType, payload: bytes) -> Packet:
         return Packet(message_type, request.session_id, request.sequence, self.clock_ns() // 1_000, payload)
 
@@ -274,6 +328,23 @@ class FakeMcuTransport:
 
     def _emit_state(self, sequence: int) -> None:
         now_ns = self.clock_ns()
+        self._sweep_id += 1
+        self._last_observed = self._last_applied
+        self._last_observed_mcu_us = now_ns // 1_000
+        if self._progress:
+            latest = self._progress[-1]
+            if (
+                latest.sequence == self._last_applied
+                and latest.flags & int(ActionProgressFlags.CAN_QUEUED_EXACT)
+                and not latest.flags & int(ActionProgressFlags.POST_COMMAND_FEEDBACK)
+            ):
+                self._progress[-1] = ActionProgressRecord(
+                    latest.sequence,
+                    latest.flags | int(ActionProgressFlags.POST_COMMAND_FEEDBACK),
+                    latest.can_queued_mcu_us,
+                    self._last_observed_mcu_us,
+                    self._sweep_id,
+                )
         self._next_state_ns = now_ns + self._state_period_ns
         state = RobotState(
             position=self._position.copy(),
@@ -286,7 +357,6 @@ class FakeMcuTransport:
             velocity_valid=True,
             gripper_valid=self.config.gripper_state_feedback,
             last_received_sequence=self._last_received,
-            last_applied_sequence=self._last_applied,
             target_age_ms=0
             if self._target_deadline_ns is None
             else max(
@@ -307,6 +377,14 @@ class FakeMcuTransport:
                 TelemetryValidityBits.FOLLOWING_ERROR
                 | TelemetryValidityBits.CAN_FEEDBACK
             ),
+            can_transport_status=0x4F,
+            feedback_sample_mcu_us=np.full(7, now_ns // 1_000, dtype=np.uint64),
+            feedback_sweep_id=np.full(7, self._sweep_id, dtype=np.uint32),
+            coherent_sweep_id=self._sweep_id,
+            feedback_max_skew_us=0,
+            coherent_reference_mcu_us=now_ns // 1_000,
+            state_repeated=False,
+            action_progress=tuple(self._progress),
         )
         self._rx.put(
             Packet(

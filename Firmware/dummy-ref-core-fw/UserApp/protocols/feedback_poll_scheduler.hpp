@@ -3,50 +3,148 @@
 
 #include "can_feedback_monitor.hpp"
 
+#include <array>
 #include <cstdint>
 
 namespace dummy::protocol
 {
 
-enum class CanSlotKind : uint8_t
+enum class CanDispatchMode : uint8_t
 {
+    Bootstrap,
+    Hold,
+    Stream,
+    Fault,
+};
+
+enum class CanDispatchAction : uint8_t
+{
+    None,
     ActuatorTarget,
-    PositionFeedback,
-    TemperatureFeedback,
+    PositionRequest,
+    TemperatureRequest,
+    EnableBroadcast,
+    DisableBroadcast,
 };
 
-struct CanSlotRequest
+struct FeedbackResponseEvents
 {
-    CanSlotKind kind = CanSlotKind::ActuatorTarget;
-    uint8_t node_id = 1;
+    uint8_t position_mask = 0;
+    uint8_t temperature_mask = 0;
 };
 
-// Produces at most one outbound CAN frame per 700 Hz timer slot. Target and
-// feedback slots alternate. Feedback is phase-shifted by three nodes so a
-// motor never receives its target and query in adjacent slots.
-class CanSlotScheduler
+struct CanDispatchStep
+{
+    CanDispatchAction action = CanDispatchAction::None;
+    uint8_t node_id = 0;
+    CanDispatchAction timed_out_action = CanDispatchAction::None;
+    uint8_t timed_out_node_id = 0;
+    bool transition = false;
+};
+
+struct CanDispatchConfig
+{
+    uint32_t response_timeout_us = 4000U;
+    uint32_t node_quiet_us = 5000U;
+    uint32_t dispatch_tick_hz = 700U;
+    uint32_t target_hz_per_node = 50U;
+    uint32_t position_hz_per_node = 40U;
+    uint32_t temperature_hz_per_node = 1U;
+};
+
+struct CanDispatchDiagnostics
+{
+    uint32_t tick_count = 0;
+    uint32_t idle_slot_count = 0;
+    uint32_t deferred_send_count = 0;
+    uint32_t unexpected_response_count = 0;
+    std::array<uint32_t, kActuatorNodeCount> target_queued{};
+    std::array<uint32_t, kActuatorNodeCount> position_requested{};
+    std::array<uint32_t, kActuatorNodeCount> position_responded{};
+    std::array<uint32_t, kActuatorNodeCount> position_timed_out{};
+    std::array<uint32_t, kActuatorNodeCount> temperature_requested{};
+    std::array<uint32_t, kActuatorNodeCount> temperature_responded{};
+    std::array<uint32_t, kActuatorNodeCount> temperature_timed_out{};
+    bool query_pending = false;
+    CanDispatchAction pending_action = CanDispatchAction::None;
+    uint8_t pending_node_id = 0;
+    bool config_valid = true;
+};
+
+// v2.1 CAN traffic planner. A 700 Hz task calls Next(), but frequencies are
+// intentionally lower than the timer ceiling:
+//   - active target:       50 Hz/node (350 frames/s)
+//   - position feedback:  40 Hz/node (280 requests/s)
+//   - temperature:         1 Hz/node (7 requests/s)
+// Only one feedback transaction may be outstanding. Every normal and
+// transition action is admitted one frame at a time through the non-blocking
+// transport; missed ticks are never replayed as a burst.
+class CanDispatchScheduler
 {
 public:
-    explicit CanSlotScheduler(uint32_t temperature_feedback_slot_interval);
+    explicit CanDispatchScheduler(const CanDispatchConfig& config = {});
 
-    CanSlotRequest Next();
+    void SetMode(CanDispatchMode mode);
+    CanDispatchStep Next(uint32_t now_us,
+                         const FeedbackResponseEvents& responses = {});
+    void OnQueued(const CanDispatchStep& step, uint32_t now_us);
+    void OnDeferred();
     void Reset();
 
+    CanDispatchMode mode() const { return mode_; }
+    CanDispatchDiagnostics diagnostics() const;
+
 private:
-    uint32_t temperature_feedback_slot_interval_ = 0;
-    uint32_t feedback_slots_since_temperature_ = 0;
-    uint8_t next_target_node_ = 1;
-    uint8_t current_pair_target_node_ = 1;
-    bool target_slot_next_ = true;
+    enum class Transition : uint8_t
+    {
+        None,
+        HoldTargets,
+        Enable,
+        Disable,
+    };
+
+    static uint8_t NextNode(uint8_t node_id);
+    bool NodeQuiet(uint8_t node_id, uint32_t now_us) const;
+    bool AllNodesQuiet(uint32_t now_us) const;
+    uint8_t SelectTargetNode(uint32_t now_us) const;
+    uint8_t SelectPositionNode(uint32_t now_us) const;
+    uint8_t SelectTemperatureNode(uint32_t now_us) const;
+    void ConsumeResponses(const FeedbackResponseEvents& responses);
+    void CountUnexpectedResponses(uint8_t mask, CanDispatchAction action,
+                                  uint8_t expected_node);
+    static uint32_t PeriodUs(uint32_t hz_per_node);
+    static bool DeadlineDue(uint32_t now_us, uint32_t deadline_us);
+    void InitializeDeadlines(uint32_t now_us);
+    void AdvanceDeadline(uint32_t& deadline_us, uint32_t hz_per_node,
+                         uint32_t now_us);
+
+    CanDispatchConfig config_{};
+    bool config_valid_ = true;
+    CanDispatchMode mode_ = CanDispatchMode::Bootstrap;
+    Transition transition_ = Transition::None;
+    uint8_t transition_node_ = 1U;
+    bool deadlines_initialized_ = false;
+    uint32_t next_target_deadline_us_ = 0U;
+    uint32_t next_position_deadline_us_ = 0U;
+    uint32_t next_temperature_deadline_us_ = 0U;
+    uint8_t next_target_node_ = 1U;
+    uint8_t next_position_node_ = 1U;
+    uint8_t next_temperature_node_ = 1U;
+    std::array<uint32_t, kActuatorNodeCount> last_node_tx_us_{};
+    std::array<bool, kActuatorNodeCount> node_transmitted_{};
+    bool query_pending_ = false;
+    CanDispatchAction pending_action_ = CanDispatchAction::None;
+    uint8_t pending_node_id_ = 0U;
+    uint32_t pending_since_us_ = 0U;
+    CanDispatchDiagnostics diagnostics_{};
 };
 
-// Tracks when all seven actuator nodes have accepted at least one CAN frame for
-// a host target sequence. Failed mailbox admissions remain pending and are
-// retried when that node's next slot arrives.
 class ActuatorApplicationTracker
 {
 public:
-    bool RecordTransmission(uint32_t sequence, uint8_t node_id, bool transmitted);
+    bool RecordTransmission(uint32_t sequence, uint8_t node_id,
+                            bool transmitted);
+    uint32_t TakeSupersededSequence();
     void Reset();
 
 private:
@@ -54,6 +152,7 @@ private:
     uint8_t transmitted_nodes_ = 0;
     bool sequence_active_ = false;
     bool completion_reported_ = false;
+    uint32_t superseded_sequence_ = 0;
 };
 
 } // namespace dummy::protocol

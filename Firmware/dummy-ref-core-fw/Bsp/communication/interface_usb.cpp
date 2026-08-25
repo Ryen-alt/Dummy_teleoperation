@@ -8,9 +8,11 @@
 #include "protocols/binary_control_bridge.hpp"
 #include "protocols/binary_protocol.hpp"
 #include "protocols/binary_state_bridge.hpp"
+#include "protocols/feedback_runtime.hpp"
 #include "protocols/monotonic_micros.hpp"
 #include "configurations/robot_config_generated.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 osThreadId_t usbServerTaskHandle;
@@ -116,13 +118,66 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v1.13");
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v2.1");
 dummy::protocol::FeedbackSafetyOutput binary_safety_telemetry{};
 dummy::protocol::MonotonicMicros32 binary_monotonic_micros;
 uint64_t binary_last_state_us = 0;
 uint32_t binary_state_sequence = 0;
 bool cdc_binary_frame_active = false;
 bool binary_state_stream_enabled = false;
+
+struct PendingProgress
+{
+    uint32_t sequence = 0;
+    uint32_t queued_sweep_id = 0;
+};
+
+std::array<dummy::protocol::ActionProgressRecord,
+           dummy::protocol::kActionProgressReplayCapacity> binary_progress{};
+std::array<PendingProgress, dummy::protocol::kActionProgressReplayCapacity>
+    binary_pending_progress{};
+size_t binary_progress_count = 0;
+size_t binary_progress_next = 0;
+std::array<dummy::protocol::ActionProgressPayload, 12> binary_progress_events{};
+size_t binary_progress_event_read = 0;
+size_t binary_progress_event_write = 0;
+uint32_t binary_incomplete_target_sequence = 0U;
+
+dummy::protocol::ActionProgressRecord& ProgressRecord(uint32_t sequence)
+{
+    for (auto& record : binary_progress)
+    {
+        if (record.action_sequence == sequence)
+            return record;
+    }
+    auto& record = binary_progress[binary_progress_next];
+    record = {};
+    record.action_sequence = sequence;
+    binary_pending_progress[binary_progress_next] = {};
+    binary_progress_next =
+        (binary_progress_next + 1U) % binary_progress.size();
+    if (binary_progress_count < binary_progress.size())
+        ++binary_progress_count;
+    return record;
+}
+
+void QueueProgressEvent(uint32_t sequence,
+                        dummy::protocol::ActionProgressStage stage,
+                        uint64_t now_us, uint32_t sweep_id)
+{
+    auto& event = binary_progress_events[
+        binary_progress_event_write % binary_progress_events.size()];
+    event = {};
+    event.action_sequence = sequence;
+    event.stage = static_cast<uint8_t>(stage);
+    event.stage_time_us = now_us;
+    event.feedback_sweep_id = sweep_id;
+    ++binary_progress_event_write;
+    if (binary_progress_event_write - binary_progress_event_read >
+        binary_progress_events.size())
+        binary_progress_event_read =
+            binary_progress_event_write - binary_progress_events.size();
+}
 
 uint64_t BinaryMonotonicMicros()
 {
@@ -142,6 +197,19 @@ uint64_t BinaryControlMonotonicMicros()
     return now_us;
 }
 
+void ResetBinaryActionProgress()
+{
+    taskENTER_CRITICAL();
+    binary_progress.fill({});
+    binary_pending_progress.fill({});
+    binary_progress_count = 0U;
+    binary_progress_next = 0U;
+    binary_progress_event_read = 0U;
+    binary_progress_event_write = 0U;
+    binary_incomplete_target_sequence = 0U;
+    taskEXIT_CRITICAL();
+}
+
 BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us)
 {
     BinaryControlSnapshot snapshot{};
@@ -159,10 +227,103 @@ BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us)
     return snapshot;
 }
 
-void MarkBinaryTargetApplied(uint32_t sequence)
+void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
+                                      uint32_t coherent_sweep_id)
 {
     taskENTER_CRITICAL();
-    binary_session.MarkTargetApplied(sequence);
+    auto& record = ProgressRecord(sequence);
+    record.flags |= kActionProgressCanQueuedExact;
+    record.can_queued_time_low_us = static_cast<uint32_t>(now_us);
+    const size_t index = static_cast<size_t>(&record - binary_progress.data());
+    binary_pending_progress[index] = {sequence, coherent_sweep_id};
+    QueueProgressEvent(
+        sequence, ActionProgressStage::CanQueuedExact, now_us,
+        coherent_sweep_id);
+    if (binary_incomplete_target_sequence == sequence)
+        binary_incomplete_target_sequence = 0U;
+    taskEXIT_CRITICAL();
+}
+
+void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us)
+{
+    if (sequence == 0U)
+        return;
+    taskENTER_CRITICAL();
+    const uint32_t previous = binary_incomplete_target_sequence;
+    if (previous != 0U && previous != sequence)
+    {
+        auto& record = ProgressRecord(previous);
+        if ((record.flags & kActionProgressSuperseded) == 0U)
+        {
+            record.flags |= kActionProgressSuperseded;
+            record.can_queued_time_low_us = static_cast<uint32_t>(now_us);
+            const size_t index = static_cast<size_t>(
+                &record - binary_progress.data());
+            binary_pending_progress[index] = {};
+            QueueProgressEvent(
+                previous, ActionProgressStage::Superseded, now_us, 0U);
+        }
+    }
+    bool already_exact = false;
+    for (const auto& record : binary_progress)
+    {
+        if (record.action_sequence == sequence &&
+            (record.flags & kActionProgressCanQueuedExact) != 0U)
+        {
+            already_exact = true;
+            break;
+        }
+    }
+    binary_incomplete_target_sequence = already_exact ? 0U : sequence;
+    taskEXIT_CRITICAL();
+}
+
+void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us)
+{
+    if (sequence == 0U)
+        return;
+    taskENTER_CRITICAL();
+    auto& record = ProgressRecord(sequence);
+    const bool first_report =
+        (record.flags & kActionProgressSuperseded) == 0U;
+    record.flags |= kActionProgressSuperseded;
+    record.can_queued_time_low_us = static_cast<uint32_t>(now_us);
+    const size_t index = static_cast<size_t>(&record - binary_progress.data());
+    binary_pending_progress[index] = {};
+    if (first_report)
+        QueueProgressEvent(
+            sequence, ActionProgressStage::Superseded, now_us, 0U);
+    if (binary_incomplete_target_sequence == sequence)
+        binary_incomplete_target_sequence = 0U;
+    taskEXIT_CRITICAL();
+}
+
+void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us)
+{
+    if (coherent_sweep_id == 0U)
+        return;
+    taskENTER_CRITICAL();
+    for (size_t index = 0; index < binary_pending_progress.size(); ++index)
+    {
+        const auto pending = binary_pending_progress[index];
+        if (pending.sequence == 0U ||
+            coherent_sweep_id <= pending.queued_sweep_id)
+            continue;
+        auto& record = binary_progress[index];
+        if (record.action_sequence != pending.sequence ||
+            (record.flags & kActionProgressSuperseded) != 0U)
+        {
+            binary_pending_progress[index] = {};
+            continue;
+        }
+        record.flags |= kActionProgressPostCommandFeedback;
+        record.post_feedback_time_low_us = static_cast<uint32_t>(now_us);
+        record.feedback_sweep_id = coherent_sweep_id;
+        QueueProgressEvent(
+            pending.sequence, ActionProgressStage::PostCommandFeedback,
+            now_us, coherent_sweep_id);
+        binary_pending_progress[index] = {};
+    }
     taskEXIT_CRITICAL();
 }
 
@@ -170,6 +331,9 @@ void ApplyBinarySafetyOutcome(const FeedbackSafetyOutput& safety)
 {
     taskENTER_CRITICAL();
     binary_safety_telemetry = safety;
+    binary_session.SetControlReady(
+        safety.arm_position_valid && safety.gripper_position_valid &&
+        ReadCanFeedbackReady());
     if (safety.fault_bits != 0)
         binary_session.SetFault(safety.fault_bits);
     else if (safety.hold_reason_bits != 0)
@@ -198,13 +362,40 @@ bool BinaryControlLeaseActive()
 namespace
 {
 
-void SendBinaryPacket(dummy::protocol::Packet& packet, uint64_t now_us)
+bool SendBinaryPacket(dummy::protocol::Packet& packet, uint64_t now_us)
 {
     std::array<uint8_t, 600> encoded{};
     packet.header.sender_time_us = now_us;
     const size_t length = dummy::protocol::EncodePacket(packet, encoded.data(), encoded.size());
-    if (length != 0)
-        usb_stream_output.process_bytes(encoded.data(), length, nullptr);
+    return length != 0 &&
+        usb_stream_output.process_bytes(encoded.data(), length, nullptr) == 0;
+}
+
+void MaybeSendBinaryProgressEvent(uint64_t now_us)
+{
+    if (!binary_state_stream_enabled)
+        return;
+    dummy::protocol::ActionProgressPayload progress{};
+    bool available = false;
+    taskENTER_CRITICAL();
+    if (binary_progress_event_read != binary_progress_event_write)
+    {
+        progress = binary_progress_events[
+            binary_progress_event_read % binary_progress_events.size()];
+        ++binary_progress_event_read;
+        available = true;
+    }
+    taskEXIT_CRITICAL();
+    if (!available)
+        return;
+    dummy::protocol::Packet packet{};
+    packet.header.message_type = static_cast<uint8_t>(
+        dummy::protocol::MessageType::Event);
+    packet.header.session_id = binary_session.telemetry_session_id();
+    packet.header.sequence = ++binary_state_sequence;
+    packet.header.payload_length = sizeof(progress);
+    std::memcpy(packet.payload.data(), &progress, sizeof(progress));
+    SendBinaryPacket(packet, now_us);
 }
 
 void ProcessBinaryBytes(const uint8_t* data, size_t length, uint64_t now_us)
@@ -217,6 +408,16 @@ void ProcessBinaryBytes(const uint8_t* data, size_t length, uint64_t now_us)
         taskENTER_CRITICAL();
         auto result = binary_session.Process(request, now_us);
         taskEXIT_CRITICAL();
+        if (request.header.message_type == static_cast<uint8_t>(
+                dummy::protocol::MessageType::Hello) &&
+            binary_session.hello_valid() &&
+            binary_session.telemetry_session_id() == request.header.session_id)
+        {
+            dummy::protocol::ResetBinaryActionProgress();
+        }
+        if (result.target_updated)
+            dummy::protocol::RecordBinaryTargetAccepted(
+                request.header.sequence, now_us);
         SendBinaryPacket(result.response, now_us);
     }
     binary_state_stream_enabled = binary_session.hello_valid();
@@ -232,10 +433,53 @@ void MaybeSendBinaryState(uint64_t now_us)
     const auto safety = dummy::protocol::ReadBinarySafetyTelemetry();
     const auto measurement = dummy::protocol::ReadRobotStateForBinaryProtocol(
         now_us, safety);
+    const uint32_t now_low = static_cast<uint32_t>(now_us);
+    std::array<uint64_t, dummy::protocol::kActuatorNodeCount>
+        feedback_sample_mcu_us{};
+    uint64_t sweep_first_us = 0U;
+    uint64_t sweep_last_us = 0U;
+    for (size_t index = 0; index < dummy::protocol::kActuatorNodeCount; ++index)
+    {
+        if (measurement.position_sweep_id[index] == 0U)
+            continue;
+        const uint32_t age_us = now_low - measurement.position_sample_us[index];
+        feedback_sample_mcu_us[index] = now_us - age_us;
+        const uint64_t sample_us = feedback_sample_mcu_us[index];
+        sweep_first_us = sweep_first_us == 0U
+            ? sample_us : std::min(sweep_first_us, sample_us);
+        sweep_last_us = std::max(sweep_last_us, sample_us);
+    }
     taskENTER_CRITICAL();
-    const auto state = binary_session.MakeState(
+    auto state = binary_session.MakeState(
         measurement.position, measurement.velocity, measurement.validity,
         now_us, safety);
+    taskEXIT_CRITICAL();
+    state.can_transport_status = dummy::protocol::ReadCanRuntimeStatus();
+    state.coherent_sweep_id = measurement.coherent_sweep_id;
+    state.feedback_max_skew_us = measurement.max_skew_us;
+    state.coherent_reference_mcu_us = sweep_first_us == 0U
+        ? 0U : sweep_first_us + (sweep_last_us - sweep_first_us) / 2U;
+    state.state_flags = measurement.repeated
+        ? dummy::protocol::kStateRepeated : 0U;
+    for (size_t index = 0; index < dummy::protocol::kActuatorNodeCount; ++index)
+    {
+        if (measurement.position_sweep_id[index] == 0U)
+        {
+            state.feedback_sample_mcu_us[index] = 0U;
+            state.feedback_sweep_id[index] = 0U;
+            continue;
+        }
+        state.feedback_sample_mcu_us[index] = feedback_sample_mcu_us[index];
+        state.feedback_sweep_id[index] = measurement.position_sweep_id[index];
+    }
+    taskENTER_CRITICAL();
+    state.action_progress_count = static_cast<uint8_t>(binary_progress_count);
+    state.action_progress_head = 0U;
+    const size_t oldest = binary_progress_count < binary_progress.size()
+        ? 0U : binary_progress_next;
+    for (size_t index = 0; index < binary_progress_count; ++index)
+        state.action_progress[index] = binary_progress[
+            (oldest + index) % binary_progress.size()];
     taskEXIT_CRITICAL();
     dummy::protocol::Packet packet{};
     packet.header.message_type = static_cast<uint8_t>(dummy::protocol::MessageType::State);
@@ -329,7 +573,10 @@ static void UsbServerTask(void *ctx)
                 USBD_CDC_ReceivePacket(&hUsbDeviceFS, ODrive_interface.out_ep);  // Allow next packet
             }
         }
-        MaybeSendBinaryState(dummy::protocol::BinaryControlMonotonicMicros());
+        const uint64_t binary_now_us =
+            dummy::protocol::BinaryControlMonotonicMicros();
+        MaybeSendBinaryProgressEvent(binary_now_us);
+        MaybeSendBinaryState(binary_now_us);
     }
 }
 

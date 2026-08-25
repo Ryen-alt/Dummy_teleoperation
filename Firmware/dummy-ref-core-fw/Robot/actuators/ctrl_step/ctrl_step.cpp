@@ -51,6 +51,23 @@ void CtrlStepMotor::SetEnable(bool _enable)
     CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
 
+
+bool CtrlStepMotor::TrySetEnable(bool _enable)
+{
+    uint8_t mode = 0x01;
+    CAN_TxHeaderTypeDef request_header = txHeader;
+    request_header.StdId = nodeID << 7 | mode;
+    uint8_t request_data[8] = {};
+    const uint32_t value = _enable ? 1U : 0U;
+    memcpy(request_data, &value, sizeof(value));
+
+    const bool queued = CanTrySendMessage(
+        get_can_ctx(hcan), request_data, &request_header) == CanTxStatus::Queued;
+    if (queued)
+        state = _enable ? FINISH : STOP;
+    return queued;
+}
+
 void CtrlStepMotor::SetEnableTemp(bool _enable)
 {
     uint8_t mode = 0x7d;
@@ -108,11 +125,12 @@ void CtrlStepMotor::SetVelocitySetPoint(float _val)
 
 void CtrlStepMotor::SetPositionSetPoint(float _val)
 {
-    (void) SendPositionSetPoint(_val, true);
+    (void) SendPositionSetPoint(_val, true, false);
 }
 
 
-bool CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack)
+bool CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack,
+                                         bool non_blocking)
 {
     uint8_t mode = 0x05;
     txHeader.StdId = nodeID << 7 | mode;
@@ -126,17 +144,21 @@ bool CtrlStepMotor::SendPositionSetPoint(float _val, bool request_ack)
     canBuf[6] = 0U;
     canBuf[7] = 0U;
 
+    if (non_blocking)
+        return CanTrySendMessage(get_can_ctx(hcan), canBuf, &txHeader) ==
+            CanTxStatus::Queued;
     return CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
 
 
 void CtrlStepMotor::SetPositionWithVelocityLimit(float _pos, float _vel)
 {
-    (void) SendPositionWithVelocityLimit(_pos, _vel);
+    (void) SendPositionWithVelocityLimit(_pos, _vel, false);
 }
 
 
-bool CtrlStepMotor::SendPositionWithVelocityLimit(float _pos, float _vel)
+bool CtrlStepMotor::SendPositionWithVelocityLimit(float _pos, float _vel,
+                                                   bool non_blocking)
 {
     uint8_t mode = 0x07;
     txHeader.StdId = nodeID << 7 | mode;
@@ -149,6 +171,9 @@ bool CtrlStepMotor::SendPositionWithVelocityLimit(float _pos, float _vel)
     for (int i = 4; i < 8; i++)
         canBuf[i] = *(b + i - 4);
 
+    if (non_blocking)
+        return CanTrySendMessage(get_can_ctx(hcan), canBuf, &txHeader) ==
+            CanTxStatus::Queued;
     return CanSendMessage(get_can_ctx(hcan), canBuf, &txHeader);
 }
 
@@ -273,6 +298,19 @@ float CtrlStepMotor::GetTemp()
     return temperature;
 }
 
+
+bool CtrlStepMotor::TryGetTemp()
+{
+    constexpr uint8_t mode = 0x25;
+    CAN_TxHeaderTypeDef request_header = txHeader;
+    request_header.StdId = nodeID << 7 | mode;
+    uint8_t request_data[8] = {};
+
+    return CanTrySendMessage(get_can_ctx(hcan), request_data, &request_header,
+                             RecordTemperatureRequest, &nodeID) ==
+        CanTxStatus::Queued;
+}
+
 void CtrlStepMotor::EraseConfigs()
 {
     uint8_t mode = 0x7e;
@@ -294,7 +332,7 @@ bool CtrlStepMotor::SetStreamingAngle(float _angle)
 {
     _angle = inverseDirection ? -_angle : _angle;
     const float stepMotorCnt = _angle / 360.0f * (float) reduction;
-    return SendPositionSetPoint(stepMotorCnt, false);
+    return SendPositionSetPoint(stepMotorCnt, false, true);
 }
 
 
@@ -310,7 +348,7 @@ bool CtrlStepMotor::SetStreamingAngleWithVelocityLimit(float _angle, float _vel)
 {
     _angle = inverseDirection ? -_angle : _angle;
     const float stepMotorCnt = _angle / 360.0f * (float) reduction;
-    return SendPositionWithVelocityLimit(stepMotorCnt, _vel);
+    return SendPositionWithVelocityLimit(stepMotorCnt, _vel, true);
 }
 
 
@@ -323,6 +361,19 @@ void CtrlStepMotor::UpdateAngle()
 
     CanSendMessage(get_can_ctx(hcan), request_data, &request_header,
                    RecordPositionRequest, &nodeID);
+}
+
+
+bool CtrlStepMotor::TryUpdateAngle()
+{
+    constexpr uint8_t mode = 0x23;
+    CAN_TxHeaderTypeDef request_header = txHeader;
+    request_header.StdId = nodeID << 7 | mode;
+    uint8_t request_data[8] = {};
+
+    return CanTrySendMessage(get_can_ctx(hcan), request_data, &request_header,
+                             RecordPositionRequest, &nodeID) ==
+        CanTxStatus::Queued;
 }
 
 
