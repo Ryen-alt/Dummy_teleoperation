@@ -714,6 +714,15 @@ class JointVelocityIntegrator:
         self._target = None if state is None else state.position.astype(np.float32, copy=True)
         self._last_time_ns = now_ns
 
+    def advance_without_motion(self, now_ns: int) -> None:
+        """Advance only the timing anchor while transport applies backpressure."""
+
+        if now_ns < 0 or (
+            self._last_time_ns is not None and now_ns < self._last_time_ns
+        ):
+            raise TeleopError("cannot move joint timing anchor backwards")
+        self._last_time_ns = now_ns
+
     def step(self, command: TeleopCommand, state: RobotState, now_ns: int) -> np.ndarray:
         if not command.connected or not command.deadman or command.hold_requested or command.estop_requested:
             raise TeleopError("cannot integrate a command without an active dead-man")

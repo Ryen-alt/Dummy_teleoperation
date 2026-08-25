@@ -108,7 +108,7 @@ class _InputWorker:
 
 
 class _LeaseCoordinator:
-    """Own blocking mode changes and periodic lease heartbeats off control."""
+    """Own blocking lease traffic and control-bound target refreshes off control."""
 
     def __init__(
         self,
@@ -125,6 +125,9 @@ class _LeaseCoordinator:
         self.acquired = False
         self.error: BaseException | None = None
         self.stop = False
+        self._refresh_generation = 0
+        self._refresh_served_generation = 0
+        self._refresh_request: tuple[int, int, int] | None = None
         self.thread = Thread(target=self._run, name="dummy-lease-heartbeat", daemon=True)
 
     def start(self) -> None:
@@ -135,7 +138,34 @@ class _LeaseCoordinator:
             raise ValueError("invalid lease state")
         with self.condition:
             self.desired = desired
+            if desired != "teleop":
+                self._refresh_request = None
             self.condition.notify_all()
+
+    def request_target_refresh(self, action_sequence: int, control_tick_ns: int) -> None:
+        """Request one refresh backed by a recent control-thread tick.
+
+        The request is replaceable and never repeats autonomously. If control
+        stops ticking, only the independent lease remains alive; the motion
+        target still expires and the firmware enters HOLD.
+        """
+
+        if not 0 < action_sequence <= 0xFFFFFFFF or control_tick_ns < 0:
+            raise ValueError("invalid target refresh request")
+        with self.condition:
+            if self.desired != "teleop":
+                return
+            self._refresh_generation += 1
+            self._refresh_request = (
+                self._refresh_generation,
+                action_sequence,
+                control_tick_ns,
+            )
+            self.condition.notify_all()
+
+    def cancel_target_refresh(self) -> None:
+        with self.condition:
+            self._refresh_request = None
 
     def snapshot(self) -> tuple[bool, BaseException | None]:
         with self.condition:
@@ -153,6 +183,15 @@ class _LeaseCoordinator:
 
     def _run(self) -> None:
         heartbeat_s = max(0.02, self.robot.config.lease_timeout_ms / 3000.0)
+        heartbeat_ns = int(heartbeat_s * 1e9)
+        refresh_health_ns = max(
+            1,
+            min(
+                self.robot.config.target_ttl_ms * 1_000_000 // 2,
+                int(1e9 / self.robot.config.control_rate_hz),
+            ),
+        )
+        next_heartbeat_ns = 0
         try:
             while True:
                 with self.condition:
@@ -160,6 +199,7 @@ class _LeaseCoordinator:
                         return
                     desired = self.desired
                     acquired = self.acquired
+                    refresh_request = self._refresh_request
                 if desired == "estop":
                     self.robot.emergency_stop()
                     with self.condition:
@@ -176,6 +216,7 @@ class _LeaseCoordinator:
                         self.acquired = True
                         still_desired = self.desired
                         self.condition.notify_all()
+                    next_heartbeat_ns = self.clock_ns() + heartbeat_ns
                     self.event_callback(
                         "deadman_acquired",
                         self.clock_ns(),
@@ -192,9 +233,47 @@ class _LeaseCoordinator:
                     self.event_callback("control_released", self.clock_ns(), {})
                     continue
                 elif desired == "teleop" and acquired:
-                    self.robot.heartbeat()
+                    if (
+                        refresh_request is not None
+                        and refresh_request[0] != self._refresh_served_generation
+                    ):
+                        generation, action_sequence, control_tick_ns = refresh_request
+                        age_ns = self.clock_ns() - control_tick_ns
+                        if 0 <= age_ns <= refresh_health_ns:
+                            self.robot.refresh_target(action_sequence)
+                        else:
+                            self.event_callback(
+                                "stale_target_refresh_dropped",
+                                self.clock_ns(),
+                                {
+                                    "action_sequence": action_sequence,
+                                    "control_tick_age_ns": age_ns,
+                                    "health_limit_ns": refresh_health_ns,
+                                },
+                            )
+                        with self.condition:
+                            self._refresh_served_generation = generation
+                            if (
+                                self._refresh_request is not None
+                                and self._refresh_request[0] == generation
+                            ):
+                                self._refresh_request = None
+                        continue
+                    now_ns = self.clock_ns()
+                    if now_ns >= next_heartbeat_ns:
+                        self.robot.heartbeat()
+                        next_heartbeat_ns = self.clock_ns() + heartbeat_ns
                 with self.condition:
-                    self.condition.wait(heartbeat_s)
+                    wait_s = heartbeat_s
+                    if desired == "teleop" and acquired:
+                        wait_s = max(
+                            0.001,
+                            min(
+                                heartbeat_s,
+                                (next_heartbeat_ns - self.clock_ns()) / 1e9,
+                            ),
+                        )
+                    self.condition.wait(wait_s)
         except BaseException as exc:
             with self.condition:
                 self.error = exc
@@ -338,6 +417,7 @@ def run_teleop_collection(
     action_stages: dict[int, set[ActionStage]] = {}
     action_stage_lock = Lock()
     episode_last_sequence: int | None = None
+    latest_action_sequence: int | None = None
     episode_finalize_deadline_ns: int | None = None
     actions_sent = 0
     hold_transitions = 0
@@ -355,6 +435,7 @@ def run_teleop_collection(
     ik_soft_overruns = 0
     coherent_sweep_skips = 0
     ik_hard_timeouts = 0
+    idle_input_timeout_active = False
     runtime_error: BaseException | None = None
 
     def runtime_event(name: str, when_ns: int, payload: dict[str, object]) -> None:
@@ -503,6 +584,8 @@ def run_teleop_collection(
             nonlocal last_fresh_sweep_ns, cartesian_reanchors, ik_soft_overruns
             nonlocal coherent_sweep_skips, ik_hard_timeouts
             nonlocal episode_last_sequence, episode_finalize_deadline_ns
+            nonlocal latest_action_sequence
+            nonlocal idle_input_timeout_active
             now_ns = scheduled.actual_start_ns
             if deadline_ns is not None and now_ns >= deadline_ns:
                 stop.set()
@@ -555,6 +638,7 @@ def run_teleop_collection(
                 fail_active_episode("action_lifecycle_failed", now_ns)
                 record_control_sample(command, final_state, scheduled, valid=False, invalid_reason=reason)
                 action_failure.clear()
+                latest_action_sequence = None
                 return
 
             if command.teleop_mode != teleop_mode:
@@ -573,12 +657,19 @@ def run_teleop_collection(
             age_ms = (now_ns - command.monotonic_ns) / 1e6
             if age_ms < 0 or age_ms > profile.input_timeout_ms:
                 lease.request("hold")
-                fail_active_episode("input_timeout", now_ns)
-                recorder.record_event(
-                    "input_timeout",
-                    monotonic_ns=now_ns,
-                    payload={"input_age_ms": age_ms},
-                )
+                active_control = acquired or control_had_lease or command.deadman
+                if active_control or age_ms < 0:
+                    fail_active_episode("input_timeout", now_ns)
+                if not idle_input_timeout_active or active_control or age_ms < 0:
+                    recorder.record_event(
+                        "input_timeout",
+                        monotonic_ns=now_ns,
+                        payload={
+                            "input_age_ms": age_ms,
+                            "active_control": active_control,
+                        },
+                    )
+                idle_input_timeout_active = True
                 record_control_sample(
                     command,
                     final_state,
@@ -586,7 +677,16 @@ def run_teleop_collection(
                     valid=False,
                     invalid_reason=f"input command stale: {age_ms:.1f} ms",
                 )
-                raise TeleopError(f"input command is stale ({age_ms:.1f} ms)")
+                if active_control or age_ms < 0:
+                    raise TeleopError(f"input command is stale ({age_ms:.1f} ms)")
+                return
+            if idle_input_timeout_active:
+                recorder.record_event(
+                    "input_recovered",
+                    monotonic_ns=now_ns,
+                    payload={"input_age_ms": age_ms},
+                )
+                idle_input_timeout_active = False
 
             if bool(command.raw.get("input_sync_lost", False)):
                 lease.request("hold")
@@ -753,6 +853,8 @@ def run_teleop_collection(
                     ActionStage.CAN_QUEUED_EXACT,
                     ActionStage.POST_COMMAND_FEEDBACK,
                 }
+                if ActionStage.ACKNOWLEDGED in completed_stages:
+                    lease.request_target_refresh(episode_last_sequence, now_ns)
                 if required_stages.issubset(completed_stages):
                     accepted = episode_manager.finish(
                         EpisodeStatus.ACCEPTED,
@@ -779,6 +881,7 @@ def run_teleop_collection(
                     episode_events += 1
                     episode_last_sequence = None
                     episode_finalize_deadline_ns = None
+                    latest_action_sequence = None
                     record_control_sample(command, final_state, scheduled)
                     return
                 if now_ns >= episode_finalize_deadline_ns:
@@ -828,6 +931,7 @@ def run_teleop_collection(
                 if control_had_lease:
                     integrator.reset()
                     control_had_lease = False
+                    latest_action_sequence = None
                     hold_transitions += 1
                     hold_event = (
                         "operator_hold"
@@ -867,6 +971,7 @@ def run_teleop_collection(
                     return
                 integrator.reset(final_state, now_ns=now_ns)
                 control_had_lease = True
+                latest_action_sequence = None
                 last_fresh_sweep_ns = now_ns if teleop_mode == "cartesian" else None
                 record_control_sample(command, final_state, scheduled)
                 return
@@ -896,6 +1001,15 @@ def run_teleop_collection(
                     command = replace(command, raw=raw)
                     last_command = command
                     integrator.advance_without_motion(now_ns)
+                    if latest_action_sequence is not None:
+                        with action_stage_lock:
+                            refresh_stages = set(
+                                action_stages.get(latest_action_sequence, set())
+                            )
+                        if ActionStage.ACKNOWLEDGED in refresh_stages:
+                            lease.request_target_refresh(
+                                latest_action_sequence, now_ns
+                            )
                     if stall_ns >= robot.config.target_ttl_ms * 1_000_000:
                         hold_latched = True
                         lease.request("hold")
@@ -925,6 +1039,42 @@ def run_teleop_collection(
                         scheduled,
                         valid=False,
                         invalid_reason=reason_code,
+                    )
+                    return
+
+            # One motion sequence owns the CAN target fan-out until all seven
+            # node transmissions are confirmed. Producing another latest-value
+            # target before that exact watermark would intentionally supersede
+            # data, so apply backpressure at the control boundary instead.
+            if latest_action_sequence is not None:
+                with action_stage_lock:
+                    pending_stages = set(
+                        action_stages.get(latest_action_sequence, set())
+                    )
+                if ActionStage.CAN_QUEUED_EXACT not in pending_stages:
+                    if ActionStage.ACKNOWLEDGED in pending_stages:
+                        lease.request_target_refresh(latest_action_sequence, now_ns)
+                    integrator.advance_without_motion(now_ns)
+                    if teleop_mode == "cartesian":
+                        last_fresh_sweep_ns = now_ns
+                    raw = dict(command.raw)
+                    raw["target_dispatch"] = {
+                        "status": "waiting_for_can_queued_exact",
+                        "action_sequence": latest_action_sequence,
+                        "observed_stages": sorted(
+                            stage.value for stage in pending_stages
+                        ),
+                    }
+                    command = replace(command, raw=raw)
+                    last_command = command
+                    record_control_sample(
+                        command,
+                        final_state,
+                        scheduled,
+                        valid=False,
+                        invalid_reason=(
+                            "previous action is still completing exact seven-node CAN fan-out"
+                        ),
                     )
                     return
 
@@ -974,6 +1124,7 @@ def run_teleop_collection(
                 )
                 return
             target_generated_ns = clock_ns()
+            lease.cancel_target_refresh()
             try:
                 action = robot.enqueue_absolute_action(
                     requested,
@@ -1040,6 +1191,7 @@ def run_teleop_collection(
                 last_fresh_sweep_ns = now_ns
             send_enqueued_ns = clock_ns()
             actions_sent += 1
+            latest_action_sequence = action.sequence
             if episode_manager.snapshot.status is EpisodeStatus.RECORDING:
                 episode_last_sequence = action.sequence
             record_control_sample(

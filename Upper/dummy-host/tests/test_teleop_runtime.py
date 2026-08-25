@@ -83,6 +83,15 @@ class FrozenTimestampKeyboard(ScriptedKeyboard):
         return self.command
 
 
+class FrozenIdleTimestampKeyboard(FrozenTimestampKeyboard):
+    def poll(self, now_ns: int | None = None) -> TeleopCommand:
+        assert now_ns is not None
+        self.polls += 1
+        if self.command is None:
+            self.command = self.mapper.map(set(), now_ns)
+        return self.command
+
+
 class AdvancingClock:
     def __init__(self, *, step_ns: int = 50_000_000) -> None:
         self.value = 0
@@ -92,6 +101,50 @@ class AdvancingClock:
         current = self.value
         self.value += self.step_ns
         return current
+
+
+class DelayedExactFanoutTransport(FakeMcuTransport):
+    """Hide exact fan-out progress long enough to require target refreshes."""
+
+    def __init__(self, config: RobotConfig) -> None:
+        super().__init__(config)
+        self.hidden_sequence: int | None = None
+        self.hidden_states_remaining = 0
+        self.target_keepalives = 0
+        self.lease_heartbeats = 0
+        self.target_overlap = False
+
+    def send(self, packet) -> None:
+        if packet.message_type is MessageType.SET_JOINT_TARGET:
+            if self.hidden_sequence is not None:
+                self.target_overlap = True
+            self.hidden_sequence = packet.sequence
+            self.hidden_states_remaining = 3
+        elif packet.message_type is MessageType.TARGET_KEEPALIVE:
+            self.target_keepalives += 1
+        elif packet.message_type is MessageType.HEARTBEAT:
+            self.lease_heartbeats += 1
+        super().send(packet)
+
+    def _emit_state(self, sequence: int) -> None:
+        hidden = self.hidden_sequence
+        if hidden is not None and self.hidden_states_remaining > 0:
+            saved_progress = self._progress
+            saved_applied = self._last_applied
+            self._progress = [
+                record for record in saved_progress if record.sequence != hidden
+            ]
+            self._last_applied = 0
+            try:
+                super()._emit_state(sequence)
+            finally:
+                self._progress = saved_progress
+                self._last_applied = saved_applied
+                self.hidden_states_remaining -= 1
+            return
+        super()._emit_state(sequence)
+        if hidden is not None:
+            self.hidden_sequence = None
 
 
 def test_keyboard_fake_mcu_collection_closes_in_hold(
@@ -136,6 +189,43 @@ def test_keyboard_fake_mcu_collection_closes_in_hold(
     assert lifecycle[1] >= 1
     assert source.closed
     assert not robot.is_connected
+
+
+def test_runtime_refreshes_target_and_waits_for_exact_fanout(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = ScriptedKeyboard(KeyboardMapper(profile))
+    transport = DelayedExactFanoutTransport(config)
+    robot = DummyRobot(config, transport)
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_delayed_exact",
+    )
+
+    result = run_teleop_collection(
+        robot,
+        source,
+        recorder,
+        profile,
+        duration_s=0.7,
+    )
+    recorder.close()
+
+    assert result.actions_sent >= 1
+    assert transport.target_keepalives >= 1
+    assert transport.lease_heartbeats <= 5
+    assert not transport.target_overlap
+    with sqlite3.connect(recorder.db_path) as connection:
+        superseded = connection.execute(
+            "SELECT COUNT(*) FROM action_lifecycle WHERE terminal_stage = 'superseded'"
+        ).fetchone()
+    assert superseded == (0,)
 
 
 def test_idle_fake_mcu_collection_keeps_state_fresh(
@@ -249,6 +339,44 @@ def test_frozen_input_timestamp_deterministically_holds_after_150_ms(
     assert source.closed
     assert not robot.is_connected
     assert '"event":"input_timeout"' in recorder.events_path.read_text(encoding="utf-8")
+
+
+def test_frozen_idle_input_is_invalid_but_does_not_abort_collection(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = FrozenIdleTimestampKeyboard(KeyboardMapper(profile))
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_frozen_idle_input",
+    )
+
+    result = run_teleop_collection(
+        robot,
+        source,
+        recorder,
+        profile,
+        duration_s=1.0,
+        clock_ns=AdvancingClock(),
+    )
+    recorder.close()
+
+    assert result.actions_sent == 0
+    assert result.final_mode == "HOLD"
+    events = recorder.events_path.read_text(encoding="utf-8")
+    assert events.count('"event":"input_timeout"') == 1
+    with sqlite3.connect(recorder.db_path) as connection:
+        invalid = connection.execute(
+            "SELECT COUNT(*) FROM samples WHERE sample_valid = 0 "
+            "AND invalid_reason LIKE 'input command stale:%'"
+        ).fetchone()
+    assert invalid is not None and invalid[0] >= 1
 
 
 def test_episode_success_waits_for_exact_final_action_watermarks(
