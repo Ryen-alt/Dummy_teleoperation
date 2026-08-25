@@ -1,0 +1,281 @@
+{
+  "benchmark_version": 1,
+  "created_utc": "2026-08-25T04:04:08.784588+00:00",
+  "host": "Linux-6.8.0-110-generic-x86_64-with-glibc2.35",
+  "python": "3.13.13",
+  "samples": 300,
+  "random_seed": 20260825,
+  "stress_fraction": 0.2,
+  "stress_samples": 65,
+  "soft_budget_ms": 12.0,
+  "hard_budget_ms": 20.0,
+  "hard_timeout_processing_target_ms": 25.0,
+  "hard_timeout_processing_target_met": true,
+  "successes": 235,
+  "failures": 65,
+  "timeouts": 65,
+  "all_solves": {
+    "p50_ms": 6.6636945,
+    "p95_ms": 20.367010450000002,
+    "p99_ms": 20.443449769999997,
+    "max_ms": 20.492632
+  },
+  "successful_solves": {
+    "p50_ms": 6.636965,
+    "p95_ms": 9.9345555,
+    "p99_ms": 10.01142694,
+    "max_ms": 11.677247
+  },
+  "failure_tail": [
+    {
+      "sample_index": 61,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.492632,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 212,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.450218,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 168,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.445803,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 18,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.443426,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 53,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.43634,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 165,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.429024,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 229,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.417632,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 166,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.415514,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 145,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.409954,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 41,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.407599,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 171,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.405756,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 286,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.395513,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 260,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.379334,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_1",
+      "iterations": 6
+    },
+    {
+      "sample_index": 135,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.372731,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_1",
+      "iterations": 6
+    },
+    {
+      "sample_index": 259,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.37023,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 56,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.366841,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 213,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.363729,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 261,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.359817,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 42,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.356849,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    },
+    {
+      "sample_index": 172,
+      "scenario": "independent_seed_stress",
+      "solve_duration_ms": 20.353449,
+      "failure_reason": "solve_budget_exceeded",
+      "timed_out": true,
+      "timeout_stage": "jacobian_column_0",
+      "iterations": 6
+    }
+  ],
+  "kinematics": {
+    "urdf": "/home/jin/Downloads/Dummy_data_collect/Dummy_URDF/dummy.urdf",
+    "base_link": "base_link",
+    "tip_link": "tool0",
+    "joint_names": [
+      "joint_1",
+      "joint_2",
+      "joint_3",
+      "joint_4",
+      "joint_5",
+      "joint_6"
+    ],
+    "chain": [
+      "joint_1",
+      "joint_2",
+      "joint_3",
+      "joint_4",
+      "joint_5",
+      "joint_6",
+      "tool0_fixed"
+    ],
+    "tool0_parent": "hand_base",
+    "tool0_identity": true,
+    "urdf_tip_link": "tool0",
+    "urdf_hash": "50e17c547b031fda9a96d0bbee0abada547407b384377489eb7acbe25171a507",
+    "model_hash": "111523262f80ae8cb9dc7e2b43ae2220d560b83405380cebe34e0a8b60db9a14",
+    "cartesian_calibration_hash": null,
+    "tool0_T_tip": [
+      [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "identity_tip": true,
+    "solver": "dummy_urdf_damped_least_squares",
+    "solver_version": "1",
+    "joint_limit_margin_rad": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "position_tolerance_m": 0.0003,
+    "orientation_tolerance_rad": 0.003,
+    "max_solution_step_rad": 0.12
+  },
+  "robot_config_hash": "8dd76dc8e39c730f798b36052aebfd15a0debae527f97eb1ff179ee03b96aac1",
+  "teleop_config_hash": "f807798cd85545e29b370224f39afb0bab2b7e30a3614b7ccef9332794248670"
+}

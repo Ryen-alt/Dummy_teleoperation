@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from dummy_host.schema import ControlMode, RobotConfig, RobotState
 from dummy_host.teleop import (
     GamepadMapper,
+    ControlTimingError,
     JointVelocityIntegrator,
     KeyboardMapper,
     load_teleop_profile,
@@ -34,7 +37,6 @@ def _state(config: RobotConfig, now_ns: int) -> RobotState:
         velocity_valid=True,
         gripper_valid=True,
         last_received_sequence=0,
-        last_applied_sequence=0,
         target_age_ms=0,
         config_hash=config.config_hash,
     )
@@ -88,12 +90,35 @@ def test_joint_velocity_integrator_accelerates_and_stays_bounded(config: RobotCo
     assert np.all(target[:6] <= config.joint_limit_max_rad)
 
 
+def test_joint_integrator_uses_real_jitter_and_rejects_over_budget_dt(
+    config: RobotConfig,
+) -> None:
+    profile = _profile()
+    mapper = KeyboardMapper(profile)
+    state = _state(config, 1_000_000_000)
+    integrator = JointVelocityIntegrator(profile, config)
+    integrator.reset(state, now_ns=1_000_000_000)
+    jittered_ns = 1_070_000_000
+    jittered = integrator.step(
+        mapper.map({"KEY_SPACE", "KEY_Q"}, jittered_ns), state, jittered_ns
+    )
+    assert jittered[0] > state.position[0]
+    with pytest.raises(ControlTimingError, match="exceeds"):
+        integrator.step(
+            mapper.map({"KEY_SPACE", "KEY_Q"}, 1_150_000_000),
+            state,
+            1_150_000_000,
+        )
+
+
 def test_real_bringup_mask_blocks_unapproved_joints_and_gripper() -> None:
     profile = _profile()
     mapper = KeyboardMapper(profile)
     command = mapper.map({"KEY_SPACE", "KEY_Q", "KEY_W", "KEY_L"}, 1_000)
+    command = replace(command, event_ns=900)
     masked = mask_teleop_command(command, allowed_joints={2}, allow_gripper=False)
     assert masked.joint_velocity_rad_s[0] == 0
     assert masked.joint_velocity_rad_s[1] != 0
     assert masked.gripper_velocity_per_s == 0
+    assert masked.event_ns == 900
     assert masked.raw["allowed_joints"] == [2]

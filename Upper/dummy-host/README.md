@@ -2,12 +2,12 @@
 
 这是当前工作区的第一版安全闭环。范围是配置与固件代码生成、二进制协议、
 USB CDC 串口、`DummyRobot`、动作安全过滤、20 Hz 调度、单关节 bring-up，
-键盘/手柄遥操作采集、按逻辑角色管理的多相机同步、Raw Session v2 和离线数据集导出契约。
+键盘/手柄遥操作采集、按逻辑角色管理的多相机同步、Raw Session v4 和离线数据集导出契约。
 训练与推理运行时没有接入；LeRobot v3 依赖被隔离在相邻的 `lerobot-robot-dummy` 包。
 
 ## 安全状态
 
-`configs/robot_config.yaml` 版本 4 以 URDF 关节角为上位机和二进制协议的统一坐标，
+`configs/robot_config.yaml` 版本 7 以 URDF 关节角为上位机和二进制协议的统一坐标，
 并在 MCU 协议边界映射到旧固件坐标。方向、零点、减速比、限位和夹爪映射已经由
 `dummy_v2_001-arm-gripper-20260821-v2` 标定基线冻结。真实控制仍要求上位机与固件
 配置哈希完全一致，并同时满足控制租约、dead-man、TTL 和状态有效性门禁。
@@ -118,9 +118,56 @@ dummy-host-teleop-collect \
   --session-root sessions/offline
 ```
 
+末端位姿逆解遥操作使用显式并行模式；Xbox/兼容手柄输出 `base_link` 下的末端速度，
+上位机积分为标定 TCP 目标并通过 URDF IK 生成关节候选，随后仍走相同的安全网关和
+`SET_JOINT_TARGET`。普通手柄摇杆、扳机和十字键即可，不要求陀螺仪：
+
+```bash
+dummy-host-teleop-collect \
+  --config configs/robot_config.yaml \
+  --input-config configs/teleop_inputs.yaml \
+  --source gamepad --mode cartesian --device auto \
+  --simulate --urdf ../../Dummy_URDF/dummy.urdf --duration 60 \
+  --session-root sessions/offline
+```
+
+`--simulate` 不提供标定时使用 engineering-only 的 `tool0` identity。真实 Cartesian
+入口必须额外提供 `--cartesian-calibration`，并显式放行 1～6 轴；校准文件必须通过
+robot ID、URDF hash、TCP 和 Cartesian-ready pose 门禁。仓库示例
+`configs/cartesian_calibration.example.yaml` 为 `validated: false`，因此不会解锁真机：
+
+```bash
+dummy-host-teleop-collect \
+  --config configs/robot_config.yaml \
+  --input-config configs/teleop_inputs.yaml \
+  --source gamepad --mode cartesian --device auto \
+  --execute --port /dev/ttyACM0 \
+  --urdf ../../Dummy_URDF/dummy.urdf \
+  --cartesian-calibration /path/to/site-validated-cartesian.yaml \
+  --allow-joint 1 --allow-joint 2 --allow-joint 3 \
+  --allow-joint 4 --allow-joint 5 --allow-joint 6 \
+  --session-root sessions/real
+```
+
+连接后必须连续三个 coherent sweep 落入标定的 ready tolerance，才会进入首次控制权
+获取。校准原件、hash、ready pose、TCP 变换和实际 base/tip frame 会归档到 Raw
+Session。设计、轴映射、已知初始位形奇异风险和验收门禁见根目录
+`06_末端位姿逆解遥操作与现有关节遥操作并行对齐设计.md`。
+
+IK 延迟基准（保存 P50/P95/P99、硬超时阶段和失败尾部）：
+
+```bash
+dummy-host-cartesian-ik-benchmark \
+  --config configs/robot_config.yaml \
+  --input-config configs/teleop_inputs.yaml \
+  --urdf ../../Dummy_URDF/dummy.urdf \
+  --samples 300 --stress-fraction 0.2 \
+  --output logs/cartesian_ik_benchmark_phase1.json
+```
+
 每次运行生成独立目录，包含：
 
-- `manifest.json`：机器人/输入配置哈希、固件版本、来源和放行轴；
+- `manifest.json`：机器人/输入配置哈希、固件版本、来源、放行轴和 Cartesian 标定身份；
 - `samples.sqlite`：WAL 模式下的原始输入、requested/applied action、机器人状态和序号；
 - `events.jsonl`：dead-man、HOLD、ESTOP、Episode 和错误事件；
 - `frames/<camera-role>/`：每个已启用逻辑相机角色的分段原始彩色/深度 NPZ；
@@ -129,7 +176,8 @@ dummy-host-teleop-collect \
 记录队列是有界的；写盘跟不上时程序报错并进入 HOLD，不会静默丢弃动作样本。
 启用 `--with-cameras --require-camera` 后，必需相机缺帧或同步超限同样会停止采集并进入 HOLD。
 完成后使用 `dummy-host-session-check --session /path/to/session_dir` 实际复算校验和、
-运行 SQLite 完整性检查并汇总 sent/received/applied 序号。
+运行 SQLite 完整性检查并汇总 received/ACK/CAN_QUEUED_EXACT/
+POST_COMMAND_FEEDBACK 序号。
 进一步的自动 QA 会统计采样频率、调度间隔、Episode 结果、故障/裁剪样本、每个相机
 角色的帧号缺口、捕获延迟和同步偏差，并生成不依赖 GUI 的 HTML 轨迹报告：
 
@@ -139,7 +187,7 @@ dummy-host-session-qa --session /path/to/session_dir \
   --html-output /tmp/session_qa.html
 ```
 
-Raw Session v2 也可通过 `ReplayCamera` 走相同的 Camera/CameraManager 接口。回放 rig
+Raw Session v2/v3/v4 也可通过 `ReplayCamera` 走相同的 Camera/CameraManager 接口。回放 rig
 将 `driver` 设为 `replay`，`device_serial` 填 clean session 目录，并保持角色、分辨率和
 `calibration_version` 与源记录一致；回放时间戳会重基到当前单调时钟，因此过期帧和
 同步门禁仍然生效。

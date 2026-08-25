@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from threading import Lock
+from types import SimpleNamespace
 
 import yaml
 import pytest
@@ -19,6 +21,45 @@ from dummy_host.teleop import GamepadMapper, TeleopConfigError, load_teleop_prof
 
 def _profile():
     return load_teleop_profile(Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml")
+
+
+def test_evdev_background_reader_uses_kernel_time_and_marks_syn_dropped() -> None:
+    ecodes = SimpleNamespace(
+        EV_SYN=0,
+        EV_KEY=1,
+        EV_ABS=3,
+        SYN_REPORT=0,
+        SYN_DROPPED=3,
+    )
+    events = (
+        SimpleNamespace(type=1, code=30, value=1, sec=1, usec=10),
+        SimpleNamespace(type=0, code=0, value=0, sec=1, usec=20),
+        SimpleNamespace(type=0, code=3, value=0, sec=1, usec=30),
+    )
+
+    class Device:
+        def read_loop(self):
+            return iter(events)
+
+        def active_keys(self):
+            return [31]
+
+    device = _EvdevDevice.__new__(_EvdevDevice)
+    device.device = Device()
+    device.ecodes = ecodes
+    device._closed = False
+    device._lock = Lock()
+    device._active_keys = set()
+    device._axis_values = {}
+    device._last_event_ns = 0
+    device._sync_lost = False
+    device.last_error = None
+
+    device._event_loop()
+
+    assert device._active_keys == {31}
+    assert device.event_metadata() == (1_000_030_000, True)
+    assert device.event_metadata() == (1_000_030_000, False)
 
 
 def test_flydigi_evdev_protocol_decodes_to_stable_logical_controls() -> None:

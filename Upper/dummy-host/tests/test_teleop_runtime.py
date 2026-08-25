@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 import numpy as np
 import pytest
 
+from dummy_host.domain import EpisodeManager, EpisodeStatus
 from dummy_host.fake_mcu import FakeMcuTransport
-from dummy_host.recording import SessionRecorder
+from dummy_host.protocol import MessageType
+from dummy_host.recording import RecorderBackpressure, SessionRecorder
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import RobotConfig
 from dummy_host.teleop import KeyboardMapper, TeleopCommand, TeleopError, load_teleop_profile
@@ -22,7 +25,7 @@ class ScriptedKeyboard:
     def poll(self, now_ns: int | None = None) -> TeleopCommand:
         assert now_ns is not None
         self.polls += 1
-        if 2 <= self.polls <= 4:
+        if 2 <= self.polls <= 9:
             keys = {"KEY_SPACE", "KEY_Q"}
             if self.polls == 2:
                 keys.add("KEY_F5")
@@ -39,6 +42,20 @@ class IdleKeyboard(ScriptedKeyboard):
         assert now_ns is not None
         self.polls += 1
         return self.mapper.map(set(), now_ns)
+
+
+class SuccessfulEpisodeKeyboard(ScriptedKeyboard):
+    def poll(self, now_ns: int | None = None) -> TeleopCommand:
+        assert now_ns is not None
+        self.polls += 1
+        keys: set[str] = set()
+        if 2 <= self.polls <= 10:
+            keys = {"KEY_SPACE", "KEY_Q"}
+        if self.polls == 2:
+            keys.add("KEY_F5")
+        if self.polls == 9:
+            keys.add("KEY_F6")
+        return self.mapper.map(keys, now_ns)
 
 
 class FrozenTimestampKeyboard(ScriptedKeyboard):
@@ -83,17 +100,28 @@ def test_keyboard_fake_mcu_collection_closes_in_hold(
         source,
         recorder,
         profile,
-        duration_s=0.31,
+        duration_s=0.56,
     )
     recorder_stats = recorder.close()
-    # Poll 2 performs the synchronous control acquisition and rebases timing;
-    # only polls 3 and 4 may become motion actions.
-    assert result.actions_sent == 2
+    # WAIT_FEEDBACK_READY and ACQUIRE run on the lease thread; the 20 Hz
+    # control thread remains responsive and only emits targets afterwards.
+    assert result.actions_sent >= 1
     assert result.hold_transitions >= 1
     assert result.episode_events == 1
     assert result.final_mode == "HOLD"
-    assert result.final_applied_sequence == result.final_received_sequence
+    assert (
+        result.final_post_command_feedback_sequence
+        == result.final_received_sequence
+    )
     assert recorder_stats.samples >= 4
+    with sqlite3.connect(recorder.db_path) as connection:
+        lifecycle = connection.execute(
+            "SELECT COUNT(*), COUNT(post_command_feedback_host_ns) "
+            "FROM action_lifecycle"
+        ).fetchone()
+    assert lifecycle is not None
+    assert lifecycle[0] >= 1
+    assert lifecycle[1] >= 1
     assert source.closed
     assert not robot.is_connected
 
@@ -177,3 +205,141 @@ def test_frozen_input_timestamp_deterministically_holds_after_150_ms(
     assert source.closed
     assert not robot.is_connected
     assert '"event":"input_timeout"' in recorder.events_path.read_text(encoding="utf-8")
+
+
+def test_episode_success_waits_for_exact_final_action_watermarks(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = SuccessfulEpisodeKeyboard(KeyboardMapper(profile))
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_finalize_success",
+    )
+
+    result = run_teleop_collection(
+        robot,
+        source,
+        recorder,
+        profile,
+        duration_s=0.8,
+    )
+    recorder.close()
+
+    events = recorder.events_path.read_text(encoding="utf-8")
+    assert '"event":"episode_finalizing"' in events
+    assert '"event":"episode_success"' in events
+    assert events.index('"event":"episode_finalizing"') < events.index(
+        '"event":"episode_success"'
+    )
+    assert result.episode_events >= 3
+
+
+def test_recorder_backpressure_holds_and_fails_active_episode(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    class AuditedFakeMcu(FakeMcuTransport):
+        def __init__(self, robot_config: RobotConfig) -> None:
+            super().__init__(robot_config)
+            self.sent_types: list[MessageType] = []
+
+        def send(self, packet) -> None:
+            self.sent_types.append(packet.message_type)
+            super().send(packet)
+
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = ScriptedKeyboard(KeyboardMapper(profile))
+    transport = AuditedFakeMcu(config)
+    robot = DummyRobot(config, transport)
+    episodes = EpisodeManager(id_factory=lambda: "backpressure-episode")
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_runtime_backpressure",
+    )
+    real_record_sample = recorder.record_sample
+    calls = 0
+
+    def fail_after_episode_starts(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 6:
+            raise RecorderBackpressure("injected recorder saturation")
+        return real_record_sample(*args, **kwargs)
+
+    recorder.record_sample = fail_after_episode_starts  # type: ignore[method-assign]
+    with pytest.raises(RecorderBackpressure, match="injected recorder saturation"):
+        run_teleop_collection(
+            robot,
+            source,
+            recorder,
+            profile,
+            duration_s=2.0,
+            episode_manager=episodes,
+        )
+    recorder.close(clean_shutdown=False)
+
+    assert episodes.snapshot.status is EpisodeStatus.FAILED
+    assert "runtime_error" in (episodes.snapshot.failure_reason or "")
+    assert MessageType.HOLD in transport.sent_types
+    events = recorder.events_path.read_text(encoding="utf-8")
+    assert '"event":"episode_failure"' in events
+    assert '"event":"episode_cancel"' not in events
+
+
+def test_episode_finalizing_times_out_without_post_command_feedback(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    class ExactCanWithoutPostFeedback(FakeMcuTransport):
+        def _emit_state(self, sequence: int) -> None:
+            applied = self._last_applied
+            self._last_applied = 0
+            try:
+                super()._emit_state(sequence)
+            finally:
+                self._last_applied = applied
+
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = SuccessfulEpisodeKeyboard(KeyboardMapper(profile))
+    robot = DummyRobot(
+        config,
+        ExactCanWithoutPostFeedback(config),
+        action_observation_timeout_s=1.0,
+    )
+    episodes = EpisodeManager(id_factory=lambda: "finalize-timeout-episode")
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_finalize_timeout",
+    )
+
+    run_teleop_collection(
+        robot,
+        source,
+        recorder,
+        profile,
+        duration_s=1.0,
+        episode_manager=episodes,
+    )
+    recorder.close()
+
+    assert episodes.snapshot.status is EpisodeStatus.FAILED
+    assert episodes.snapshot.failure_reason == "episode_action_completion_timeout"
+    events = recorder.events_path.read_text(encoding="utf-8")
+    assert '"event":"episode_finalizing"' in events
+    assert '"event":"episode_finalize_timeout"' in events
+    assert '"event":"episode_success"' not in events
