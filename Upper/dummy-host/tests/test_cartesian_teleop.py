@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from dummy_host.calibration.geometry import rotation_vector
 from dummy_host.cartesian_teleop import (
     CartesianGamepadMapper,
     CartesianPoseIntegrator,
@@ -480,6 +481,37 @@ def test_real_urdf_solver_checks_the_hard_deadline_inside_solve(
     assert result.timeout_stage is not None
     assert result.solve_duration_ns >= 20_000_000
     json.dumps(result.as_dict(), allow_nan=False)
+
+
+def test_geometric_jacobian_matches_central_difference(config: RobotConfig) -> None:
+    profile = _profile()
+    tool0_T_tip = np.eye(4, dtype=np.float64)
+    tool0_T_tip[:3, 3] = [0.04, -0.02, 0.08]
+    backend = _kinematics(
+        config,
+        profile,
+        tool0_T_tip=tool0_T_tip,
+        tip_frame="test_tcp",
+    )
+    joints = np.asarray([0.32, 1.02, -1.05, 0.43, 0.24, 0.54])
+    pose = backend.forward(joints)
+    analytic = backend._jacobian(joints, pose, None)
+    numeric = np.empty((6, 6), dtype=np.float64)
+    delta = 1e-6
+    for index in range(6):
+        lower = joints.copy()
+        upper = joints.copy()
+        lower[index] -= delta
+        upper[index] += delta
+        lower_pose = backend.forward(lower)
+        upper_pose = backend.forward(upper)
+        numeric[:3, index] = (
+            upper_pose.position_m - lower_pose.position_m
+        ) / (2.0 * delta)
+        numeric[3:, index] = rotation_vector(
+            upper_pose.rotation @ lower_pose.rotation.T
+        ) / (2.0 * delta)
+    np.testing.assert_allclose(analytic, numeric, atol=2e-6, rtol=2e-5)
 
 
 class _ScriptedCartesianGamepad:

@@ -34,7 +34,7 @@ class DummyUrdfKinematics:
     """
 
     SOLVER = "dummy_urdf_damped_least_squares"
-    SOLVER_VERSION = "1"
+    SOLVER_VERSION = "2"
 
     def __init__(
         self,
@@ -180,20 +180,54 @@ class DummyUrdfKinematics:
         pose: CartesianPose,
         deadline_ns: int | None,
     ) -> np.ndarray:
-        jacobian = np.empty((6, 6), dtype=np.float64)
-        for index in range(6):
-            self._check_budget(deadline_ns, f"jacobian_column_{index}")
-            perturbed = joints.copy()
-            delta = self.finite_difference_rad
-            if perturbed[index] + delta > self.upper[index]:
-                delta = -delta
-            perturbed[index] += delta
-            sample = self.forward(perturbed)
-            jacobian[:3, index] = (sample.position_m - pose.position_m) / delta
-            jacobian[3:, index] = rotation_vector(
-                sample.rotation @ pose.rotation.T
-            ) / delta
+        del pose
+        self._check_budget(deadline_ns, "analytic_jacobian_start")
+        try:
+            _, jacobian = self._urdf.base_T_tip_with_jacobian(
+                joints,
+                self.tool0_T_tip,
+                check_limits=False,
+            )
+        except UrdfError as exc:
+            raise KinematicsError(str(exc)) from exc
+        self._check_budget(deadline_ns, "analytic_jacobian_complete")
         return jacobian
+
+    def _forward_with_jacobian(
+        self,
+        joints: np.ndarray,
+        deadline_ns: int | None,
+    ) -> tuple[CartesianPose, np.ndarray]:
+        self._check_budget(deadline_ns, "analytic_fk_jacobian_start")
+        try:
+            transform, jacobian = self._urdf.base_T_tip_with_jacobian(
+                joints,
+                self.tool0_T_tip,
+                check_limits=False,
+            )
+        except UrdfError as exc:
+            raise KinematicsError(str(exc)) from exc
+        self._check_budget(deadline_ns, "analytic_fk_jacobian_complete")
+        return (
+            CartesianPose(
+                transform[:3, 3],
+                transform[:3, :3],
+                base_frame=self.base_link,
+                tip_frame=self.tip_link,
+            ),
+            jacobian,
+        )
+
+    def _minimum_singular_value(
+        self,
+        jacobian: np.ndarray,
+        deadline_ns: int | None,
+        stage: str,
+    ) -> float:
+        self._check_budget(deadline_ns, f"{stage}_start")
+        value = float(np.linalg.svd(jacobian, compute_uv=False)[-1])
+        self._check_budget(deadline_ns, f"{stage}_complete")
+        return value
 
     def _solve_seed(
         self,
@@ -209,7 +243,7 @@ class DummyUrdfKinematics:
         try:
             for iteration in range(self.max_iterations + 1):
                 self._check_budget(deadline_ns, f"iteration_{iteration}_fk")
-                pose = self.forward(joints)
+                pose, jacobian = self._forward_with_jacobian(joints, deadline_ns)
                 translation, position_error, orientation_error = self._pose_error(
                     target, pose
                 )
@@ -217,9 +251,10 @@ class DummyUrdfKinematics:
                     position_error <= self.position_tolerance_m
                     and orientation_error <= self.orientation_tolerance_rad
                 ):
-                    jacobian = self._jacobian(joints, pose, deadline_ns)
-                    minimum_singular = float(
-                        np.linalg.svd(jacobian, compute_uv=False)[-1]
+                    minimum_singular = self._minimum_singular_value(
+                        jacobian,
+                        deadline_ns,
+                        f"iteration_{iteration}_singular_values",
                     )
                     return (
                         joints,
@@ -229,9 +264,12 @@ class DummyUrdfKinematics:
                         iteration,
                     )
                 if iteration == self.max_iterations:
+                    minimum_singular = self._minimum_singular_value(
+                        jacobian,
+                        deadline_ns,
+                        "unconverged_singular_values",
+                    )
                     break
-                jacobian = self._jacobian(joints, pose, deadline_ns)
-                minimum_singular = float(np.linalg.svd(jacobian, compute_uv=False)[-1])
                 weighted_jacobian = jacobian.copy()
                 weighted_jacobian[:3] /= self.translation_scale_m
                 error = np.concatenate(
@@ -245,6 +283,11 @@ class DummyUrdfKinematics:
                 try:
                     step = weighted_jacobian.T @ np.linalg.solve(normal, error)
                 except np.linalg.LinAlgError:
+                    minimum_singular = self._minimum_singular_value(
+                        jacobian,
+                        deadline_ns,
+                        "linear_solve_failure_singular_values",
+                    )
                     return (
                         None,
                         position_error,
@@ -254,6 +297,11 @@ class DummyUrdfKinematics:
                     )
                 step_norm = float(np.linalg.norm(step))
                 if not math.isfinite(step_norm):
+                    minimum_singular = self._minimum_singular_value(
+                        jacobian,
+                        deadline_ns,
+                        "nonfinite_step_singular_values",
+                    )
                     return (
                         None,
                         position_error,
@@ -265,6 +313,11 @@ class DummyUrdfKinematics:
                     step *= self.max_solver_step_rad / step_norm
                 updated = np.clip(joints + step, self.lower, self.upper)
                 if np.allclose(updated, joints, atol=1e-12):
+                    minimum_singular = self._minimum_singular_value(
+                        jacobian,
+                        deadline_ns,
+                        "stalled_step_singular_values",
+                    )
                     return (
                         None,
                         position_error,

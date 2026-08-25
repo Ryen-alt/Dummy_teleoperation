@@ -192,6 +192,81 @@ class UrdfKinematics:
             result = result @ joint.transform(position_by_name.get(joint.name, 0.0))
         return result
 
+    def base_T_tip_with_jacobian(
+        self,
+        positions_rad: np.ndarray | Mapping[str, float],
+        tool0_T_tip: np.ndarray | None = None,
+        *,
+        check_limits: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return FK and the exact geometric Jacobian in one chain traversal.
+
+        Jacobian rows are base-frame linear velocity followed by base-frame
+        angular velocity.  The translational component is evaluated at the
+        requested tip origin, so calibrated tool offsets are handled without
+        finite differencing six additional FK evaluations.
+        """
+
+        if isinstance(positions_rad, Mapping):
+            try:
+                values = np.asarray(
+                    [positions_rad[joint.name] for joint in self.movable_joints],
+                    dtype=np.float64,
+                )
+            except KeyError as exc:
+                raise UrdfError(f"missing joint position for {exc.args[0]!r}") from exc
+        else:
+            values = np.asarray(positions_rad, dtype=np.float64)
+        if check_limits:
+            values = self.validate_positions(values)
+        elif values.shape != (len(self.movable_joints),) or not np.isfinite(values).all():
+            raise UrdfError(
+                f"joint positions must be {len(self.movable_joints)} finite radians"
+            )
+        tip_offset = (
+            np.eye(4, dtype=np.float64)
+            if tool0_T_tip is None
+            else np.asarray(tool0_T_tip, dtype=np.float64)
+        )
+        if tip_offset.shape != (4, 4) or not np.isfinite(tip_offset).all():
+            raise UrdfError("tool0_T_tip must be a finite 4x4 transform")
+
+        position_by_name = dict(zip(self.joint_names, values, strict=True))
+        result = np.eye(4, dtype=np.float64)
+        origins: list[np.ndarray] = []
+        axes: list[np.ndarray] = []
+        joint_types: list[str] = []
+        for joint in self.chain:
+            origin = make_transform(rpy_rotation(joint.origin_rpy), joint.origin_xyz)
+            joint_frame = result @ origin
+            if joint.joint_type != "fixed":
+                origins.append(joint_frame[:3, 3].copy())
+                axes.append((joint_frame[:3, :3] @ joint.axis).copy())
+                joint_types.append(joint.joint_type)
+                position = position_by_name[joint.name]
+                if joint.joint_type in {"revolute", "continuous"}:
+                    motion = make_transform(axis_angle_rotation(joint.axis, position))
+                elif joint.joint_type == "prismatic":
+                    motion = make_transform(translation=joint.axis * position)
+                else:
+                    raise UrdfError(f"unsupported joint type {joint.joint_type!r}")
+                result = joint_frame @ motion
+            else:
+                result = joint_frame
+
+        base_T_tip = result @ tip_offset
+        tip_position = base_T_tip[:3, 3]
+        jacobian = np.zeros((6, len(origins)), dtype=np.float64)
+        for index, (origin, axis, joint_type) in enumerate(
+            zip(origins, axes, joint_types, strict=True)
+        ):
+            if joint_type in {"revolute", "continuous"}:
+                jacobian[:3, index] = np.cross(axis, tip_position - origin)
+                jacobian[3:, index] = axis
+            else:
+                jacobian[:3, index] = axis
+        return base_T_tip, jacobian
+
     def describe(self) -> dict[str, object]:
         return {
             "urdf": str(self.path.resolve()),
