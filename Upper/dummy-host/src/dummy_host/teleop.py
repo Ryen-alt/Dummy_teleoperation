@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -27,6 +27,27 @@ class TeleopError(RuntimeError):
     pass
 
 
+class ControlTimingError(TeleopError):
+    def __init__(self, measured_dt_s: float, budget_s: float) -> None:
+        super().__init__(
+            f"control interval {measured_dt_s * 1000:.1f} ms exceeds "
+            f"{budget_s * 1000:.1f} ms budget"
+        )
+        self.measured_dt_s = measured_dt_s
+        self.budget_s = budget_s
+
+
+def integration_substeps(measured_dt_s: float, nominal_period_s: float) -> tuple[float, ...]:
+    """Integrate the real interval without hiding jitter by clipping dt."""
+
+    budget_s = nominal_period_s * 1.5
+    if measured_dt_s <= 0 or measured_dt_s > budget_s:
+        raise ControlTimingError(measured_dt_s, budget_s)
+    count = max(1, math.ceil(measured_dt_s / nominal_period_s))
+    step = measured_dt_s / count
+    return (step,) * count
+
+
 EPISODE_EVENTS = ("start", "success", "failure", "cancel")
 
 
@@ -35,6 +56,51 @@ class GamepadAxisBinding:
     axis: str
     joint: int
     invert: bool
+
+
+@dataclass(frozen=True)
+class CartesianAxisBinding:
+    axis: str
+    component: int
+    invert: bool
+    unipolar: bool
+
+
+@dataclass(frozen=True)
+class CartesianTeleopProfile:
+    linear_speed_m_s: np.ndarray
+    angular_speed_rad_s: np.ndarray
+    linear_acceleration_m_s2: np.ndarray
+    angular_acceleration_rad_s2: np.ndarray
+    workspace_min_m: np.ndarray
+    workspace_max_m: np.ndarray
+    min_base_radius_m: float
+    joint_limit_margin_rad: float
+    position_tolerance_m: float
+    orientation_tolerance_rad: float
+    max_iterations: int
+    damping: float
+    finite_difference_rad: float
+    max_solver_step_rad: float
+    max_solution_step_rad: float
+    translation_scale_m: float
+    soft_budget_ms: float
+    hard_budget_ms: float
+    axes: tuple[CartesianAxisBinding, ...]
+
+    @property
+    def speed(self) -> np.ndarray:
+        return np.concatenate((self.linear_speed_m_s, self.angular_speed_rad_s))
+
+    @property
+    def acceleration(self) -> np.ndarray:
+        return np.concatenate(
+            (self.linear_acceleration_m_s2, self.angular_acceleration_rad_s2)
+        )
+
+    @property
+    def axis_names(self) -> frozenset[str]:
+        return frozenset(binding.axis for binding in self.axes)
 
 
 @dataclass(frozen=True)
@@ -72,6 +138,7 @@ class TeleopProfile:
     input_timeout_ms: int
     keyboard: KeyboardMapping
     gamepad: GamepadMapping
+    cartesian: CartesianTeleopProfile | None
     config_hash: str
 
 
@@ -87,14 +154,30 @@ class TeleopCommand:
     episode_event: str | None
     connected: bool
     raw: Mapping[str, object]
+    teleop_mode: str = "joint"
+    cartesian_twist: np.ndarray = field(
+        default_factory=lambda: np.zeros(6, dtype=np.float32)
+    )
+    event_ns: int | None = None
 
     def __post_init__(self) -> None:
         velocity = np.asarray(self.joint_velocity_rad_s)
+        twist = np.asarray(self.cartesian_twist)
         if velocity.dtype != np.float32 or velocity.shape != (6,):
             raise TeleopError("joint_velocity_rad_s must be float32[6]")
-        if not np.isfinite(velocity).all() or not math.isfinite(self.gripper_velocity_per_s):
+        if twist.dtype != np.float32 or twist.shape != (6,):
+            raise TeleopError("cartesian_twist must be float32[6]")
+        if self.teleop_mode not in {"joint", "cartesian"}:
+            raise TeleopError("teleop_mode must be 'joint' or 'cartesian'")
+        if (
+            not np.isfinite(velocity).all()
+            or not np.isfinite(twist).all()
+            or not math.isfinite(self.gripper_velocity_per_s)
+        ):
             raise TeleopError("teleop velocity contains NaN or Inf")
-        if self.monotonic_ns < 0:
+        if self.monotonic_ns < 0 or (
+            self.event_ns is not None and self.event_ns < 0
+        ):
             raise TeleopError("monotonic_ns must be non-negative")
         if not self.source:
             raise TeleopError("teleop source must be non-empty")
@@ -102,7 +185,10 @@ class TeleopCommand:
             raise TeleopError(f"unknown episode event {self.episode_event}")
         copied = velocity.astype(np.float32, copy=True)
         copied.setflags(write=False)
+        copied_twist = twist.astype(np.float32, copy=True)
+        copied_twist.setflags(write=False)
         object.__setattr__(self, "joint_velocity_rad_s", copied)
+        object.__setattr__(self, "cartesian_twist", copied_twist)
 
 
 def _canonical_hash(raw: Mapping[str, Any]) -> str:
@@ -116,6 +202,139 @@ def _float_array(raw: Mapping[str, Any], key: str) -> np.ndarray:
         raise TeleopConfigError(f"{key} must contain six positive finite values")
     value.setflags(write=False)
     return value
+
+
+def _vector3(
+    raw: Mapping[str, Any],
+    key: str,
+    *,
+    positive: bool = False,
+) -> np.ndarray:
+    value = np.asarray(raw.get(key), dtype=np.float64)
+    if value.shape != (3,) or not np.isfinite(value).all():
+        raise TeleopConfigError(f"{key} must contain three finite values")
+    if positive and np.any(value <= 0):
+        raise TeleopConfigError(f"{key} must contain three positive values")
+    value.setflags(write=False)
+    return value
+
+
+_CARTESIAN_COMPONENTS = {
+    "vx": 0,
+    "vy": 1,
+    "vz": 2,
+    "wx": 3,
+    "wy": 4,
+    "wz": 5,
+}
+
+
+def _positive_float(raw: Mapping[str, Any], key: str, *, allow_zero: bool = False) -> float:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TeleopConfigError(f"{key} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or (result < 0 if allow_zero else result <= 0):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise TeleopConfigError(f"{key} must be finite and {qualifier}")
+    return result
+
+
+def _load_cartesian_profile(
+    raw: object,
+    *,
+    protocol: GamepadProtocolConfig,
+) -> CartesianTeleopProfile | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise TeleopConfigError("cartesian must be a mapping")
+    solver = raw.get("solver")
+    mapping = raw.get("mapping")
+    if not isinstance(solver, dict):
+        raise TeleopConfigError("cartesian.solver must be a mapping")
+    if not isinstance(mapping, dict):
+        raise TeleopConfigError("cartesian.mapping must be a mapping")
+
+    workspace_min = _vector3(raw, "workspace_min_m")
+    workspace_max = _vector3(raw, "workspace_max_m")
+    if np.any(workspace_min >= workspace_max):
+        raise TeleopConfigError("cartesian workspace_min_m must be below workspace_max_m")
+
+    axes_raw = mapping.get("axes")
+    if not isinstance(axes_raw, list) or not axes_raw:
+        raise TeleopConfigError("cartesian.mapping.axes must be a non-empty list")
+    bindings: list[CartesianAxisBinding] = []
+    for item in axes_raw:
+        if not isinstance(item, dict):
+            raise TeleopConfigError("each Cartesian axis binding must be a mapping")
+        axis = _required_key(item, "axis")
+        component_name = item.get("component")
+        if component_name not in _CARTESIAN_COMPONENTS:
+            raise TeleopConfigError(
+                "Cartesian axis component must be one of vx, vy, vz, wx, wy, wz"
+            )
+        invert = item.get("invert", False)
+        unipolar = item.get("unipolar", False)
+        if not isinstance(invert, bool) or not isinstance(unipolar, bool):
+            raise TeleopConfigError("Cartesian axis invert/unipolar must be boolean")
+        bindings.append(
+            CartesianAxisBinding(
+                axis=axis,
+                component=_CARTESIAN_COMPONENTS[str(component_name)],
+                invert=invert,
+                unipolar=unipolar,
+            )
+        )
+    if len({binding.axis for binding in bindings}) != len(bindings):
+        raise TeleopConfigError("Cartesian physical axis names must be unique")
+    if {binding.component for binding in bindings} != set(range(6)):
+        raise TeleopConfigError("Cartesian mapping must drive every twist component")
+    missing_axes = {binding.axis for binding in bindings} - set(protocol.axes)
+    if missing_axes:
+        raise TeleopConfigError(
+            f"Cartesian mapping references axes missing from protocol: {sorted(missing_axes)}"
+        )
+
+    max_iterations = solver.get("max_iterations")
+    if (
+        not isinstance(max_iterations, int)
+        or isinstance(max_iterations, bool)
+        or max_iterations <= 0
+    ):
+        raise TeleopConfigError("cartesian.solver.max_iterations must be a positive integer")
+    soft_budget_ms = _positive_float(solver, "soft_budget_ms")
+    hard_budget_ms = _positive_float(solver, "hard_budget_ms")
+    if hard_budget_ms <= soft_budget_ms:
+        raise TeleopConfigError(
+            "cartesian.solver.hard_budget_ms must be greater than soft_budget_ms"
+        )
+
+    return CartesianTeleopProfile(
+        linear_speed_m_s=_vector3(raw, "linear_speed_m_s", positive=True),
+        angular_speed_rad_s=_vector3(raw, "angular_speed_rad_s", positive=True),
+        linear_acceleration_m_s2=_vector3(
+            raw, "linear_acceleration_m_s2", positive=True
+        ),
+        angular_acceleration_rad_s2=_vector3(
+            raw, "angular_acceleration_rad_s2", positive=True
+        ),
+        workspace_min_m=workspace_min,
+        workspace_max_m=workspace_max,
+        min_base_radius_m=_positive_float(raw, "min_base_radius_m", allow_zero=True),
+        joint_limit_margin_rad=_positive_float(raw, "joint_limit_margin_rad", allow_zero=True),
+        position_tolerance_m=_positive_float(solver, "position_tolerance_m"),
+        orientation_tolerance_rad=_positive_float(solver, "orientation_tolerance_rad"),
+        max_iterations=max_iterations,
+        damping=_positive_float(solver, "damping"),
+        finite_difference_rad=_positive_float(solver, "finite_difference_rad"),
+        max_solver_step_rad=_positive_float(solver, "max_solver_step_rad"),
+        max_solution_step_rad=_positive_float(solver, "max_solution_step_rad"),
+        translation_scale_m=_positive_float(solver, "translation_scale_m"),
+        soft_budget_ms=soft_budget_ms,
+        hard_budget_ms=hard_budget_ms,
+        axes=tuple(bindings),
+    )
 
 
 def _required_key(mapping: Mapping[str, Any], key: str) -> str:
@@ -344,6 +563,8 @@ def load_teleop_profile(path: str | Path) -> TeleopProfile:
             f"axes={sorted(missing_axes)} buttons={sorted(missing_buttons)}"
         )
 
+    cartesian = _load_cartesian_profile(raw.get("cartesian"), protocol=protocol)
+
     return TeleopProfile(
         version=version,
         joint_speed_rad_s=joint_speed,
@@ -352,6 +573,7 @@ def load_teleop_profile(path: str | Path) -> TeleopProfile:
         input_timeout_ms=timeout_ms,
         keyboard=keyboard,
         gamepad=gamepad,
+        cartesian=cartesian,
         config_hash=_canonical_hash(raw),
     )
 
@@ -506,24 +728,15 @@ class JointVelocityIntegrator:
         period_s = 1.0 / self.config.control_rate_hz
         if self._target is None:
             self._target = state.position.astype(np.float32, copy=True)
-        if self._last_time_ns is None:
-            dt = period_s
-        else:
-            measured_dt = (now_ns - self._last_time_ns) / 1e9
-            if measured_dt <= 0 or measured_dt > self.profile.input_timeout_ms / 1000:
-                raise TeleopError("teleop control period is invalid or timed out")
-            dt = max(period_s * 0.5, min(period_s * 1.5, measured_dt))
+        measured_dt = period_s if self._last_time_ns is None else (
+            now_ns - self._last_time_ns
+        ) / 1e9
+        steps = integration_substeps(measured_dt, period_s)
 
         desired = np.clip(
             command.joint_velocity_rad_s,
             -self.profile.joint_speed_rad_s,
             self.profile.joint_speed_rad_s,
-        )
-        max_delta = self.profile.joint_acceleration_rad_s2 * dt
-        self._velocity = np.clip(desired, self._velocity - max_delta, self._velocity + max_delta)
-        self._target[:6] += self._velocity * dt
-        self._target[:6] = np.clip(
-            self._target[:6], self.config.joint_limit_min_rad, self.config.joint_limit_max_rad
         )
         gripper_velocity = float(
             np.clip(
@@ -532,12 +745,23 @@ class JointVelocityIntegrator:
                 self.profile.gripper_speed_per_s,
             )
         )
-        self._target[6] = np.float32(
-            np.clip(
-                self._target[6] + gripper_velocity * dt,
-                self.config.gripper_range[0],
-                self.config.gripper_range[1],
+        for dt in steps:
+            max_delta = self.profile.joint_acceleration_rad_s2 * dt
+            self._velocity = np.clip(
+                desired, self._velocity - max_delta, self._velocity + max_delta
             )
-        )
+            self._target[:6] += self._velocity * dt
+            self._target[:6] = np.clip(
+                self._target[:6],
+                self.config.joint_limit_min_rad,
+                self.config.joint_limit_max_rad,
+            )
+            self._target[6] = np.float32(
+                np.clip(
+                    self._target[6] + gripper_velocity * dt,
+                    self.config.gripper_range[0],
+                    self.config.gripper_range[1],
+                )
+            )
         self._last_time_ns = now_ns
         return self._target.astype(np.float32, copy=True)

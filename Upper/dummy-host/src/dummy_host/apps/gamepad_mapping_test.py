@@ -127,7 +127,6 @@ class VirtualMappingSession:
             velocity_valid=True,
             gripper_valid=True,
             last_received_sequence=0,
-            last_applied_sequence=0,
             target_age_ms=0,
             config_hash=self.config.config_hash,
         )

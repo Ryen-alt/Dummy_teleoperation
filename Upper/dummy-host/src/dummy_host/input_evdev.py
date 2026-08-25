@@ -3,14 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from .gamepad import ConfiguredGamepadProtocolAdapter, GamepadSource
+from .cartesian_teleop import CartesianGamepadMapper
 from .teleop import GamepadMapper, KeyboardMapper, TeleopCommand, TeleopError, TeleopProfile
 
 
@@ -87,6 +89,35 @@ class _EvdevDevice:
         self.path = path
         self.last_error: str | None = None
         self._closed = False
+        self._lock = threading.Lock()
+        self._active_keys: set[int] = set()
+        self._axis_values: dict[int, Any] = {}
+        self._last_event_ns = time.monotonic_ns()
+        self._sync_lost = False
+        monotonic_events = False
+        try:
+            self.device.set_clockid(time.CLOCK_MONOTONIC)
+            monotonic_events = True
+        except (AttributeError, OSError):
+            pass
+        try:
+            self._active_keys = set(int(code) for code in self.device.active_keys())
+        except (OSError, SystemError) as exc:
+            self.last_error = str(exc)
+        self._reader: threading.Thread | None = None
+        if callable(getattr(self.device, "read_loop", None)):
+            if not monotonic_events:
+                self.device.close()
+                self._closed = True
+                raise InputDeviceError(
+                    "evdev device cannot provide CLOCK_MONOTONIC event timestamps"
+                )
+            self._reader = threading.Thread(
+                target=self._event_loop,
+                name="dummy-evdev-events",
+                daemon=True,
+            )
+            self._reader.start()
 
     def resolve(self, name: str, *, expected_type: int) -> int:
         try:
@@ -99,21 +130,25 @@ class _EvdevDevice:
         return code
 
     def pressed(self, configured: dict[str, int]) -> set[str]:
-        # python-evdev normally raises OSError after an unplug, but some
-        # EVIOCGKEY ioctl failures surface as a bare SystemError instead.
-        try:
-            active = set(int(code) for code in self.device.active_keys())
-        except (OSError, SystemError) as exc:
-            self.last_error = str(exc)
-            raise InputDeviceError(f"input device disconnected: {exc}") from exc
+        with self._lock:
+            if self.last_error is not None:
+                raise InputDeviceError(f"input device disconnected: {self.last_error}")
+            active = set(self._active_keys)
         return {name for name, code in configured.items() if code in active}
 
     def axis(self, code: int) -> float:
-        try:
-            info = self.device.absinfo(code)
-        except (OSError, SystemError) as exc:
-            self.last_error = str(exc)
-            raise InputDeviceError(f"input device disconnected: {exc}") from exc
+        with self._lock:
+            if self.last_error is not None:
+                raise InputDeviceError(f"input device disconnected: {self.last_error}")
+            info = self._axis_values.get(code)
+        if info is None:
+            try:
+                info = self.device.absinfo(code)
+            except (OSError, SystemError) as exc:
+                self.last_error = str(exc)
+                raise InputDeviceError(f"input device disconnected: {exc}") from exc
+            with self._lock:
+                self._axis_values[code] = info
         minimum = float(info.min)
         maximum = float(info.max)
         if not all(math.isfinite(value) for value in (minimum, maximum, float(info.value))):
@@ -124,10 +159,64 @@ class _EvdevDevice:
         half_range = (maximum - minimum) * 0.5
         return max(-1.0, min(1.0, (float(info.value) - centre) / half_range))
 
+    def event_metadata(self) -> tuple[int, bool]:
+        with self._lock:
+            event_ns = self._last_event_ns
+            sync_lost = self._sync_lost
+            self._sync_lost = False
+        return event_ns, sync_lost
+
+    def _event_loop(self) -> None:
+        try:
+            for event in self.device.read_loop():
+                if self._closed:
+                    return
+                if hasattr(event, "sec") and hasattr(event, "usec"):
+                    event_ns = int(event.sec) * 1_000_000_000 + int(event.usec) * 1_000
+                else:
+                    event_ns = int(event.timestamp() * 1e9)
+                with self._lock:
+                    if event.type == self.ecodes.EV_KEY:
+                        if event.value:
+                            self._active_keys.add(int(event.code))
+                        else:
+                            self._active_keys.discard(int(event.code))
+                    elif event.type == self.ecodes.EV_ABS:
+                        current = self._axis_values.get(int(event.code))
+                        if current is None:
+                            current = self.device.absinfo(event.code)
+                        if hasattr(current, "_replace"):
+                            current = current._replace(value=event.value)
+                        else:
+                            current.value = event.value
+                        self._axis_values[int(event.code)] = current
+                    elif (
+                        event.type == self.ecodes.EV_SYN
+                        and event.code == self.ecodes.SYN_DROPPED
+                    ):
+                        self._sync_lost = True
+                        self._active_keys = set(
+                            int(code) for code in self.device.active_keys()
+                        )
+                        for code in tuple(self._axis_values):
+                            self._axis_values[code] = self.device.absinfo(code)
+                    if (
+                        event.type != self.ecodes.EV_SYN
+                        or event.code
+                        in {self.ecodes.SYN_REPORT, self.ecodes.SYN_DROPPED}
+                    ):
+                        self._last_event_ns = event_ns
+        except (OSError, SystemError) as exc:
+            if not self._closed:
+                with self._lock:
+                    self.last_error = str(exc)
+
     def close(self) -> None:
         if not self._closed:
-            self.device.close()
             self._closed = True
+            self.device.close()
+            if self._reader is not None:
+                self._reader.join(timeout=1.0)
 
 
 class EvdevKeyboardSource:
@@ -157,7 +246,16 @@ class EvdevKeyboardSource:
     def poll(self, now_ns: int | None = None) -> TeleopCommand:
         now_ns = time.monotonic_ns() if now_ns is None else now_ns
         try:
-            return self._mapper.map(self._device.pressed(self._keys), now_ns)
+            metadata = getattr(self._device, "event_metadata", None)
+            event_ns, sync_lost = (
+                metadata() if callable(metadata) else (now_ns, False)
+            )
+            command = self._mapper.map(self._device.pressed(self._keys), now_ns)
+            return replace(
+                command,
+                event_ns=event_ns,
+                raw={**command.raw, "input_sync_lost": sync_lost},
+            )
         except InputDeviceError as exc:
             return _with_raw_error(
                 self._mapper.map(set(), now_ns, connected=False), str(exc)
@@ -168,9 +266,21 @@ class EvdevKeyboardSource:
 
 
 class EvdevGamepadSource:
-    def __init__(self, path: str, profile: TeleopProfile) -> None:
+    def __init__(
+        self,
+        path: str,
+        profile: TeleopProfile,
+        *,
+        teleop_mode: str = "joint",
+    ) -> None:
         self._device = _EvdevDevice(path)
-        self._mapper = GamepadMapper(profile)
+        if teleop_mode == "joint":
+            self._mapper = GamepadMapper(profile)
+        elif teleop_mode == "cartesian":
+            self._mapper = CartesianGamepadMapper(profile)
+        else:
+            self._device.close()
+            raise InputDeviceError("teleop_mode must be 'joint' or 'cartesian'")
         mapping = profile.gamepad
         protocol = mapping.protocol
         if protocol.transport != "evdev":
@@ -187,7 +297,11 @@ class EvdevGamepadSource:
             *mapping.estop_chord,
             *mapping.episode_buttons.values(),
         }
-        logical_axis_names = {binding.axis for binding in mapping.joint_axes}
+        if teleop_mode == "joint":
+            logical_axis_names = {binding.axis for binding in mapping.joint_axes}
+        else:
+            assert profile.cartesian is not None
+            logical_axis_names = set(profile.cartesian.axis_names)
         physical_button_names = {protocol.buttons[name] for name in logical_button_names}
         physical_axis_names = {protocol.axes[name].code for name in logical_axis_names}
         try:
@@ -216,7 +330,16 @@ class EvdevGamepadSource:
                 now_ns,
                 raw={"device_path": self._device.path},
             )
-            return self._mapper.map_state(state)
+            command = self._mapper.map_state(state)
+            metadata = getattr(self._device, "event_metadata", None)
+            event_ns, sync_lost = (
+                metadata() if callable(metadata) else (now_ns, False)
+            )
+            return replace(
+                command,
+                event_ns=event_ns,
+                raw={**command.raw, "input_sync_lost": sync_lost},
+            )
         except InputDeviceError as exc:
             state = self._adapter.decode({}, set(), now_ns, connected=False)
             command = self._mapper.map_state(state)
@@ -266,6 +389,7 @@ def create_gamepad_source(
     profile: TeleopProfile,
     *,
     factories: Mapping[str, GamepadSourceFactory] | None = None,
+    teleop_mode: str = "joint",
 ) -> GamepadSource:
     """Create a transport source; applications may register vendor protocols."""
     builders: dict[str, GamepadSourceFactory] = {"evdev": EvdevGamepadSource}
@@ -280,7 +404,14 @@ def create_gamepad_source(
         ) from exc
     if transport == "evdev":
         endpoint = resolve_gamepad_endpoint(endpoint)
-    source = factory(endpoint, profile)
+    if factory is EvdevGamepadSource:
+        source = factory(endpoint, profile, teleop_mode=teleop_mode)
+    else:
+        if teleop_mode != "joint":
+            raise InputDeviceError(
+                "custom gamepad transports must provide their own Cartesian-mode source"
+            )
+        source = factory(endpoint, profile)
     if not isinstance(source, GamepadSource):
         raise InputDeviceError(f"factory for {transport!r} did not return a GamepadSource")
     return source
@@ -298,6 +429,8 @@ def _with_raw_error(command: TeleopCommand, error: str) -> TeleopCommand:
         episode_event=None,
         connected=False,
         raw={"error": error},
+        teleop_mode=command.teleop_mode,
+        cartesian_twist=np.zeros(6, dtype=np.float32),
     )
 
 

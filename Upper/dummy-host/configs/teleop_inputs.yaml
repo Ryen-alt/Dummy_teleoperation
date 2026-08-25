@@ -1,4 +1,4 @@
-version: 2
+version: 4
 
 control:
   # These are deliberately below robot_config.yaml limits. Raise them only
@@ -74,3 +74,49 @@ gamepad:
       cancel: right_stick
     deadzone: 0.12
     response_exponent: 1.6
+
+# Parallel Cartesian frontend. It uses only ordinary Xbox-compatible axes:
+# no IMU/gyroscope is needed. The twist is expressed in base_link, integrated
+# into a tool0 pose, solved through URDF IK, then sent through the unchanged
+# absolute-joint ActionGateway and binary SET_JOINT_TARGET path.
+cartesian:
+  linear_speed_m_s: [0.015, 0.015, 0.012]
+  angular_speed_rad_s: [0.10, 0.10, 0.12]
+  linear_acceleration_m_s2: [0.06, 0.06, 0.05]
+  angular_acceleration_rad_s2: [0.40, 0.40, 0.48]
+
+  # Conservative first-stage base_link workspace. Tune only after offline
+  # reachability sampling and low-speed real-machine acceptance tests.
+  workspace_min_m: [-0.35, -0.35, 0.02]
+  workspace_max_m: [0.35, 0.35, 0.48]
+  min_base_radius_m: 0.04
+  # The current home pose lies on J2/J3 limits, so the first implementation
+  # cannot reserve a non-zero hard margin without rejecting a valid anchor.
+  joint_limit_margin_rad: 0.0
+
+  solver:
+    position_tolerance_m: 0.0003
+    orientation_tolerance_rad: 0.003
+    max_iterations: 80
+    damping: 0.02
+    finite_difference_rad: 0.0001
+    max_solver_step_rad: 0.12
+    max_solution_step_rad: 0.12
+    translation_scale_m: 0.10
+    # At 20 Hz, typical solves should finish inside the soft budget. The hard
+    # budget is fail-closed and prevents non-convergent tails blocking a tick.
+    soft_budget_ms: 12
+    hard_budget_ms: 20
+
+  mapping:
+    axes:
+      # Left stick: base-frame XY translation.
+      - {axis: left_x, component: vx, invert: false}
+      - {axis: left_y, component: vy, invert: true}
+      # Triggers are unipolar: right raises Z, left lowers Z.
+      - {axis: right_trigger, component: vz, invert: false, unipolar: true}
+      - {axis: left_trigger, component: vz, invert: true, unipolar: true}
+      # Right stick plus D-pad: base-frame angular velocity.
+      - {axis: dpad_x, component: wx, invert: false}
+      - {axis: right_y, component: wy, invert: true}
+      - {axis: right_x, component: wz, invert: false}

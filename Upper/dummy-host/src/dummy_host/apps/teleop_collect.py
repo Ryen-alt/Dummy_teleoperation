@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Event, Thread
 
 from dummy_host.cameras import CameraManager
+from dummy_host.calibration.urdf import UrdfError
 from dummy_host.fake_mcu import FakeMcuTransport
 from dummy_host.input_evdev import (
     EvdevKeyboardSource,
@@ -18,6 +19,12 @@ from dummy_host.input_evdev import (
     resolve_gamepad_endpoint,
 )
 from dummy_host.frame_archive import DEFAULT_MINIMUM_FREE_BYTES
+from dummy_host.kinematics import (
+    CartesianCalibration,
+    DummyUrdfKinematics,
+    load_cartesian_calibration,
+)
+from dummy_host.kinematics.contracts import KinematicsError
 from dummy_host.recording import SessionRecorder, estimate_camera_archive_bytes
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import ConfigError, load_robot_config, validate_camera_rig_for_formal_collection
@@ -33,6 +40,23 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--input-config", required=True)
     parser.add_argument("--source", choices=("keyboard", "gamepad"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("joint", "cartesian"),
+        default="joint",
+        help="parallel teleoperation frontend; both modes emit the same absolute joint action",
+    )
+    parser.add_argument(
+        "--urdf",
+        help="canonical Dummy URDF; required for --mode cartesian",
+    )
+    parser.add_argument(
+        "--cartesian-calibration",
+        help=(
+            "independent Cartesian-ready/TCP calibration YAML; mandatory and "
+            "validated for real Cartesian execution"
+        ),
+    )
     parser.add_argument(
         "--device",
         required=True,
@@ -90,6 +114,24 @@ def main() -> None:
         parser.error("--progress-interval must be positive")
     if args.execute and not args.allow_joint and not args.allow_gripper:
         parser.error("--execute requires at least one --allow-joint or --allow-gripper")
+    if args.mode == "cartesian" and args.source != "gamepad":
+        parser.error("--mode cartesian currently requires --source gamepad")
+    if args.mode == "cartesian" and not args.urdf:
+        parser.error("--mode cartesian requires --urdf Dummy_URDF/dummy.urdf")
+    if args.mode != "cartesian" and args.cartesian_calibration:
+        parser.error("--cartesian-calibration is only valid with --mode cartesian")
+    if args.mode == "cartesian" and args.execute and not args.cartesian_calibration:
+        parser.error("real Cartesian execution requires --cartesian-calibration")
+    if (
+        args.mode == "cartesian"
+        and args.allow_joint
+        and set(args.allow_joint) != set(range(1, 7))
+    ):
+        parser.error("Cartesian teleoperation cannot use a partial joint allow-list")
+    if args.mode == "cartesian" and args.execute and set(args.allow_joint or ()) != set(
+        range(1, 7)
+    ):
+        parser.error("real Cartesian teleoperation requires --allow-joint 1 through 6")
 
     config = load_robot_config(args.config, camera_rig_path=args.camera_rig)
     if args.require_camera:
@@ -99,6 +141,55 @@ def main() -> None:
             parser.error(str(exc))
     profile = load_teleop_profile(args.input_config)
     validate_profile_for_robot(profile, config)
+    if args.mode == "cartesian" and profile.cartesian is None:
+        parser.error("input configuration does not define a cartesian section")
+    kinematics = None
+    cartesian_calibration: CartesianCalibration | None = None
+    if args.mode == "cartesian":
+        assert profile.cartesian is not None
+        try:
+            if args.cartesian_calibration:
+                cartesian_calibration = load_cartesian_calibration(
+                    args.cartesian_calibration
+                )
+                cartesian_calibration.validate_for(
+                    config,
+                    args.urdf,
+                    require_validated=args.execute,
+                )
+            tool0_T_tip = (
+                None
+                if cartesian_calibration is None
+                else cartesian_calibration.tool0_T_tcp
+            )
+            tip_frame = (
+                "tool0"
+                if tool0_T_tip is None
+                else cartesian_calibration.tip_frame
+            )
+            kinematics = DummyUrdfKinematics(
+                args.urdf,
+                joint_min_rad=config.joint_limit_min_rad,
+                joint_max_rad=config.joint_limit_max_rad,
+                joint_limit_margin_rad=profile.cartesian.joint_limit_margin_rad,
+                position_tolerance_m=profile.cartesian.position_tolerance_m,
+                orientation_tolerance_rad=profile.cartesian.orientation_tolerance_rad,
+                max_iterations=profile.cartesian.max_iterations,
+                damping=profile.cartesian.damping,
+                finite_difference_rad=profile.cartesian.finite_difference_rad,
+                max_solver_step_rad=profile.cartesian.max_solver_step_rad,
+                max_solution_step_rad=profile.cartesian.max_solution_step_rad,
+                translation_scale_m=profile.cartesian.translation_scale_m,
+                tool0_T_tip=tool0_T_tip,
+                tip_frame=tip_frame,
+                calibration_hash=(
+                    None
+                    if cartesian_calibration is None
+                    else cartesian_calibration.file_hash
+                ),
+            )
+        except (KinematicsError, UrdfError) as exc:
+            parser.error(str(exc))
     try:
         resolved_device = (
             args.device
@@ -108,7 +199,11 @@ def main() -> None:
         input_source = (
             EvdevKeyboardSource(resolved_device, profile)
             if args.source == "keyboard"
-            else create_gamepad_source(resolved_device, profile)
+            else create_gamepad_source(
+                resolved_device,
+                profile,
+                teleop_mode=args.mode,
+            )
         )
     except InputDeviceError as exc:
         parser.exit(
@@ -142,6 +237,25 @@ def main() -> None:
         source=args.source,
         extra_manifest={
             "transport": "fake_mcu" if args.simulate else "usb_cdc",
+            "teleop_mode": args.mode,
+            "teleop_semantics_version": 1,
+            "kinematics": None if kinematics is None else kinematics.describe(),
+            "cartesian_calibration": (
+                None
+                if cartesian_calibration is None
+                else cartesian_calibration.as_dict()
+            ),
+            "cartesian_control_frame": (
+                None if kinematics is None else kinematics.base_link
+            ),
+            "cartesian_tip_frame": (
+                None if kinematics is None else kinematics.tip_link
+            ),
+            "real_cartesian_execution_allowed": bool(
+                args.execute
+                and cartesian_calibration is not None
+                and cartesian_calibration.validated
+            ),
             "input_device": resolved_device,
             "cameras_enabled": args.with_cameras,
             "camera_roles": list(camera_manager.roles) if camera_manager is not None else [],
@@ -161,6 +275,8 @@ def main() -> None:
             "free_bytes_at_start": available_bytes,
         },
     )
+    if cartesian_calibration is not None:
+        recorder.archive_cartesian_calibration(cartesian_calibration)
     clean_shutdown = False
     progress_stop = Event()
     progress_started = time.monotonic()
@@ -214,6 +330,9 @@ def main() -> None:
             allow_gripper=args.allow_gripper,
             task_id=args.task_id,
             task=args.task,
+            teleop_mode=args.mode,
+            kinematics=kinematics,
+            cartesian_calibration=cartesian_calibration,
         )
         clean_shutdown = True
     except BaseException as exc:
