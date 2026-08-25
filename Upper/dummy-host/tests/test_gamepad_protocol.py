@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import yaml
 import pytest
 
+import dummy_host.input_evdev as input_evdev
 from dummy_host.apps.gamepad_mapping_test import _render, demo_results
 from dummy_host.gamepad import ConfiguredGamepadProtocolAdapter, GamepadSource
 from dummy_host.input_evdev import (
@@ -60,6 +61,79 @@ def test_evdev_background_reader_uses_kernel_time_and_marks_syn_dropped() -> Non
     assert device._active_keys == {31}
     assert device.event_metadata() == (1_000_030_000, True)
     assert device.event_metadata() == (1_000_030_000, False)
+
+
+def test_evdev_configures_monotonic_clock_through_linux_ioctl(monkeypatch) -> None:
+    ioctl_calls: list[tuple[int, int, bytes]] = []
+
+    class InputDevice:
+        fd = 42
+
+        def __init__(self, path: str) -> None:
+            self.path = path
+            self.closed = False
+
+        def active_keys(self):
+            return []
+
+        def read_loop(self):
+            return iter(())
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        input_evdev,
+        "_load_evdev",
+        lambda: (InputDevice, SimpleNamespace(), lambda: []),
+    )
+    monkeypatch.setattr(
+        input_evdev.fcntl,
+        "ioctl",
+        lambda fd, request, argument: ioctl_calls.append((fd, request, argument)),
+    )
+
+    device = _EvdevDevice("/dev/input/event42")
+    device.close()
+
+    assert len(ioctl_calls) == 1
+    descriptor, request, argument = ioctl_calls[0]
+    assert descriptor == 42
+    assert request == input_evdev._EVIOCSCLOCKID
+    assert input_evdev.struct.unpack("i", argument) == (input_evdev.time.CLOCK_MONOTONIC,)
+
+
+def test_evdev_rejects_device_when_monotonic_clock_ioctl_fails(monkeypatch) -> None:
+    opened: list[object] = []
+
+    class InputDevice:
+        fd = 43
+
+        def __init__(self, path: str) -> None:
+            self.path = path
+            self.closed = False
+            opened.append(self)
+
+        def read_loop(self):
+            return iter(())
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        input_evdev,
+        "_load_evdev",
+        lambda: (InputDevice, SimpleNamespace(), lambda: []),
+    )
+
+    def fail_ioctl(fd, request, argument):
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(input_evdev.fcntl, "ioctl", fail_ioctl)
+
+    with pytest.raises(InputDeviceError, match="cannot configure CLOCK_MONOTONIC"):
+        _EvdevDevice("/dev/input/event43")
+    assert opened and opened[0].closed
 
 
 def test_flydigi_evdev_protocol_decodes_to_stable_logical_controls() -> None:

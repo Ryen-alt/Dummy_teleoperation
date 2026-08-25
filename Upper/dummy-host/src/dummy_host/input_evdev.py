@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import math
+import struct
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
@@ -22,6 +24,14 @@ class InputDeviceError(TeleopError):
 
 _GAMEPAD_LINK_DIRS = (Path("/dev/input/by-id"), Path("/dev/input/by-path"))
 
+# Linux include/uapi/linux/input.h:
+#   #define EVIOCSCLOCKID _IOW('E', 0xa0, int)
+#
+# python-evdev 1.9.x exposes the event file descriptor but does not wrap this
+# ioctl.  Configure it directly so event.sec/event.usec share the host
+# CLOCK_MONOTONIC timebase used by the rest of the control pipeline.
+_EVIOCSCLOCKID = 0x400445A0
+
 
 @dataclass(frozen=True)
 class InputDeviceInfo:
@@ -40,6 +50,20 @@ def _load_evdev() -> tuple[Any, Any, Callable[[], list[str]]]:
     except ImportError as exc:
         raise InputDeviceError("install dummy-host[teleop] to use Linux evdev inputs") from exc
     return InputDevice, ecodes, list_devices
+
+
+def _set_monotonic_event_clock(device: Any) -> None:
+    try:
+        descriptor = int(device.fd)
+        fcntl.ioctl(
+            descriptor,
+            _EVIOCSCLOCKID,
+            struct.pack("i", int(time.CLOCK_MONOTONIC)),
+        )
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise InputDeviceError(
+            f"cannot configure CLOCK_MONOTONIC event timestamps: {exc}"
+        ) from exc
 
 
 def _code_name(ecodes: Any, event_type: int, code: int) -> str:
@@ -94,24 +118,20 @@ class _EvdevDevice:
         self._axis_values: dict[int, Any] = {}
         self._last_event_ns = time.monotonic_ns()
         self._sync_lost = False
-        monotonic_events = False
-        try:
-            self.device.set_clockid(time.CLOCK_MONOTONIC)
-            monotonic_events = True
-        except (AttributeError, OSError):
-            pass
+        event_reader = getattr(self.device, "read_loop", None)
+        if callable(event_reader):
+            try:
+                _set_monotonic_event_clock(self.device)
+            except InputDeviceError:
+                self.device.close()
+                self._closed = True
+                raise
         try:
             self._active_keys = set(int(code) for code in self.device.active_keys())
         except (OSError, SystemError) as exc:
             self.last_error = str(exc)
         self._reader: threading.Thread | None = None
-        if callable(getattr(self.device, "read_loop", None)):
-            if not monotonic_events:
-                self.device.close()
-                self._closed = True
-                raise InputDeviceError(
-                    "evdev device cannot provide CLOCK_MONOTONIC event timestamps"
-                )
+        if callable(event_reader):
             self._reader = threading.Thread(
                 target=self._event_loop,
                 name="dummy-evdev-events",
