@@ -1,13 +1,28 @@
 #include "6dof_kinematic.h"
 
-inline float cosf(float x)
+#include <cmath>
+#include <cstring>
+
+#ifndef DUMMY_KINEMATICS_HOST
+#include "arm_math.h"
+#endif
+
+inline float KinematicCos(float x)
 {
+#ifdef DUMMY_KINEMATICS_HOST
+    return std::cos(x);
+#else
     return arm_cos_f32(x);
+#endif
 }
 
-inline float sinf(float x)
+inline float KinematicSin(float x)
 {
+#ifdef DUMMY_KINEMATICS_HOST
+    return std::sin(x);
+#else
     return arm_sin_f32(x);
+#endif
 }
 
 static void MatMultiply(const float* _matrix1, const float* _matrix2, float* _matrixOut,
@@ -49,7 +64,7 @@ static void RotMatToEulerAngle(const float* _rotationM, float* _eulerAngles)
     } else
     {
         B = atan2f(-_rotationM[6], sqrtf(_rotationM[0] * _rotationM[0] + _rotationM[3] * _rotationM[3]));
-        cb = cosf(B);
+        cb = KinematicCos(B);
         A = atan2f(_rotationM[3] / cb, _rotationM[0] / cb);
         C = atan2f(_rotationM[7] / cb, _rotationM[8] / cb);
     }
@@ -63,12 +78,12 @@ static void EulerAngleToRotMat(const float* _eulerAngles, float* _rotationM)
 {
     float ca, cb, cc, sa, sb, sc;
 
-    cc = cosf(_eulerAngles[0]);
-    cb = cosf(_eulerAngles[1]);
-    ca = cosf(_eulerAngles[2]);
-    sc = sinf(_eulerAngles[0]);
-    sb = sinf(_eulerAngles[1]);
-    sa = sinf(_eulerAngles[2]);
+    cc = KinematicCos(_eulerAngles[0]);
+    cb = KinematicCos(_eulerAngles[1]);
+    ca = KinematicCos(_eulerAngles[2]);
+    sc = KinematicSin(_eulerAngles[0]);
+    sb = KinematicSin(_eulerAngles[1]);
+    sa = KinematicSin(_eulerAngles[2]);
 
     _rotationM[0] = ca * cb;
     _rotationM[1] = ca * sb * sc - sa * cc;
@@ -136,10 +151,10 @@ DOF6Kinematic::SolveFK(const DOF6Kinematic::Joint6D_t &_inputJoint6D, DOF6Kinema
     for (int i = 0; i < 6; i++)
     {
         q[i] = q_in[i] + DH_matrix[i][0];
-        cosq = cosf(q[i]);
-        sinq = sinf(q[i]);
-        cosa = cosf(DH_matrix[i][3]);
-        sina = sinf(DH_matrix[i][3]);
+        cosq = KinematicCos(q[i]);
+        sinq = KinematicSin(q[i]);
+        cosa = KinematicCos(DH_matrix[i][3]);
+        sina = KinematicSin(DH_matrix[i][3]);
 
         R[i][0] = cosq;
         R[i][1] = -cosa * sinq;
@@ -257,8 +272,8 @@ bool DOF6Kinematic::SolveIK(const DOF6Kinematic::Pose6D_t &_inputPose6D, const J
     }
     for (ind_arm = 0; ind_arm < 2; ind_arm++)
     {
-        cosqs = cosf(qs[ind_arm] + DH_matrix[0][0]);
-        sinqs = sinf(qs[ind_arm] + DH_matrix[0][0]);
+        cosqs = KinematicCos(qs[ind_arm] + DH_matrix[0][0]);
+        sinqs = KinematicSin(qs[ind_arm] + DH_matrix[0][0]);
 
         R10[0] = cosqs;
         R10[1] = sinqs;
@@ -277,6 +292,17 @@ bool DOF6Kinematic::SolveIK(const DOF6Kinematic::Pose6D_t &_inputPose6D, const J
         }
         l_sw_2 = L1_sw[0] * L1_sw[0] + L1_sw[1] * L1_sw[1];
         l_sw = sqrtf(l_sw_2);
+
+        // Reject the full outside/inside unreachable regions before clamping
+        // acos inputs.  The historical code only marked points within 1 um of
+        // the boundary, so far-away poses could be mislabeled as valid.
+        if (l_sw > l_se + l_ew + 0.000001F ||
+            l_sw < fabsf(l_se - l_ew) - 0.000001F)
+        {
+            for (i = 0; i < 4; ++i)
+                _outputSolves.solFlag[4 * ind_arm + i][1] = 0;
+            continue;
+        }
 
         if (fabs(l_se + l_ew - l_sw) <= 0.000001)
         {
@@ -360,10 +386,10 @@ bool DOF6Kinematic::SolveIK(const DOF6Kinematic::Pose6D_t &_inputPose6D, const J
         }
         for (ind_elbow = 0; ind_elbow < 2; ind_elbow++)
         {
-            cosqa[0] = cosf(qa[ind_elbow][0] + DH_matrix[1][0]);
-            sinqa[0] = sinf(qa[ind_elbow][0] + DH_matrix[1][0]);
-            cosqa[1] = cosf(qa[ind_elbow][1] + DH_matrix[2][0]);
-            sinqa[1] = sinf(qa[ind_elbow][1] + DH_matrix[2][0]);
+            cosqa[0] = KinematicCos(qa[ind_elbow][0] + DH_matrix[1][0]);
+            sinqa[0] = KinematicSin(qa[ind_elbow][0] + DH_matrix[1][0]);
+            cosqa[1] = KinematicCos(qa[ind_elbow][1] + DH_matrix[2][0]);
+            sinqa[1] = KinematicSin(qa[ind_elbow][1] + DH_matrix[2][0]);
 
             R31[0] = cosqa[0] * cosqa[1] - sinqa[0] * sinqa[1];
             R31[1] = cosqa[0] * sinqa[1] + sinqa[0] * cosqa[1];
@@ -413,22 +439,22 @@ bool DOF6Kinematic::SolveIK(const DOF6Kinematic::Pose6D_t &_inputPose6D, const J
                 if (0 == ind_arm)
                 {
                     qw[0][0] = _lastJoint6D.a[3];
-                    cosqw = cosf(_lastJoint6D.a[3] + DH_matrix[3][0]);
-                    sinqw = sinf(_lastJoint6D.a[3] + DH_matrix[3][0]);
+                    cosqw = KinematicCos(_lastJoint6D.a[3] + DH_matrix[3][0]);
+                    sinqw = KinematicSin(_lastJoint6D.a[3] + DH_matrix[3][0]);
                     qw[0][2] = atan2f(cosqw * R36[3] - sinqw * R36[0], cosqw * R36[0] + sinqw * R36[3]);
                     qw[1][2] = _lastJoint6D.a[5];
-                    cosqw = cosf(_lastJoint6D.a[5] + DH_matrix[5][0]);
-                    sinqw = sinf(_lastJoint6D.a[5] + DH_matrix[5][0]);
+                    cosqw = KinematicCos(_lastJoint6D.a[5] + DH_matrix[5][0]);
+                    sinqw = KinematicSin(_lastJoint6D.a[5] + DH_matrix[5][0]);
                     qw[1][0] = atan2f(cosqw * R36[3] - sinqw * R36[0], cosqw * R36[0] + sinqw * R36[3]);
                 } else
                 {
                     qw[0][2] = _lastJoint6D.a[5];
-                    cosqw = cosf(_lastJoint6D.a[5] + DH_matrix[5][0]);
-                    sinqw = sinf(_lastJoint6D.a[5] + DH_matrix[5][0]);
+                    cosqw = KinematicCos(_lastJoint6D.a[5] + DH_matrix[5][0]);
+                    sinqw = KinematicSin(_lastJoint6D.a[5] + DH_matrix[5][0]);
                     qw[0][0] = atan2f(cosqw * R36[3] - sinqw * R36[0], cosqw * R36[0] + sinqw * R36[3]);
                     qw[1][0] = _lastJoint6D.a[3];
-                    cosqw = cosf(_lastJoint6D.a[3] + DH_matrix[3][0]);
-                    sinqw = sinf(_lastJoint6D.a[3] + DH_matrix[3][0]);
+                    cosqw = KinematicCos(_lastJoint6D.a[3] + DH_matrix[3][0]);
+                    sinqw = KinematicSin(_lastJoint6D.a[3] + DH_matrix[3][0]);
                     qw[1][2] = atan2f(cosqw * R36[3] - sinqw * R36[0], cosqw * R36[0] + sinqw * R36[3]);
                 }
                 _outputSolves.solFlag[4 * ind_arm + 2 * ind_elbow + 0][2] = -1;

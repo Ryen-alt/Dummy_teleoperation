@@ -1,0 +1,14 @@
+version: 1
+calibration_id: uncalibrated-cartesian-v0
+robot_id: dummy_v2_001
+validated: false
+validated_utc: null
+urdf_sha256: 50e17c547b031fda9a96d0bbee0abada547407b384377489eb7acbe25171a507
+
+# Real Cartesian execution remains blocked until these values are measured,
+# reviewed under 05/06 acceptance, and validated is explicitly set true.
+ready_pose_rad: null
+ready_tolerance_rad: null
+tip_frame: tcp
+tool0_T_tcp: null
+evidence_session: null

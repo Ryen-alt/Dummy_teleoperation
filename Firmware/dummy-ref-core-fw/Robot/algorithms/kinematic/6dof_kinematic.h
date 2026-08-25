@@ -1,9 +1,11 @@
 #ifndef DOF6_KINEMATIC_SOLVER_H
 #define DOF6_KINEMATIC_SOLVER_H
 
+#ifndef DUMMY_KINEMATICS_HOST
 #include "stm32f405xx.h"
 #include "arm_math.h"
 #include "memory.h"
+#endif
 
 class DOF6Kinematic
 {
