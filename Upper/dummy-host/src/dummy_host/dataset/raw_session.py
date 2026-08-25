@@ -255,7 +255,10 @@ class RawSession:
             period_ns = max(1, round(1e9 / recipe.control_hz))
             grid_start_ns = max(episode.start_ns, int(control_times[0]))
             grid_end_ns = min(episode.end_ns, int(control_times[-1]))
-            frame_index = 0
+            segment_index = 0
+            segment_frame_index = 0
+            segment_start_ns = grid_start_ns
+            gap_pending = False
             target_ns = grid_start_ns
             while target_ns <= grid_end_ns:
                 right = int(np.searchsorted(control_times, target_ns, side="left"))
@@ -268,8 +271,14 @@ class RawSession:
                 left_time = int(samples[left]["control_ns"])
                 right_time = int(samples[right]["control_ns"])
                 if right != left and right_time - left_time > int(period_ns * 1.5):
+                    gap_pending = True
                     target_ns += period_ns
                     continue
+                if gap_pending:
+                    segment_index += 1
+                    segment_frame_index = 0
+                    segment_start_ns = target_ns
+                    gap_pending = False
                 alpha = 0.0 if right_time == left_time else (
                     (target_ns - left_time) / (right_time - left_time)
                 )
@@ -302,28 +311,32 @@ class RawSession:
                             if depth_key is not None:
                                 if "depth_scale" not in archive:
                                     raise RawSessionError(
-                                        f"resampled frame {frame_index} camera {role} has no depth scale"
+                                        f"resampled frame {segment_frame_index} camera {role} has no depth scale"
                                     )
                                 depth_scale = float(archive["depth_scale"])
                                 if not np.isfinite(depth_scale) or depth_scale <= 0:
                                     raise RawSessionError(
-                                        f"resampled frame {frame_index} camera {role} has invalid depth scale"
+                                        f"resampled frame {segment_frame_index} camera {role} has invalid depth scale"
                                     )
                                 depths[role] = (
                                     archive[depth_key].astype(np.float32) * depth_scale
                                 )
                     if color.dtype != np.uint8 or color.ndim != 3 or color.shape[2] != 3:
                         raise RawSessionError(
-                            f"resampled frame {frame_index} camera {role} is not RGB uint8 HWC"
+                            f"resampled frame {segment_frame_index} camera {role} is not RGB uint8 HWC"
                         )
                     images[role] = color
                 yield DatasetFrame(
                     observation_state=state,
                     action=action,
                     images=images,
-                    timestamp_s=(target_ns - grid_start_ns) / 1e9,
-                    frame_index=frame_index,
-                    episode_id=episode.episode_id,
+                    timestamp_s=(target_ns - segment_start_ns) / 1e9,
+                    frame_index=segment_frame_index,
+                    episode_id=(
+                        episode.episode_id
+                        if segment_index == 0
+                        else f"{episode.episode_id}--segment-{segment_index:03d}"
+                    ),
                     task_id=episode.task_id,
                     task=episode.task,
                     source_sample_index=int(source["sample_index"]),
@@ -333,7 +346,7 @@ class RawSession:
                     interpolation_alpha=alpha,
                     depths=depths,
                 )
-                frame_index += 1
+                segment_frame_index += 1
                 target_ns += period_ns
 
     def sample_counts(self, episode: EpisodeWindow) -> tuple[int, int]:

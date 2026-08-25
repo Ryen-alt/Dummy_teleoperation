@@ -17,6 +17,7 @@ def export_raw_session(
     episodes = session.episodes()
     selected = [episode for episode in episodes if episode.outcome in recipe.accepted_outcomes]
     episodes_exported = 0
+    source_episodes_exported = 0
     frames_exported = 0
     invalid_excluded = 0
     for episode in selected:
@@ -28,17 +29,28 @@ def export_raw_session(
         except StopIteration:
             invalid_excluded += total_samples
             continue
+        active_episode_id = first_frame.episode_id
         sink.begin_episode(
-            episode_id=episode.episode_id,
+            episode_id=active_episode_id,
             task_id=episode.task_id,
             task=episode.task,
         )
         for frame in chain((first_frame,), frames):
+            if frame.episode_id != active_episode_id:
+                sink.end_episode(episode_id=active_episode_id)
+                episodes_exported += 1
+                active_episode_id = frame.episode_id
+                sink.begin_episode(
+                    episode_id=active_episode_id,
+                    task_id=episode.task_id,
+                    task=episode.task,
+                )
             sink.add_frame(frame)
             frames_exported += 1
             episode_frames += 1
-        sink.end_episode(episode_id=episode.episode_id)
+        sink.end_episode(episode_id=active_episode_id)
         episodes_exported += 1
+        source_episodes_exported += 1
         invalid_excluded += total_samples - episode_frames
     metadata = {
         "dataset_format": recipe.dataset_format,
@@ -70,6 +82,6 @@ def export_raw_session(
         episodes_exported=episodes_exported,
         frames_exported=frames_exported,
         invalid_samples_excluded=invalid_excluded,
-        incomplete_episodes_excluded=len(episodes) - episodes_exported,
+        incomplete_episodes_excluded=len(episodes) - source_episodes_exported,
         sink_result=result,
     )
