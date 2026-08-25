@@ -20,6 +20,7 @@ class ExportRecipe:
     include_depth: bool = False
     allow_uncalibrated_cameras: bool = False
     require_temporary_source: bool = False
+    max_action_observation_latency_ms: float = 250.0
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -30,6 +31,10 @@ class ExportRecipe:
             or self.version <= 0
             or isinstance(self.control_hz, bool)
             or self.control_hz <= 0
+            or isinstance(self.max_action_observation_latency_ms, bool)
+            or not isinstance(self.max_action_observation_latency_ms, (int, float))
+            or not np.isfinite(self.max_action_observation_latency_ms)
+            or self.max_action_observation_latency_ms <= 0
         ):
             raise ValueError("recipe_id, version and control_hz must be valid")
         if self.dataset_format != "lerobot_v3":
@@ -75,6 +80,7 @@ class ExportRecipe:
             "include_depth": self.include_depth,
             "allow_uncalibrated_cameras": self.allow_uncalibrated_cameras,
             "require_temporary_source": self.require_temporary_source,
+            "max_action_observation_latency_ms": self.max_action_observation_latency_ms,
             "metadata": dict(self.metadata),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -93,6 +99,9 @@ class DatasetFrame:
     task: str
     source_sample_index: int
     source_tick_ns: int
+    source_raw_tick_index: int = 0
+    source_control_time_ns: int = 0
+    interpolation_alpha: float = 0.0
     depths: Mapping[str, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -144,6 +153,9 @@ class DatasetFrame:
             or self.frame_index < 0
             or self.source_sample_index < 0
             or self.source_tick_ns < 0
+            or self.source_raw_tick_index < 0
+            or self.source_control_time_ns < 0
+            or not 0.0 <= self.interpolation_alpha <= 1.0
         ):
             raise ValueError("dataset frame indices and timestamps must be non-negative")
         if not self.episode_id or not self.task_id or not self.task:

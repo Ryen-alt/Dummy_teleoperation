@@ -123,15 +123,17 @@ def analyze_session(session_dir: str | Path) -> tuple[SessionQaReport, tuple[np.
     action_reason_counts: dict[str, int] = {}
     fault_samples = 0
     try:
+        schema_version = int(manifest.get("schema_version", 0))
+        timing_column = "control_actual_start_ns" if schema_version >= 3 else "tick_ns"
         with sqlite3.connect(
             f"file:{(session_dir / 'samples.sqlite').as_posix()}?mode=ro&immutable=1",
             uri=True,
         ) as connection:
             rows = connection.execute(
-                """
-                SELECT sample_index, tick_ns, state_position, applied_action,
+                f"""
+                SELECT sample_index, {timing_column}, state_position, applied_action,
                        action_clipped, action_reasons_json, state_fault_bits
-                FROM samples ORDER BY tick_ns, sample_index
+                FROM samples ORDER BY {timing_column}, sample_index
                 """
             ).fetchall()
             for (
@@ -269,11 +271,22 @@ def analyze_session(session_dir: str | Path) -> tuple[SessionQaReport, tuple[np.
         )
         if not offline_training_only or real_policy_execution_allowed:
             errors.append("temporary session safety classification fields are inconsistent")
+    if schema_version < 4:
+        warnings.append(
+            "schema v2/v3 is inspectable but not strict-export-ready because exact "
+            "CAN_QUEUED_EXACT/POST_COMMAND_FEEDBACK evidence is unavailable"
+        )
 
     state_min, state_max = _range(states)
     action_min, action_max = _range(actions)
     ok = integrity.ok and integrity.clean_shutdown and not errors
-    export_ready = ok and outcomes["accepted"] > 0 and action_samples > 0 and not missing_roles
+    export_ready = (
+        schema_version == 4
+        and ok
+        and outcomes["accepted"] > 0
+        and action_samples > 0
+        and not missing_roles
+    )
     report = SessionQaReport(
         ok=ok,
         export_ready=export_ready,

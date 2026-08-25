@@ -7,6 +7,8 @@ import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from ..protocol import PROTOCOL_VERSION
+
 
 class SessionCheckError(RuntimeError):
     pass
@@ -23,7 +25,7 @@ class SessionCheckReport:
     camera_files: int
     max_sent_sequence: int
     max_received_sequence: int
-    max_applied_sequence: int
+    max_completed_sequence: int
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
 
@@ -55,6 +57,19 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
         raise SessionCheckError("checksums.json files must be a mapping")
     errors: list[str] = []
     warnings: list[str] = []
+    try:
+        manifest_schema_version = int(manifest.get("schema_version", 1))
+    except (TypeError, ValueError):
+        manifest_schema_version = 0
+        errors.append("manifest schema_version is invalid")
+    if (
+        manifest_schema_version >= 4
+        and manifest.get("binary_protocol_version") != PROTOCOL_VERSION
+    ):
+        errors.append(
+            "Raw Session schema v4 requires binary protocol v4 evidence; "
+            f"found {manifest.get('binary_protocol_version')!r}"
+        )
     for relative, expected in expected_files.items():
         if not isinstance(relative, str) or not isinstance(expected, str):
             errors.append("checksums.json contains a non-string path or digest")
@@ -95,6 +110,22 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
             elif _sha256(path) != expected_hash:
                 errors.append(f"camera calibration hash mismatch: {role}")
 
+    cartesian_calibration = manifest.get("cartesian_calibration")
+    if cartesian_calibration is not None:
+        if not isinstance(cartesian_calibration, dict):
+            errors.append("manifest Cartesian calibration must be a mapping or null")
+        else:
+            archive_path = cartesian_calibration.get("archive_path")
+            expected_hash = cartesian_calibration.get("sha256")
+            if not isinstance(archive_path, str) or not isinstance(expected_hash, str):
+                errors.append("Cartesian calibration has no archive_path or sha256")
+            else:
+                path = session_dir / archive_path
+                if not path.is_file():
+                    errors.append(f"missing archived Cartesian calibration: {archive_path}")
+                elif _sha256(path) != expected_hash:
+                    errors.append("Cartesian calibration hash mismatch")
+
     db_path = session_dir / "samples.sqlite"
     try:
         connection = sqlite3.connect(
@@ -102,17 +133,42 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
         )
         integrity_row = connection.execute("PRAGMA integrity_check").fetchone()
         integrity = "missing" if integrity_row is None else str(integrity_row[0])
-        row = connection.execute(
-            """
-            SELECT COUNT(*),
-                   COALESCE(SUM(CASE WHEN sample_valid = 0 THEN 1 ELSE 0 END), 0),
-                   COALESCE(MAX(action_sequence), 0),
-                   COALESCE(MAX(last_received_sequence), 0),
-                   COALESCE(MAX(last_applied_sequence), 0)
-            FROM samples
-            """
-        ).fetchone()
-        schema_version = int(manifest.get("schema_version", 1))
+        schema_version = manifest_schema_version
+        if schema_version >= 3:
+            sample_row = connection.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN sample_valid = 0 THEN 1 ELSE 0 END), 0),
+                       COALESCE(MAX(action_sequence), 0),
+                       COALESCE(MAX(last_received_sequence), 0)
+                FROM samples
+                """
+            ).fetchone()
+            lifecycle_column = (
+                "post_command_feedback_host_ns"
+                if schema_version >= 4
+                else "motor_observed_host_ns"
+            )
+            applied_row = connection.execute(
+                f"""
+                SELECT COALESCE(MAX(action_sequence), 0)
+                FROM action_lifecycle
+                WHERE {lifecycle_column} IS NOT NULL
+                """
+            ).fetchone()
+            assert sample_row is not None and applied_row is not None
+            row = (*sample_row, applied_row[0])
+        else:
+            row = connection.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN sample_valid = 0 THEN 1 ELSE 0 END), 0),
+                       COALESCE(MAX(action_sequence), 0),
+                       COALESCE(MAX(last_received_sequence), 0),
+                       COALESCE(MAX(last_applied_sequence), 0)
+                FROM samples
+                """
+            ).fetchone()
         if schema_version >= 2:
             frame_rows = connection.execute(
                 "SELECT DISTINCT frame_path FROM camera_samples"
@@ -150,8 +206,8 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
         )
     if sent > received or sent > applied:
         warnings.append(
-            f"target sequence did not close in recorded STATE: sent={sent}, "
-            f"received={received}, applied={applied}"
+            f"target sequence did not close with recorded completion evidence: "
+            f"sent={sent}, received={received}, completed={applied}"
         )
     clean_shutdown = manifest.get("clean_shutdown") is True
     if not clean_shutdown:
@@ -166,7 +222,7 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
         camera_files=camera_files,
         max_sent_sequence=sent,
         max_received_sequence=received,
-        max_applied_sequence=applied,
+        max_completed_sequence=applied,
         errors=tuple(errors),
         warnings=tuple(warnings),
     )

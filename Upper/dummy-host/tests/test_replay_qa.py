@@ -48,7 +48,6 @@ def _record_replay_source(config: RobotConfig, root: Path) -> Path:
             velocity_valid=False,
             gripper_valid=True,
             last_received_sequence=index + 1,
-            last_applied_sequence=index + 1,
             target_age_ms=1,
             config_hash=config.config_hash,
         )

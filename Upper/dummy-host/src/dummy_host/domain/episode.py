@@ -107,6 +107,24 @@ class EpisodeManager:
         self.arm(task_id=task_id, task=task, now_ns=now_ns, metadata=metadata)
         return self.start(now_ns=now_ns)
 
+    def begin_finalizing(self, *, now_ns: int) -> EpisodeSnapshot:
+        if now_ns < 0:
+            raise EpisodeError("finalizing timestamp must be non-negative")
+        with self._lock:
+            if self._snapshot.status is not EpisodeStatus.RECORDING:
+                raise EpisodeError("only a recording Episode can begin finalizing")
+            self._snapshot = EpisodeSnapshot(
+                self._snapshot.episode_id,
+                EpisodeStatus.FINALIZING,
+                self._snapshot.task_id,
+                self._snapshot.task,
+                self._snapshot.started_ns,
+                None,
+                None,
+                self._snapshot.metadata,
+            )
+            return self._snapshot
+
     def finish(
         self,
         outcome: EpisodeStatus | str,
@@ -122,8 +140,11 @@ class EpisodeManager:
         }:
             raise EpisodeError(f"invalid terminal Episode outcome {outcome.value}")
         with self._lock:
-            if self._snapshot.status is not EpisodeStatus.RECORDING:
-                raise EpisodeError("only a recording Episode can be finalized")
+            if self._snapshot.status not in {
+                EpisodeStatus.RECORDING,
+                EpisodeStatus.FINALIZING,
+            }:
+                raise EpisodeError("only a recording/finalizing Episode can be finalized")
             if outcome is EpisodeStatus.FAILED and not failure_reason:
                 failure_reason = "operator_marked_failure"
             self._snapshot = EpisodeSnapshot(

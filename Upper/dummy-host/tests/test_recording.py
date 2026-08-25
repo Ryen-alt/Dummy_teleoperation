@@ -14,6 +14,7 @@ import pytest
 from dummy_host.cameras import CameraFrame
 from dummy_host.apps.session_check import check_session
 from dummy_host.frame_archive import NpzFrameArchive
+from dummy_host.domain import ActionProgressFlags, ActionProgressRecord
 from dummy_host.recording import (
     RecorderBackpressure,
     SessionRecorder,
@@ -45,9 +46,20 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
         velocity_valid=True,
         gripper_valid=True,
         last_received_sequence=7,
-        last_applied_sequence=7,
         target_age_ms=5,
         config_hash=config.config_hash,
+        can_transport_status=0x6F,
+        coherent_reference_mcu_us=now_ns // 1_000,
+        action_progress=(
+            ActionProgressRecord(
+                sequence=7,
+                flags=int(ActionProgressFlags.CAN_QUEUED_EXACT)
+                | int(ActionProgressFlags.POST_COMMAND_FEEDBACK),
+                can_queued_mcu_us=now_ns // 1_000,
+                post_feedback_mcu_us=now_ns // 1_000 + 1_000,
+                feedback_sweep_id=1,
+            ),
+        ),
     )
     command = KeyboardMapper(profile).map({"KEY_SPACE", "KEY_Q"}, now_ns)
     action = AppliedAction(
@@ -102,23 +114,25 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
     assert stats.camera_frames == 2
     with sqlite3.connect(recorder.db_path) as connection:
         row = connection.execute(
-            "SELECT COUNT(*), action_sequence, length(applied_action), last_applied_sequence, "
+            "SELECT COUNT(*), action_sequence, length(applied_action), "
             "length(state_following_error), length(feedback_age_ms), "
-            "length(node_fault_bits), state_hold_reason_bits "
+            "length(node_fault_bits), state_hold_reason_bits, state_can_transport_status, "
+            "json_array_length(action_progress_json) "
             "FROM samples"
         ).fetchone()
         camera_rows = connection.execute(
             "SELECT role, COUNT(*), COUNT(DISTINCT frame_path) "
             "FROM camera_samples GROUP BY role ORDER BY role"
         ).fetchall()
-    assert row == (2, 7, 28, 7, 28, 28, 14, 0)
+    assert row == (2, 7, 28, 28, 28, 14, 0, 0x6F, 1)
     assert camera_rows == [("global", 2, 1), ("wrist", 2, 1)]
     manifest = json.loads(recorder.manifest_path.read_text(encoding="utf-8"))
     assert manifest["clean_shutdown"] is True
     assert manifest["firmware_version"] == "fake-mcu-v1"
     assert manifest["robot_config_hash"] == config.config_hash
-    assert manifest["schema_version"] == 2
-    assert manifest["state_telemetry_version"] == 2
+    assert manifest["schema_version"] == 4
+    assert manifest["binary_protocol_version"] == 4
+    assert manifest["state_telemetry_version"] == 4
     assert manifest["camera_rig_hash"] == config.camera_rig.config_hash
     frame_files = list((recorder.session_dir / "frames").rglob("*.npz"))
     assert len(frame_files) == 2
@@ -248,7 +262,6 @@ def test_sample_backpressure_preserves_capacity_for_critical_events(
         velocity_valid=True,
         gripper_valid=True,
         last_received_sequence=1,
-        last_applied_sequence=1,
         target_age_ms=1,
         config_hash=config.config_hash,
     )

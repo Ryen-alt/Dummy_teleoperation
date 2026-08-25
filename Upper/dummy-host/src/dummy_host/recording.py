@@ -8,7 +8,7 @@ import queue
 import sqlite3
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -17,6 +17,9 @@ import numpy as np
 
 from .cameras import CameraFrame
 from .frame_archive import DEFAULT_MINIMUM_FREE_BYTES, FrameArchive, NpzFrameArchive
+from .domain import ActionLifecycleUpdate, ActionStage
+from .kinematics.calibration import CartesianCalibration
+from .protocol import PROTOCOL_VERSION
 from .schema import AppliedAction, RobotConfig, RobotState
 from .teleop import TeleopCommand, TeleopProfile
 
@@ -58,6 +61,31 @@ class RecorderStats:
 
 
 @dataclass(frozen=True)
+class ControlTickTiming:
+    raw_tick_index: int
+    planned_ns: int
+    actual_start_ns: int
+    actual_end_ns: int
+    target_generated_ns: int | None = None
+    send_enqueued_ns: int | None = None
+    missed_periods: int = 0
+    next_rebase_deadline_ns: int = 0
+    transport_diagnostics: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        values = (
+            self.raw_tick_index,
+            self.planned_ns,
+            self.actual_start_ns,
+            self.actual_end_ns,
+            self.missed_periods,
+            self.next_rebase_deadline_ns,
+        )
+        if any(value < 0 for value in values) or self.actual_end_ns < self.actual_start_ns:
+            raise ValueError("control tick timing is invalid")
+
+
+@dataclass(frozen=True)
 class _SampleRecord:
     command: TeleopCommand
     state: RobotState
@@ -69,6 +97,7 @@ class _SampleRecord:
     camera_frames: Mapping[str, CameraFrame]
     valid: bool
     invalid_reason: str | None
+    timing: ControlTickTiming
 
 
 @dataclass(frozen=True)
@@ -182,8 +211,9 @@ class SessionRecorder:
         self._queue_high_watermark = 0
         self._stats_lock = threading.Lock()
         self._manifest: dict[str, object] = {
-            "schema_version": 2,
-            "state_telemetry_version": 2,
+            "schema_version": 4,
+            "state_telemetry_version": 4,
+            "binary_protocol_version": PROTOCOL_VERSION,
             "created_utc": _utc_now(),
             "closed_utc": None,
             "clean_shutdown": False,
@@ -197,6 +227,7 @@ class SessionRecorder:
             "camera_rig_version": robot_config.camera_rig.version,
             "camera_rig_hash": robot_config.camera_rig.config_hash,
             "camera_calibrations": archived_calibrations,
+            "cartesian_calibration": None,
             "teleop_config_version": teleop_profile.version,
             "teleop_config_hash": teleop_profile.config_hash,
             "action_source": source,
@@ -205,6 +236,42 @@ class SessionRecorder:
             "joint_order": list(robot_config.joint_order),
             "joint_unit": robot_config.joint_unit,
             "array_encoding": "little-endian float32 blobs",
+            "timestamp_chain_version": 1,
+            "timestamp_chain": [
+                "input_event_ns",
+                "input_snapshot_ns",
+                "control_planned_ns",
+                "control_actual_start_ns",
+                "control_actual_end_ns",
+                "target_generated_ns",
+                "send_enqueued_ns",
+                "serial_send_started_host_ns",
+                "serial_send_finished_host_ns",
+                "acknowledged_host_ns",
+                "acknowledged_mcu_us",
+                "can_queued_exact_host_ns",
+                "can_queued_exact_mcu_us",
+                "post_command_feedback_host_ns",
+                "post_command_feedback_mcu_us",
+                "state_host_ns",
+                "state_mcu_us",
+                "camera_capture_ns",
+                "camera_arrival_ns",
+            ],
+            "action_lifecycle": [
+                "received",
+                "safety_accepted",
+                "send_enqueued",
+                "serial_send_started",
+                "serial_send_finished",
+                "acknowledged",
+                "can_queued_exact",
+                "post_command_feedback",
+                "superseded",
+                "preempted_by_safety",
+                "rejected",
+                "failed",
+            ],
             "camera_archive": (
                 "atomic lossless uncompressed RGB/depth NPZ by role; "
                 "compression deferred to offline dataset export"
@@ -237,6 +304,31 @@ class SessionRecorder:
         self._manifest["firmware_version"] = firmware_version
         self._write_json_atomic(self.manifest_path, self._manifest)
 
+    def archive_cartesian_calibration(
+        self, calibration: CartesianCalibration
+    ) -> None:
+        """Archive the exact validated identity used by Cartesian control."""
+
+        self._require_open()
+        if self._manifest.get("cartesian_calibration") is not None:
+            raise RecorderError("Cartesian calibration is already archived")
+        calibrations_dir = self.session_dir / "calibrations"
+        calibrations_dir.mkdir(exist_ok=True)
+        archive_path = calibrations_dir / "cartesian.yaml"
+        try:
+            archive_path.write_bytes(Path(calibration.source_path).read_bytes())
+        except OSError as exc:
+            raise RecorderError(f"cannot archive Cartesian calibration: {exc}") from exc
+        archived_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        if archived_hash != calibration.file_hash:
+            raise RecorderError(
+                "Cartesian calibration changed while the session was starting"
+            )
+        record = calibration.as_dict()
+        record["archive_path"] = archive_path.relative_to(self.session_dir).as_posix()
+        self._manifest["cartesian_calibration"] = record
+        self._write_json_atomic(self.manifest_path, self._manifest)
+
     def record_sample(
         self,
         command: TeleopCommand,
@@ -247,6 +339,7 @@ class SessionRecorder:
         camera_frames: Mapping[str, CameraFrame] | None = None,
         valid: bool = True,
         invalid_reason: str | None = None,
+        timing: ControlTickTiming | None = None,
     ) -> None:
         self._require_open()
         if camera_frame is not None and camera_frames is not None:
@@ -259,6 +352,12 @@ class SessionRecorder:
         # reference here so the 20 Hz control thread does not copy megabytes of
         # image data; the writer releases the reference after persisting it.
         frame_copy = frames
+        timing = timing or ControlTickTiming(
+            raw_tick_index=0,
+            planned_ns=command.monotonic_ns,
+            actual_start_ns=command.monotonic_ns,
+            actual_end_ns=command.monotonic_ns,
+        )
         record = _SampleRecord(
             command=command,
             state=RobotState(
@@ -272,7 +371,6 @@ class SessionRecorder:
                 velocity_valid=state.velocity_valid,
                 gripper_valid=state.gripper_valid,
                 last_received_sequence=state.last_received_sequence,
-                last_applied_sequence=state.last_applied_sequence,
                 target_age_ms=state.target_age_ms,
                 config_hash=state.config_hash,
                 following_error=state.following_error.astype(np.float32, copy=True),
@@ -284,6 +382,14 @@ class SessionRecorder:
                 node_validity=state.node_validity.copy(),
                 hold_reason_bits=state.hold_reason_bits,
                 telemetry_validity=state.telemetry_validity,
+                can_transport_status=state.can_transport_status,
+                feedback_sample_mcu_us=state.feedback_sample_mcu_us.copy(),
+                feedback_sweep_id=state.feedback_sweep_id.copy(),
+                coherent_sweep_id=state.coherent_sweep_id,
+                feedback_max_skew_us=state.feedback_max_skew_us,
+                coherent_reference_mcu_us=state.coherent_reference_mcu_us,
+                state_repeated=state.state_repeated,
+                action_progress=state.action_progress,
             ),
             requested_action=None if action is None else action.requested.astype(np.float32, copy=True),
             applied_action=None if action is None else action.applied.astype(np.float32, copy=True),
@@ -293,6 +399,7 @@ class SessionRecorder:
             camera_frames=frame_copy,
             valid=valid,
             invalid_reason=invalid_reason,
+            timing=timing,
         )
         self._enqueue(("sample", record), sample=True)
 
@@ -312,6 +419,10 @@ class SessionRecorder:
                 ),
             )
         )
+
+    def record_action_lifecycle(self, update: ActionLifecycleUpdate) -> None:
+        self._require_open()
+        self._enqueue(("action_lifecycle", update))
 
     def close(self, *, clean_shutdown: bool = True) -> RecorderStats:
         if self._closed:
@@ -390,6 +501,10 @@ class SessionRecorder:
                     with self._stats_lock:
                         self._events += 1
                     uncommitted += 1
+                elif kind == "action_lifecycle":
+                    assert isinstance(payload, ActionLifecycleUpdate)
+                    self._write_action_lifecycle(connection, payload)
+                    uncommitted += 1
                 else:
                     raise RecorderError(f"unknown recorder item {kind}")
                 if uncommitted >= 20:
@@ -413,13 +528,26 @@ class SessionRecorder:
             CREATE TABLE IF NOT EXISTS samples (
                 sample_index INTEGER PRIMARY KEY AUTOINCREMENT,
                 tick_ns INTEGER NOT NULL,
+                raw_tick_index INTEGER NOT NULL,
+                input_event_ns INTEGER NOT NULL,
+                input_snapshot_ns INTEGER NOT NULL,
+                control_planned_ns INTEGER NOT NULL,
+                control_actual_start_ns INTEGER NOT NULL,
+                control_actual_end_ns INTEGER NOT NULL,
+                control_missed_periods INTEGER NOT NULL,
+                next_rebase_deadline_ns INTEGER NOT NULL,
+                transport_diagnostics_json TEXT NOT NULL,
+                target_generated_ns INTEGER,
+                send_enqueued_ns INTEGER,
                 source TEXT NOT NULL,
+                teleop_mode TEXT NOT NULL,
                 connected INTEGER NOT NULL,
                 deadman INTEGER NOT NULL,
                 hold_requested INTEGER NOT NULL,
                 estop_requested INTEGER NOT NULL,
                 episode_event TEXT,
                 joint_velocity_rad_s BLOB NOT NULL,
+                cartesian_twist BLOB NOT NULL,
                 gripper_velocity_per_s REAL NOT NULL,
                 raw_input_json TEXT NOT NULL,
                 requested_action BLOB,
@@ -437,7 +565,6 @@ class SessionRecorder:
                 velocity_valid INTEGER NOT NULL,
                 gripper_valid INTEGER NOT NULL,
                 last_received_sequence INTEGER NOT NULL,
-                last_applied_sequence INTEGER NOT NULL,
                 target_age_ms INTEGER NOT NULL,
                 state_following_error BLOB NOT NULL,
                 following_error_duration_ms BLOB NOT NULL,
@@ -446,8 +573,16 @@ class SessionRecorder:
                 consecutive_feedback_loss BLOB NOT NULL,
                 node_fault_bits BLOB NOT NULL,
                 node_validity BLOB NOT NULL,
+                state_can_transport_status INTEGER NOT NULL,
                 state_hold_reason_bits INTEGER NOT NULL,
                 state_telemetry_validity INTEGER NOT NULL,
+                feedback_sample_mcu_us BLOB NOT NULL,
+                feedback_sweep_id BLOB NOT NULL,
+                coherent_sweep_id INTEGER NOT NULL,
+                feedback_max_skew_us INTEGER NOT NULL,
+                coherent_reference_mcu_us INTEGER NOT NULL,
+                state_repeated INTEGER NOT NULL,
+                action_progress_json TEXT NOT NULL,
                 camera_frame_number INTEGER,
                 camera_capture_ns INTEGER,
                 camera_arrival_ns INTEGER,
@@ -473,6 +608,26 @@ class SessionRecorder:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS action_lifecycle (
+                action_sequence INTEGER PRIMARY KEY,
+                received_host_ns INTEGER,
+                safety_accepted_host_ns INTEGER,
+                send_enqueued_host_ns INTEGER,
+                serial_send_started_host_ns INTEGER,
+                serial_send_finished_host_ns INTEGER,
+                acknowledged_host_ns INTEGER,
+                acknowledged_mcu_us INTEGER,
+                can_queued_exact_host_ns INTEGER,
+                can_queued_exact_mcu_us INTEGER,
+                post_command_feedback_host_ns INTEGER,
+                post_command_feedback_mcu_us INTEGER,
+                terminal_stage TEXT,
+                detail TEXT
+            )
+            """
+        )
 
     def _write_sample(
         self,
@@ -486,28 +641,55 @@ class SessionRecorder:
         cursor = connection.execute(
             """
             INSERT INTO samples (
-                tick_ns, source, connected, deadman, hold_requested, estop_requested,
-                episode_event, joint_velocity_rad_s, gripper_velocity_per_s, raw_input_json,
+                tick_ns, raw_tick_index, input_event_ns, input_snapshot_ns,
+                control_planned_ns, control_actual_start_ns, control_actual_end_ns,
+                control_missed_periods, next_rebase_deadline_ns,
+                transport_diagnostics_json, target_generated_ns,
+                send_enqueued_ns, source, teleop_mode, connected, deadman,
+                hold_requested, estop_requested,
+                episode_event, joint_velocity_rad_s, cartesian_twist,
+                gripper_velocity_per_s, raw_input_json,
                 requested_action, applied_action, action_sequence, action_clipped,
                 action_reasons_json, state_position, state_velocity, state_host_ns, state_mcu_us,
                 state_mode, state_fault_bits, position_valid, velocity_valid, gripper_valid,
-                last_received_sequence, last_applied_sequence, target_age_ms,
+                last_received_sequence, target_age_ms,
                 state_following_error, following_error_duration_ms, feedback_age_ms,
                 feedback_loss_count, consecutive_feedback_loss, node_fault_bits,
-                node_validity, state_hold_reason_bits, state_telemetry_validity,
+                node_validity, state_can_transport_status,
+                state_hold_reason_bits, state_telemetry_validity,
+                feedback_sample_mcu_us, feedback_sweep_id, coherent_sweep_id,
+                feedback_max_skew_us, coherent_reference_mcu_us,
+                state_repeated, action_progress_json,
                 camera_frame_number, camera_capture_ns, camera_arrival_ns,
                 camera_color_depth_skew_ms, sample_valid, invalid_reason
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 command.monotonic_ns,
+                record.timing.raw_tick_index,
+                command.event_ns if command.event_ns is not None else command.monotonic_ns,
+                command.monotonic_ns,
+                record.timing.planned_ns,
+                record.timing.actual_start_ns,
+                record.timing.actual_end_ns,
+                record.timing.missed_periods,
+                record.timing.next_rebase_deadline_ns,
+                json.dumps(
+                    dict(record.timing.transport_diagnostics),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                record.timing.target_generated_ns,
+                record.timing.send_enqueued_ns,
                 command.source,
+                command.teleop_mode,
                 int(command.connected),
                 int(command.deadman),
                 int(command.hold_requested),
                 int(command.estop_requested),
                 command.episode_event,
                 _float32_blob(command.joint_velocity_rad_s),
+                _float32_blob(command.cartesian_twist),
                 command.gripper_velocity_per_s,
                 json.dumps(command.raw, separators=(",", ":"), ensure_ascii=False),
                 _float32_blob(record.requested_action),
@@ -525,7 +707,6 @@ class SessionRecorder:
                 int(state.velocity_valid),
                 int(state.gripper_valid),
                 state.last_received_sequence,
-                state.last_applied_sequence,
                 state.target_age_ms,
                 _float32_blob(state.following_error),
                 np.asarray(state.following_error_duration_ms, dtype="<u4").tobytes(),
@@ -534,8 +715,19 @@ class SessionRecorder:
                 np.asarray(state.consecutive_feedback_loss, dtype="<u2").tobytes(),
                 np.asarray(state.node_fault_bits, dtype="<u2").tobytes(),
                 np.asarray(state.node_validity, dtype="u1").tobytes(),
+                state.can_transport_status,
                 state.hold_reason_bits,
                 state.telemetry_validity,
+                np.asarray(state.feedback_sample_mcu_us, dtype="<u8").tobytes(),
+                np.asarray(state.feedback_sweep_id, dtype="<u4").tobytes(),
+                state.coherent_sweep_id,
+                state.feedback_max_skew_us,
+                state.coherent_reference_mcu_us,
+                int(state.state_repeated),
+                json.dumps(
+                    [asdict(progress) for progress in state.action_progress],
+                    separators=(",", ":"),
+                ),
                 None if frame is None else frame.frame_number,
                 None if frame is None else frame.capture_time_ns,
                 None if frame is None else frame.arrival_time_ns,
@@ -569,6 +761,52 @@ class SessionRecorder:
             if frame_archive.unique_frames > before:
                 with self._stats_lock:
                     self._camera_frames += 1
+
+    @staticmethod
+    def _write_action_lifecycle(
+        connection: sqlite3.Connection, update: ActionLifecycleUpdate
+    ) -> None:
+        connection.execute(
+            "INSERT OR IGNORE INTO action_lifecycle (action_sequence) VALUES (?)",
+            (update.sequence,),
+        )
+        columns = {
+            ActionStage.RECEIVED: ("received_host_ns",),
+            ActionStage.SAFETY_ACCEPTED: ("safety_accepted_host_ns",),
+            ActionStage.SEND_ENQUEUED: ("send_enqueued_host_ns",),
+            ActionStage.SERIAL_SEND_STARTED: ("serial_send_started_host_ns",),
+            ActionStage.SERIAL_SEND_FINISHED: ("serial_send_finished_host_ns",),
+            ActionStage.ACKNOWLEDGED: ("acknowledged_host_ns", "acknowledged_mcu_us"),
+            ActionStage.CAN_QUEUED_EXACT: (
+                "can_queued_exact_host_ns",
+                "can_queued_exact_mcu_us",
+            ),
+            ActionStage.POST_COMMAND_FEEDBACK: (
+                "post_command_feedback_host_ns",
+                "post_command_feedback_mcu_us",
+            ),
+        }
+        selected = columns.get(update.stage)
+        if selected is not None:
+            values: tuple[object, ...] = (update.host_time_ns,)
+            if len(selected) == 2:
+                values += (update.mcu_time_us,)
+            assignments = ", ".join(f"{column} = ?" for column in selected)
+            connection.execute(
+                f"UPDATE action_lifecycle SET {assignments} WHERE action_sequence = ?",
+                (*values, update.sequence),
+            )
+        if update.stage in (
+            ActionStage.SUPERSEDED,
+            ActionStage.PREEMPTED_BY_SAFETY,
+            ActionStage.REJECTED,
+            ActionStage.FAILED,
+        ):
+            connection.execute(
+                "UPDATE action_lifecycle SET terminal_stage = ?, detail = ? "
+                "WHERE action_sequence = ?",
+                (update.stage.value, update.detail, update.sequence),
+            )
 
     def _build_checksums(self) -> dict[str, object]:
         files: dict[str, str] = {}

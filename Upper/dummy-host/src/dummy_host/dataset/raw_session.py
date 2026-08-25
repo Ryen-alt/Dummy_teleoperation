@@ -38,8 +38,10 @@ class RawSession:
         self.manifest = json.loads(
             (self.session_dir / "manifest.json").read_text(encoding="utf-8")
         )
-        if self.manifest.get("schema_version") != 2:
-            raise RawSessionError("dataset export requires Raw Session schema version 2")
+        if self.manifest.get("schema_version") not in (2, 3, 4):
+            raise RawSessionError(
+                "session inspection supports Raw Session schema versions 2, 3 and 4"
+            )
         if self.manifest.get("clean_shutdown") is not True:
             raise RawSessionError("dataset export requires a cleanly finalized raw session")
 
@@ -168,40 +170,127 @@ class RawSession:
         recipe: ExportRecipe,
     ) -> Iterator[DatasetFrame]:
         db_path = self.session_dir / "samples.sqlite"
+        if self.manifest.get("schema_version") != 4:
+            raise RawSessionError(
+                "strict exact-sequence export requires Raw Session schema version 4; "
+                "schema v3 lacks CAN_QUEUED_EXACT/POST_COMMAND_FEEDBACK evidence"
+            )
         with sqlite3.connect(
             f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
         ) as connection:
             rows = connection.execute(
                 """
-                SELECT sample_index, tick_ns, state_position, applied_action,
-                       sample_valid, state_fault_bits
-                FROM samples
-                WHERE tick_ns >= ? AND tick_ns <= ?
-                ORDER BY tick_ns, sample_index
+                SELECT s.sample_index, s.tick_ns, s.raw_tick_index,
+                       s.control_actual_start_ns, s.state_host_ns,
+                       s.state_position, s.applied_action, s.action_sequence
+                FROM samples AS s
+                JOIN action_lifecycle AS a
+                  ON a.action_sequence = s.action_sequence
+                WHERE s.control_actual_start_ns >= ?
+                  AND s.control_actual_start_ns <= ?
+                  AND s.sample_valid = 1
+                  AND s.state_fault_bits = 0
+                  AND s.position_valid = 1
+                  AND a.received_host_ns IS NOT NULL
+                  AND a.safety_accepted_host_ns IS NOT NULL
+                  AND a.send_enqueued_host_ns IS NOT NULL
+                  AND a.acknowledged_host_ns IS NOT NULL
+                  AND a.can_queued_exact_host_ns IS NOT NULL
+                  AND a.post_command_feedback_host_ns IS NOT NULL
+                  AND a.terminal_stage IS NULL
+                  AND a.post_command_feedback_mcu_us >= a.can_queued_exact_mcu_us
+                  AND (a.post_command_feedback_mcu_us - a.can_queued_exact_mcu_us) <= ?
+                ORDER BY s.control_actual_start_ns, s.sample_index
                 """,
-                (episode.start_ns, episode.end_ns),
+                (
+                    episode.start_ns,
+                    episode.end_ns,
+                    int(recipe.max_action_observation_latency_ms * 1_000),
+                ),
             ).fetchall()
-            frame_index = 0
-            for sample_index, tick_ns, state_blob, action_blob, valid, fault_bits in rows:
-                if not valid or fault_bits or state_blob is None or action_blob is None:
-                    continue
+            if len(rows) < 2:
+                return
+            samples: list[dict[str, object]] = []
+            for row in rows:
+                sample_index, tick_ns, raw_tick, control_ns, state_ns, state_blob, action_blob, _ = row
                 state = np.frombuffer(state_blob, dtype="<f4").copy()
                 action = np.frombuffer(action_blob, dtype="<f4").copy()
                 if state.shape != (7,) or action.shape != (7,):
                     raise RawSessionError(f"sample {sample_index} has invalid state/action shape")
                 if not np.isfinite(state).all() or not np.isfinite(action).all():
                     raise RawSessionError(f"sample {sample_index} contains NaN or Inf")
-                camera_rows = connection.execute(
-                    "SELECT role, frame_path FROM camera_samples WHERE sample_index = ?",
-                    (sample_index,),
-                ).fetchall()
-                paths = {str(role): str(path) for role, path in camera_rows}
-                if any(role not in paths for role in recipe.required_camera_roles):
+                samples.append(
+                    {
+                        "sample_index": int(sample_index),
+                        "tick_ns": int(tick_ns),
+                        "raw_tick": int(raw_tick),
+                        "control_ns": int(control_ns),
+                        "state_ns": int(state_ns),
+                        "state": state,
+                        "action": action,
+                    }
+                )
+
+            camera_by_role: dict[str, list[tuple[int, int, str]]] = {}
+            camera_rows = connection.execute(
+                """
+                SELECT c.role, c.capture_ns, c.sample_index, c.frame_path
+                FROM camera_samples AS c
+                JOIN samples AS s ON s.sample_index = c.sample_index
+                WHERE s.control_actual_start_ns >= ? AND s.control_actual_start_ns <= ?
+                ORDER BY c.role, c.capture_ns
+                """,
+                (episode.start_ns, episode.end_ns),
+            ).fetchall()
+            for role, capture_ns, sample_index, frame_path in camera_rows:
+                camera_by_role.setdefault(str(role), []).append(
+                    (int(capture_ns), int(sample_index), str(frame_path))
+                )
+            if any(role not in camera_by_role for role in recipe.required_camera_roles):
+                return
+
+            control_times = np.asarray(
+                [int(sample["control_ns"]) for sample in samples], dtype=np.int64
+            )
+            period_ns = max(1, round(1e9 / recipe.control_hz))
+            grid_start_ns = max(episode.start_ns, int(control_times[0]))
+            grid_end_ns = min(episode.end_ns, int(control_times[-1]))
+            frame_index = 0
+            target_ns = grid_start_ns
+            while target_ns <= grid_end_ns:
+                right = int(np.searchsorted(control_times, target_ns, side="left"))
+                if right == 0:
+                    left = right = 0
+                elif right >= len(samples):
+                    left = right = len(samples) - 1
+                else:
+                    left = right - 1
+                left_time = int(samples[left]["control_ns"])
+                right_time = int(samples[right]["control_ns"])
+                if right != left and right_time - left_time > int(period_ns * 1.5):
+                    target_ns += period_ns
                     continue
+                alpha = 0.0 if right_time == left_time else (
+                    (target_ns - left_time) / (right_time - left_time)
+                )
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+                state = (
+                    (1.0 - alpha) * samples[left]["state"]
+                    + alpha * samples[right]["state"]
+                ).astype(np.float32)
+                action = (
+                    (1.0 - alpha) * samples[left]["action"]
+                    + alpha * samples[right]["action"]
+                ).astype(np.float32)
+                source_index = left if alpha < 0.5 else right
+                source = samples[source_index]
                 images: dict[str, np.ndarray] = {}
                 depths: dict[str, np.ndarray] = {}
                 for role in recipe.required_camera_roles:
-                    path = self.session_dir / paths[role]
+                    _, _, relative_path = min(
+                        camera_by_role[role], key=lambda item: abs(item[0] - target_ns)
+                    )
+                    path = self.session_dir / relative_path
                     with np.load(path, allow_pickle=False) as archive:
                         color = archive["color_rgb"].copy()
                         if recipe.include_depth:
@@ -213,45 +302,54 @@ class RawSession:
                             if depth_key is not None:
                                 if "depth_scale" not in archive:
                                     raise RawSessionError(
-                                        f"sample {sample_index} camera {role} has no depth scale"
+                                        f"resampled frame {frame_index} camera {role} has no depth scale"
                                     )
                                 depth_scale = float(archive["depth_scale"])
                                 if not np.isfinite(depth_scale) or depth_scale <= 0:
                                     raise RawSessionError(
-                                        f"sample {sample_index} camera {role} has invalid depth scale"
+                                        f"resampled frame {frame_index} camera {role} has invalid depth scale"
                                     )
                                 depths[role] = (
                                     archive[depth_key].astype(np.float32) * depth_scale
                                 )
                     if color.dtype != np.uint8 or color.ndim != 3 or color.shape[2] != 3:
-                        raise RawSessionError(f"sample {sample_index} camera {role} is not RGB uint8 HWC")
+                        raise RawSessionError(
+                            f"resampled frame {frame_index} camera {role} is not RGB uint8 HWC"
+                        )
                     images[role] = color
                 yield DatasetFrame(
                     observation_state=state,
                     action=action,
                     images=images,
-                    # LeRobot datasets use a fixed-FPS episode timeline. Preserve
-                    # the exact source monotonic timestamp separately for audit.
-                    timestamp_s=frame_index / recipe.control_hz,
+                    timestamp_s=(target_ns - grid_start_ns) / 1e9,
                     frame_index=frame_index,
                     episode_id=episode.episode_id,
                     task_id=episode.task_id,
                     task=episode.task,
-                    source_sample_index=int(sample_index),
-                    source_tick_ns=int(tick_ns),
+                    source_sample_index=int(source["sample_index"]),
+                    source_tick_ns=int(source["tick_ns"]),
+                    source_raw_tick_index=int(source["raw_tick"]),
+                    source_control_time_ns=int(source["control_ns"]),
+                    interpolation_alpha=alpha,
                     depths=depths,
                 )
                 frame_index += 1
+                target_ns += period_ns
 
     def sample_counts(self, episode: EpisodeWindow) -> tuple[int, int]:
         db_path = self.session_dir / "samples.sqlite"
         with sqlite3.connect(
             f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
         ) as connection:
+            timing_column = (
+                "control_actual_start_ns"
+                if self.manifest.get("schema_version") == 4
+                else "tick_ns"
+            )
             row = connection.execute(
-                """
+                f"""
                 SELECT COUNT(*), COALESCE(SUM(CASE WHEN sample_valid = 0 THEN 1 ELSE 0 END), 0)
-                FROM samples WHERE tick_ns >= ? AND tick_ns <= ?
+                FROM samples WHERE {timing_column} >= ? AND {timing_column} <= ?
                 """,
                 (episode.start_ns, episode.end_ns),
             ).fetchone()
