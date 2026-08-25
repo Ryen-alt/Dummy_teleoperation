@@ -103,7 +103,7 @@ def test_state_v4_coherent_feedback_and_exact_action_progress_round_trip(config)
         position=np.arange(7, dtype=np.float32) / 10,
         velocity=np.arange(7, dtype=np.float32) / 100,
         monotonic_ns=123_000,
-        mcu_time_us=123,
+        mcu_time_us=4_000,
         mode=ControlMode.HOLD,
         fault_bits=2,
         position_valid=True,
@@ -157,3 +157,34 @@ def test_state_v4_coherent_feedback_and_exact_action_progress_round_trip(config)
     assert restored.last_can_queued_mcu_us == 2000
     assert restored.last_post_command_feedback_sequence == 6
     assert restored.last_post_command_feedback_mcu_us == 3000
+
+
+def test_state_future_feedback_timestamp_is_clamped_to_state_time(config) -> None:
+    state = RobotState(
+        position=np.zeros(7, dtype=np.float32),
+        velocity=np.zeros(7, dtype=np.float32),
+        monotonic_ns=123_000,
+        mcu_time_us=3_747_033_199,
+        mode=ControlMode.HOLD,
+        fault_bits=0,
+        position_valid=True,
+        velocity_valid=True,
+        gripper_valid=True,
+        last_received_sequence=7,
+        target_age_ms=0,
+        config_hash=config.config_hash,
+        feedback_sample_mcu_us=np.full(
+            7, np.iinfo(np.uint64).max - 10, dtype=np.uint64
+        ),
+        feedback_sweep_id=np.ones(7, dtype=np.uint32),
+        coherent_sweep_id=1,
+        coherent_reference_mcu_us=np.iinfo(np.uint64).max - 10,
+    )
+
+    restored = unpack_state(pack_state(state), state.monotonic_ns)
+
+    np.testing.assert_array_equal(
+        restored.feedback_sample_mcu_us,
+        np.full(7, state.mcu_time_us, dtype=np.uint64),
+    )
+    assert restored.coherent_reference_mcu_us == state.mcu_time_us

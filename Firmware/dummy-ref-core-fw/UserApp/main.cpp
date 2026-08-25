@@ -258,6 +258,8 @@ void ThreadCanDispatch(void* argument)
 {
     (void) argument;
     dummy::protocol::ActuatorApplicationTracker application_tracker;
+    ScheduledActuatorRequest target_fanout{};
+    bool target_fanout_active = false;
     for (;;)
     {
         // Clear accumulated notifications: v2.1 never replays a delayed CAN
@@ -275,6 +277,12 @@ void ThreadCanDispatch(void* argument)
 
         if (dispatch_mode != can_dispatch_scheduler.mode())
         {
+            if (target_fanout_active && target_fanout.sequence != 0U)
+                dummy::protocol::RecordBinaryTargetSuperseded(
+                    target_fanout.sequence,
+                    dummy::protocol::BinaryControlMonotonicMicros());
+            target_fanout = {};
+            target_fanout_active = false;
             application_tracker.Reset();
             can_dispatch_scheduler.SetMode(dispatch_mode);
         }
@@ -302,10 +310,36 @@ void ThreadCanDispatch(void* argument)
         switch (step.action)
         {
             case dummy::protocol::CanDispatchAction::ActuatorTarget:
-                latest = ReadScheduledActuatorRequest();
-                if (latest.mode == scheduled.mode)
-                    queued = robot.ApplyExternalUrdfTargetNodeRad(
-                        step.node_id, latest.position);
+                if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
+                {
+                    if (!target_fanout_active)
+                    {
+                        const ScheduledActuatorRequest candidate =
+                            ReadScheduledActuatorRequest();
+                        if (candidate.mode == ScheduledActuatorMode::Stream &&
+                            candidate.sequence != 0U &&
+                            dummy::protocol::TryStartBinaryTargetDispatch(
+                                candidate.sequence))
+                        {
+                            target_fanout = candidate;
+                            target_fanout_active = true;
+                            application_tracker.Reset();
+                        }
+                    }
+                    if (target_fanout_active)
+                    {
+                        latest = target_fanout;
+                        queued = robot.ApplyExternalUrdfTargetNodeRad(
+                            step.node_id, latest.position);
+                    }
+                }
+                else
+                {
+                    latest = ReadScheduledActuatorRequest();
+                    if (latest.mode == scheduled.mode)
+                        queued = robot.ApplyExternalUrdfTargetNodeRad(
+                            step.node_id, latest.position);
+                }
                 break;
             case dummy::protocol::CanDispatchAction::PositionRequest:
                 queued = robot.TryRequestPositionFeedback(step.node_id);
@@ -336,17 +370,16 @@ void ThreadCanDispatch(void* argument)
                 {
                     const bool completed = application_tracker.RecordTransmission(
                         latest.sequence, step.node_id, true);
-                    const uint32_t superseded =
-                        application_tracker.TakeSupersededSequence();
-                    if (superseded != 0U)
-                        dummy::protocol::RecordBinaryTargetSuperseded(
-                            superseded,
-                            dummy::protocol::BinaryControlMonotonicMicros());
                     if (completed)
+                    {
                         dummy::protocol::RecordBinaryTargetCanQueuedExact(
                             latest.sequence,
                             dummy::protocol::BinaryControlMonotonicMicros(),
                             coherent.sweep_id);
+                        target_fanout = {};
+                        target_fanout_active = false;
+                        application_tracker.Reset();
+                    }
                 }
             }
             else

@@ -25,6 +25,7 @@ BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us);
 void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
                                       uint32_t coherent_sweep_id);
 void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us);
+bool TryStartBinaryTargetDispatch(uint32_t sequence);
 void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us);
 void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us);
 void ApplyBinarySafetyOutcome(const FeedbackSafetyOutput& safety);

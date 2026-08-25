@@ -153,6 +153,16 @@ void TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap()
     assert(wrapping_clock.Extend(0xFFFFFFF0U) == 0xFFFFFFF0ULL);
     assert(wrapping_clock.Extend(0x00000020U) ==
            (uint64_t{1} << 32U) + 0x20U);
+
+    // CAN RX can advance a sample timestamp after STATE captured now_us. The
+    // reconstruction must clamp that race instead of underflowing near 2^64.
+    assert(ExtendRecentMicros32(3747033199ULL, 3747033204U) ==
+           3747033199ULL);
+    assert(ExtendRecentMicros32(5000ULL, 4500U) == 4500ULL);
+    assert(ExtendRecentMicros32(
+               (uint64_t{1} << 32U) + 500U,
+               std::numeric_limits<uint32_t>::max() - 499U) ==
+           (uint64_t{1} << 32U) - 500U);
 }
 
 void TestMeasuredVelocityUsesOnlyValidMonotonicIntervals()

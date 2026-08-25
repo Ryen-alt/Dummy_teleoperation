@@ -382,11 +382,22 @@ def unpack_state(payload: bytes, monotonic_ns: int) -> RobotState:
         mode = ControlMode(values[16])
     except ValueError as exc:
         raise ProtocolError("STATE contains an invalid control mode") from exc
+    mcu_time_us = values[0]
+    # A CAN RX interrupt can publish a low 32-bit sample timestamp just after
+    # firmware captured STATE.mcu_time_us. Older v2.1 firmware reconstructed
+    # that small future offset with unsigned subtraction and emitted a value
+    # near 2^64. A feedback sample cannot legitimately be newer than the STATE
+    # carrying it, so clamp at the protocol boundary as a compatibility guard.
+    feedback_sample_mcu_us = np.minimum(
+        np.asarray(values[73:80], dtype=np.uint64),
+        np.uint64(mcu_time_us),
+    )
+    coherent_reference_mcu_us = min(values[89], mcu_time_us)
     return RobotState(
         position=position,
         velocity=velocity,
         monotonic_ns=monotonic_ns,
-        mcu_time_us=values[0],
+        mcu_time_us=mcu_time_us,
         mode=mode,
         fault_bits=values[18],
         position_valid=bool(validity & 0x01),
@@ -405,11 +416,11 @@ def unpack_state(payload: bytes, monotonic_ns: int) -> RobotState:
         can_transport_status=values[70],
         hold_reason_bits=values[71],
         telemetry_validity=values[72],
-        feedback_sample_mcu_us=np.asarray(values[73:80], dtype=np.uint64),
+        feedback_sample_mcu_us=feedback_sample_mcu_us,
         feedback_sweep_id=np.asarray(values[80:87], dtype=np.uint32),
         coherent_sweep_id=values[87],
         feedback_max_skew_us=values[88],
-        coherent_reference_mcu_us=values[89],
+        coherent_reference_mcu_us=coherent_reference_mcu_us,
         state_repeated=bool(values[90] & 0x01),
         action_progress=tuple(
             ActionProgressRecord(

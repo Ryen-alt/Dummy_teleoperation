@@ -232,13 +232,19 @@ void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
 {
     taskENTER_CRITICAL();
     auto& record = ProgressRecord(sequence);
-    record.flags |= kActionProgressCanQueuedExact;
-    record.can_queued_time_low_us = static_cast<uint32_t>(now_us);
-    const size_t index = static_cast<size_t>(&record - binary_progress.data());
-    binary_pending_progress[index] = {sequence, coherent_sweep_id};
-    QueueProgressEvent(
-        sequence, ActionProgressStage::CanQueuedExact, now_us,
-        coherent_sweep_id);
+    const bool first_report =
+        (record.flags & kActionProgressCanQueuedExact) == 0U;
+    if (first_report)
+    {
+        record.flags |= kActionProgressCanQueuedExact;
+        record.can_queued_time_low_us = static_cast<uint32_t>(now_us);
+        const size_t index = static_cast<size_t>(
+            &record - binary_progress.data());
+        binary_pending_progress[index] = {sequence, coherent_sweep_id};
+        QueueProgressEvent(
+            sequence, ActionProgressStage::CanQueuedExact, now_us,
+            coherent_sweep_id);
+    }
     if (binary_incomplete_target_sequence == sequence)
         binary_incomplete_target_sequence = 0U;
     taskEXIT_CRITICAL();
@@ -249,6 +255,7 @@ void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us)
     if (sequence == 0U)
         return;
     taskENTER_CRITICAL();
+    auto& accepted = ProgressRecord(sequence);
     const uint32_t previous = binary_incomplete_target_sequence;
     if (previous != 0U && previous != sequence)
     {
@@ -264,18 +271,29 @@ void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us)
                 previous, ActionProgressStage::Superseded, now_us, 0U);
         }
     }
-    bool already_exact = false;
-    for (const auto& record : binary_progress)
-    {
-        if (record.action_sequence == sequence &&
-            (record.flags & kActionProgressCanQueuedExact) != 0U)
-        {
-            already_exact = true;
-            break;
-        }
-    }
+    const bool already_exact =
+        (accepted.flags & kActionProgressCanQueuedExact) != 0U;
     binary_incomplete_target_sequence = already_exact ? 0U : sequence;
     taskEXIT_CRITICAL();
+}
+
+bool TryStartBinaryTargetDispatch(uint32_t sequence)
+{
+    if (sequence == 0U)
+        return false;
+    taskENTER_CRITICAL();
+    bool accepted = false;
+    for (const auto& record : binary_progress)
+    {
+        if (record.action_sequence != sequence)
+            continue;
+        accepted = (record.flags & kActionProgressSuperseded) == 0U;
+        break;
+    }
+    if (accepted && binary_incomplete_target_sequence == sequence)
+        binary_incomplete_target_sequence = 0U;
+    taskEXIT_CRITICAL();
+    return accepted;
 }
 
 void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us)
@@ -433,7 +451,6 @@ void MaybeSendBinaryState(uint64_t now_us)
     const auto safety = dummy::protocol::ReadBinarySafetyTelemetry();
     const auto measurement = dummy::protocol::ReadRobotStateForBinaryProtocol(
         now_us, safety);
-    const uint32_t now_low = static_cast<uint32_t>(now_us);
     std::array<uint64_t, dummy::protocol::kActuatorNodeCount>
         feedback_sample_mcu_us{};
     uint64_t sweep_first_us = 0U;
@@ -442,8 +459,9 @@ void MaybeSendBinaryState(uint64_t now_us)
     {
         if (measurement.position_sweep_id[index] == 0U)
             continue;
-        const uint32_t age_us = now_low - measurement.position_sample_us[index];
-        feedback_sample_mcu_us[index] = now_us - age_us;
+        feedback_sample_mcu_us[index] =
+            dummy::protocol::ExtendRecentMicros32(
+                now_us, measurement.position_sample_us[index]);
         const uint64_t sample_us = feedback_sample_mcu_us[index];
         sweep_first_us = sweep_first_us == 0U
             ? sample_us : std::min(sweep_first_us, sample_us);
