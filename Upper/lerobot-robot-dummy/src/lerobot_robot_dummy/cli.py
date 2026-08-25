@@ -42,12 +42,15 @@ def _load_recipe(path: str | Path) -> ExportRecipe:
         include_depth=include_depth,
         allow_uncalibrated_cameras=allow_uncalibrated,
         require_temporary_source=require_temporary,
+        max_action_observation_latency_ms=float(
+            raw.get("max_action_observation_latency_ms", 250.0)
+        ),
         metadata=metadata,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export a verified Raw Session v2 to LeRobotDataset v3")
+    parser = argparse.ArgumentParser(description="Export a verified Raw Session v3 to LeRobotDataset v3")
     parser.add_argument("--session", required=True)
     parser.add_argument("--recipe", required=True)
     parser.add_argument("--repo-id", required=True)

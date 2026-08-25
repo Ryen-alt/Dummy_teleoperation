@@ -90,6 +90,15 @@ class LeRobotV3DatasetSink:
             "action": frame.action.copy(),
             "source.sample_index": np.asarray([frame.source_sample_index], dtype=np.int64),
             "source.tick_ns": np.asarray([frame.source_tick_ns], dtype=np.int64),
+            "source.raw_tick_index": np.asarray(
+                [frame.source_raw_tick_index], dtype=np.int64
+            ),
+            "source.control_time_ns": np.asarray(
+                [frame.source_control_time_ns], dtype=np.int64
+            ),
+            "source.interpolation_alpha": np.asarray(
+                [frame.interpolation_alpha], dtype=np.float32
+            ),
             "task": frame.task,
         }
         payload.update(
@@ -164,6 +173,21 @@ class LeRobotV3DatasetSink:
                 "dtype": "int64",
                 "shape": (1,),
                 "names": ["monotonic_ns"],
+            },
+            "source.raw_tick_index": {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": ["raw_tick_index"],
+            },
+            "source.control_time_ns": {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": ["monotonic_ns"],
+            },
+            "source.interpolation_alpha": {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["alpha"],
             },
         }
         image_dtype = "video" if self.use_videos else "image"

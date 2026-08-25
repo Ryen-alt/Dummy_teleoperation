@@ -128,7 +128,7 @@ def test_temp_fixture_writes_a_complete_dual_camera_raw_session(tmp_path: Path) 
     )
     manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["clean_shutdown"] is True
-    assert manifest["firmware_version"] == "dummy-ref-v1.6-fixture-not-hardware"
+    assert manifest["firmware_version"] == "dummy-ref-v2.1-fixture-not-hardware"
     assert manifest["stats"]["samples"] == 8
     assert manifest["stats"]["camera_frames"] == 16
     assert manifest["extra"]["data_classification"] == TEMP_CLASSIFICATION

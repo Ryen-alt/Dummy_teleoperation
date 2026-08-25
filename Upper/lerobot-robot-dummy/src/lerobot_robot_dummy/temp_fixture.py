@@ -7,7 +7,13 @@ from pathlib import Path
 import numpy as np
 
 from dummy_host.cameras import CameraFrame
-from dummy_host.recording import SessionRecorder
+from dummy_host.domain import (
+    ActionLifecycleUpdate,
+    ActionProgressFlags,
+    ActionProgressRecord,
+    ActionStage,
+)
+from dummy_host.recording import ControlTickTiming, SessionRecorder
 from dummy_host.schema import AppliedAction, ControlMode, RobotState, load_robot_config
 from dummy_host.teleop import TeleopCommand, load_teleop_profile
 
@@ -50,8 +56,9 @@ def create_temp_raw_session(
         config,
         profile,
         source="synthetic_temp_pipeline_fixture",
-        firmware_version="dummy-ref-v1.6-fixture-not-hardware",
+        firmware_version="dummy-ref-v2.1-fixture-not-hardware",
         session_name=session_name,
+        queue_size=max(256, episodes * frames_per_episode * 10 + 16),
         extra_manifest={
             "data_classification": TEMP_CLASSIFICATION,
             "offline_training_only": True,
@@ -113,10 +120,23 @@ def create_temp_raw_session(
                 velocity_valid=True,
                 gripper_valid=True,
                 last_received_sequence=sequence,
-                last_applied_sequence=sequence,
                 target_age_ms=1,
                 config_hash=config.config_hash,
                 feedback_age_ms=np.ones(7, dtype=np.uint32),
+                feedback_sample_mcu_us=np.full(7, tick_ns // 1000, dtype=np.uint64),
+                feedback_sweep_id=np.full(7, frame_index + 1, dtype=np.uint32),
+                coherent_sweep_id=frame_index + 1,
+                coherent_reference_mcu_us=tick_ns // 1000,
+                action_progress=(
+                    ActionProgressRecord(
+                        sequence=sequence,
+                        flags=int(ActionProgressFlags.CAN_QUEUED_EXACT)
+                        | int(ActionProgressFlags.POST_COMMAND_FEEDBACK),
+                        can_queued_mcu_us=tick_ns // 1000 + 2_000,
+                        post_feedback_mcu_us=tick_ns // 1000 + 3_000,
+                        feedback_sweep_id=frame_index + 1,
+                    ),
+                ),
             )
             action = AppliedAction(
                 requested=requested,
@@ -148,7 +168,40 @@ def create_temp_raw_session(
                     role=role,
                     calibration_version="uncalibrated-v0",
                 )
-            recorder.record_sample(command, state, action=action, camera_frames=frames)
+            recorder.record_sample(
+                command,
+                state,
+                action=action,
+                camera_frames=frames,
+                timing=ControlTickTiming(
+                    frame_index,
+                    tick_ns,
+                    tick_ns,
+                    tick_ns + 500_000,
+                    target_generated_ns=tick_ns + 100_000,
+                    send_enqueued_ns=tick_ns + 200_000,
+                ),
+            )
+            for offset_ns, stage in enumerate(
+                (
+                    ActionStage.RECEIVED,
+                    ActionStage.SAFETY_ACCEPTED,
+                    ActionStage.SEND_ENQUEUED,
+                    ActionStage.SERIAL_SEND_STARTED,
+                    ActionStage.SERIAL_SEND_FINISHED,
+                    ActionStage.ACKNOWLEDGED,
+                    ActionStage.CAN_QUEUED_EXACT,
+                    ActionStage.POST_COMMAND_FEEDBACK,
+                )
+            ):
+                recorder.record_action_lifecycle(
+                    ActionLifecycleUpdate(
+                        sequence,
+                        stage,
+                        tick_ns + offset_ns * 400_000,
+                        mcu_time_us=tick_ns // 1000 + offset_ns * 400,
+                    )
+                )
         recorder.record_event(
             "episode_success",
             monotonic_ns=episode_start_ns + frames_per_episode * 50_000_000 + 1_000_000,
@@ -160,7 +213,7 @@ def create_temp_raw_session(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create a synthetic v1.6-shaped TEMP Raw Session for offline pipeline tests"
+        description="Create a synthetic v2.0-shaped TEMP Raw Session for offline pipeline tests"
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--input-config", required=True)
