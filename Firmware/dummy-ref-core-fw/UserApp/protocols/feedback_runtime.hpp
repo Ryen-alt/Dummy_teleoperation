@@ -21,8 +21,8 @@ struct MotorTransportDiagnostics
 
 // Firmware-only bridge around the pure C++ monitor. Request functions run in
 // task context; response functions are safe to call from the CAN RX interrupt.
-void RecordPositionFeedbackRequest(uint8_t node_id);
-void RecordPositionFeedbackResponse(uint8_t node_id);
+void RecordPositionFeedbackRequest(uint8_t node_id, uint32_t sweep_id = 0U);
+bool RecordPositionFeedbackResponse(uint8_t node_id);
 void RecordPositionFeedbackTimeout(uint8_t node_id);
 void RecordTemperatureFeedbackRequest(uint8_t node_id);
 void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c);
@@ -30,6 +30,7 @@ void RecordMotorTransportDiagnostics(uint8_t node_id, const uint8_t* data,
                                      uint32_t length);
 void RecordTemperatureFeedbackTimeout(uint8_t node_id);
 FeedbackResponseEvents ConsumeFeedbackResponseEvents();
+void CancelPendingFeedbackRequests();
 std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(uint32_t now_us);
 CoherentFeedbackStatus ReadCoherentFeedbackStatus();
 MotorTransportDiagnostics ReadMotorTransportDiagnostics();

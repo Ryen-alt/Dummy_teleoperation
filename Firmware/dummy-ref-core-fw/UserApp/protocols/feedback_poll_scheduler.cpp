@@ -7,9 +7,6 @@ namespace dummy::protocol
 {
 namespace
 {
-constexpr uint8_t kAllNodeMask = static_cast<uint8_t>(
-    (1U << kActuatorNodeCount) - 1U);
-
 uint8_t NodeMask(uint8_t node_id)
 {
     return node_id >= 1U && node_id <= kActuatorNodeCount
@@ -19,6 +16,13 @@ uint8_t NodeMask(uint8_t node_id)
 uint32_t SaturatingIncrement(uint32_t value)
 {
     return value == std::numeric_limits<uint32_t>::max() ? value : value + 1U;
+}
+
+uint32_t SaturatingAdd(uint32_t value, uint32_t increment)
+{
+    const uint32_t remaining = std::numeric_limits<uint32_t>::max() - value;
+    return increment > remaining
+        ? std::numeric_limits<uint32_t>::max() : value + increment;
 }
 }
 
@@ -173,51 +177,105 @@ uint8_t CanDispatchScheduler::SelectTemperatureNode(uint32_t now_us) const
     return selected;
 }
 
-void CanDispatchScheduler::CountUnexpectedResponses(
-    uint8_t mask, CanDispatchAction action, uint8_t expected_node)
+uint8_t CanDispatchScheduler::SelectPositionRetryNode() const
 {
-    uint8_t expected_mask = 0U;
-    if (query_pending_ && pending_action_ == action)
-        expected_mask = NodeMask(expected_node);
-    uint8_t unexpected = static_cast<uint8_t>(mask & ~expected_mask & kAllNodeMask);
-    while (unexpected != 0U)
+    uint8_t node_id = position_sweep_start_node_;
+    for (size_t attempt = 0; attempt < kActuatorNodeCount; ++attempt)
     {
-        diagnostics_.unexpected_response_count = SaturatingIncrement(
-            diagnostics_.unexpected_response_count);
-        unexpected = static_cast<uint8_t>(unexpected & (unexpected - 1U));
+        if ((position_retry_mask_ & NodeMask(node_id)) != 0U)
+            return node_id;
+        node_id = NextNode(node_id);
     }
+    return 0U;
+}
+
+void CanDispatchScheduler::FinishPositionSweep(uint32_t now_us)
+{
+    position_sweep_active_ = false;
+    position_sweep_count_ = 0U;
+    position_sweep_id_ = 0U;
+    position_retry_mask_ = 0U;
+    position_retry_phase_ = false;
+    position_pending_.fill(false);
+    position_attempts_.fill(0U);
+    position_sweep_start_node_ = NextNode(position_sweep_start_node_);
+    const uint32_t period_us = CyclePeriodUs(config_.position_hz_per_node);
+    if (period_us == 0U)
+    {
+        next_position_deadline_us_ = 0U;
+        return;
+    }
+    const uint32_t lateness_us = now_us - next_position_deadline_us_;
+    next_position_deadline_us_ =
+        DeadlineDue(now_us, next_position_deadline_us_) &&
+        lateness_us >= period_us
+        ? now_us + period_us : next_position_deadline_us_ + period_us;
+}
+
+void CanDispatchScheduler::AdvancePositionSweep(uint32_t now_us)
+{
+    if (position_retry_phase_)
+    {
+        const uint8_t next_retry = SelectPositionRetryNode();
+        if (next_retry == 0U)
+            FinishPositionSweep(now_us);
+        else
+            position_sweep_node_ = next_retry;
+        return;
+    }
+
+    ++position_sweep_count_;
+    if (position_sweep_count_ < kActuatorNodeCount)
+    {
+        position_sweep_node_ = NextNode(position_sweep_node_);
+        return;
+    }
+
+    position_retry_phase_ = true;
+    const uint8_t next_retry = SelectPositionRetryNode();
+    if (next_retry == 0U)
+        FinishPositionSweep(now_us);
+    else
+        position_sweep_node_ = next_retry;
 }
 
 void CanDispatchScheduler::ConsumeResponses(
     const FeedbackResponseEvents& responses, uint32_t now_us)
 {
+    const uint32_t unexpected = SaturatingAdd(
+        responses.unexpected_position_count,
+        responses.unexpected_temperature_count);
+    if (mode_ == CanDispatchMode::Stream)
+        diagnostics_.unexpected_response_count = SaturatingAdd(
+            diagnostics_.unexpected_response_count, unexpected);
+    else
+        diagnostics_.maintenance_response_count = SaturatingAdd(
+            diagnostics_.maintenance_response_count, unexpected);
+
+    const bool current_position_matched = query_pending_ &&
+        pending_action_ == CanDispatchAction::PositionRequest &&
+        (responses.position_mask & NodeMask(pending_node_id_)) != 0U;
+    const bool current_temperature_matched = query_pending_ &&
+        pending_action_ == CanDispatchAction::TemperatureRequest &&
+        (responses.temperature_mask & NodeMask(pending_node_id_)) != 0U;
+
     for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
     {
         const uint8_t mask = NodeMask(node_id);
         if ((responses.position_mask & mask) != 0U)
+        {
             diagnostics_.position_responded[node_id - 1U] = SaturatingIncrement(
                 diagnostics_.position_responded[node_id - 1U]);
+            position_pending_[node_id - 1U] = false;
+            position_retry_mask_ = static_cast<uint8_t>(
+                position_retry_mask_ & ~mask);
+        }
         if ((responses.temperature_mask & mask) != 0U)
             diagnostics_.temperature_responded[node_id - 1U] = SaturatingIncrement(
                 diagnostics_.temperature_responded[node_id - 1U]);
     }
 
-    CountUnexpectedResponses(
-        responses.position_mask, CanDispatchAction::PositionRequest,
-        pending_node_id_);
-    CountUnexpectedResponses(
-        responses.temperature_mask, CanDispatchAction::TemperatureRequest,
-        pending_node_id_);
-
-    if (!query_pending_)
-        return;
-    const uint8_t mask = NodeMask(pending_node_id_);
-    const bool matched =
-        (pending_action_ == CanDispatchAction::PositionRequest &&
-         (responses.position_mask & mask) != 0U) ||
-        (pending_action_ == CanDispatchAction::TemperatureRequest &&
-         (responses.temperature_mask & mask) != 0U);
-    if (matched)
+    if (current_position_matched || current_temperature_matched)
     {
         const CanDispatchAction completed_action = pending_action_;
         query_pending_ = false;
@@ -225,37 +283,14 @@ void CanDispatchScheduler::ConsumeResponses(
         pending_node_id_ = 0U;
         if (completed_action == CanDispatchAction::PositionRequest &&
             position_sweep_active_)
-        {
-            ++position_sweep_count_;
-            if (position_sweep_count_ >= kActuatorNodeCount)
-            {
-                position_sweep_active_ = false;
-                position_sweep_count_ = 0U;
-                position_sweep_start_node_ = NextNode(
-                    position_sweep_start_node_);
-                const uint32_t period_us = CyclePeriodUs(
-                    config_.position_hz_per_node);
-                if (period_us == 0U)
-                {
-                    next_position_deadline_us_ = 0U;
-                }
-                else
-                {
-                    const uint32_t lateness_us =
-                        now_us - next_position_deadline_us_;
-                    next_position_deadline_us_ =
-                        DeadlineDue(now_us, next_position_deadline_us_) &&
-                        lateness_us >= period_us
-                        ? now_us + period_us
-                        : next_position_deadline_us_ + period_us;
-                }
-            }
-            else
-            {
-                position_sweep_node_ = NextNode(position_sweep_node_);
-            }
-        }
+            AdvancePositionSweep(now_us);
     }
+
+    if (position_sweep_active_ && position_retry_phase_ &&
+        position_retry_mask_ == 0U &&
+        (!query_pending_ ||
+         pending_action_ != CanDispatchAction::PositionRequest))
+        FinishPositionSweep(now_us);
 }
 
 void CanDispatchScheduler::SetMode(CanDispatchMode mode)
@@ -269,6 +304,11 @@ void CanDispatchScheduler::SetMode(CanDispatchMode mode)
     target_fanout_node_ = 1U;
     position_sweep_active_ = false;
     position_sweep_count_ = 0U;
+    position_sweep_id_ = 0U;
+    position_retry_mask_ = 0U;
+    position_retry_phase_ = false;
+    position_pending_.fill(false);
+    position_attempts_.fill(0U);
     query_pending_ = false;
     pending_action_ = CanDispatchAction::None;
     pending_node_id_ = 0U;
@@ -305,16 +345,24 @@ CanDispatchStep CanDispatchScheduler::Next(
         {
             diagnostics_.position_timed_out[index] = SaturatingIncrement(
                 diagnostics_.position_timed_out[index]);
-            position_sweep_active_ = false;
-            position_sweep_count_ = 0U;
-            position_sweep_start_node_ = NextNode(position_sweep_start_node_);
-            const uint32_t period_us = CyclePeriodUs(
-                config_.position_hz_per_node);
-            next_position_deadline_us_ = period_us == 0U
-                ? 0U : now_us + period_us;
+            const bool retry_exhausted = position_retry_phase_ ||
+                position_attempts_[index] >= 2U;
+            if (retry_exhausted)
+            {
+                step.timed_out_final = true;
+                position_pending_[index] = false;
+                position_retry_mask_ = static_cast<uint8_t>(
+                    position_retry_mask_ & ~NodeMask(pending_node_id_));
+            }
+            else
+            {
+                position_retry_mask_ = static_cast<uint8_t>(
+                    position_retry_mask_ | NodeMask(pending_node_id_));
+            }
         }
         else if (pending_action_ == CanDispatchAction::TemperatureRequest)
         {
+            step.timed_out_final = true;
             diagnostics_.temperature_timed_out[index] = SaturatingIncrement(
                 diagnostics_.temperature_timed_out[index]);
             const uint32_t period_us = PeriodUs(
@@ -325,6 +373,9 @@ CanDispatchStep CanDispatchScheduler::Next(
         query_pending_ = false;
         pending_action_ = CanDispatchAction::None;
         pending_node_id_ = 0U;
+        if (step.timed_out_action == CanDispatchAction::PositionRequest &&
+            position_sweep_active_)
+            AdvancePositionSweep(now_us);
     }
 
     // Emergency disable and HOLD transitions always outrank normal traffic.
@@ -402,15 +453,24 @@ CanDispatchStep CanDispatchScheduler::Next(
         return step;
     }
 
-    // Position feedback is a complete rotating sweep. Each response wakes the
-    // dispatcher and immediately schedules the next node. A timeout discards
-    // the rest of the sweep and re-bases its 25 ms deadline.
+    // A first timeout skips the node and continues the rotating sweep. Only
+    // nodes still missing at the tail receive one bounded retry.
     if (!position_sweep_active_ && next_position_deadline_us_ != 0U &&
         DeadlineDue(now_us, next_position_deadline_us_))
     {
         position_sweep_active_ = true;
         position_sweep_count_ = 0U;
         position_sweep_node_ = position_sweep_start_node_;
+        position_retry_mask_ = 0U;
+        position_retry_phase_ = false;
+        position_pending_.fill(false);
+        position_attempts_.fill(0U);
+        position_sweep_id_ = next_position_sweep_id_++;
+        if (position_sweep_id_ == 0U)
+        {
+            position_sweep_id_ = 1U;
+            next_position_sweep_id_ = 2U;
+        }
     }
     if (position_sweep_active_)
     {
@@ -418,6 +478,7 @@ CanDispatchStep CanDispatchScheduler::Next(
         {
             step.action = CanDispatchAction::PositionRequest;
             step.node_id = position_sweep_node_;
+            step.feedback_sweep_id = position_sweep_id_;
             return step;
         }
         diagnostics_.idle_slot_count = SaturatingIncrement(
@@ -460,6 +521,9 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
     {
         diagnostics_.target_queued[step.node_id - 1U] = SaturatingIncrement(
             diagnostics_.target_queued[step.node_id - 1U]);
+        if (!step.transition && query_pending_)
+            diagnostics_.query_target_overlap_count = SaturatingIncrement(
+                diagnostics_.query_target_overlap_count);
         if (!step.transition)
         {
             if (step.node_id < kActuatorNodeCount)
@@ -485,6 +549,9 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
     {
         diagnostics_.position_requested[step.node_id - 1U] = SaturatingIncrement(
             diagnostics_.position_requested[step.node_id - 1U]);
+        position_pending_[step.node_id - 1U] = true;
+        if (position_attempts_[step.node_id - 1U] != UINT8_MAX)
+            ++position_attempts_[step.node_id - 1U];
         query_pending_ = true;
         pending_action_ = step.action;
         pending_node_id_ = step.node_id;
@@ -547,6 +614,12 @@ void CanDispatchScheduler::Reset()
     position_sweep_start_node_ = 1U;
     position_sweep_node_ = 1U;
     position_sweep_count_ = 0U;
+    position_sweep_id_ = 0U;
+    next_position_sweep_id_ = 1U;
+    position_retry_mask_ = 0U;
+    position_retry_phase_ = false;
+    position_pending_.fill(false);
+    position_attempts_.fill(0U);
     last_node_tx_us_.fill(0U);
     node_transmitted_.fill(false);
     query_pending_ = false;

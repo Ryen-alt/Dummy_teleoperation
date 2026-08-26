@@ -46,11 +46,38 @@ void CanFeedbackMonitor::ForRequestedNodes(uint8_t node_id, Callback callback)
         callback(nodes_[node_id - 1]);
 }
 
-void CanFeedbackMonitor::OnPositionRequest(uint8_t node_id, uint32_t now_us)
+void CanFeedbackMonitor::OnPositionRequest(uint8_t node_id, uint32_t now_us,
+                                           uint32_t sweep_id)
 {
     (void) now_us;
     if (node_id > kActuatorNodeCount)
         return;
+    if (sweep_id != 0U)
+    {
+        if (current_sweep_id_ != sweep_id)
+            current_sweep_request_mask_ = 0U;
+        current_sweep_id_ = sweep_id;
+        const uint8_t request_mask = node_id == 0U
+            ? kAllNodeMask : NodeMask(node_id);
+        current_sweep_request_mask_ = static_cast<uint8_t>(
+            current_sweep_request_mask_ | request_mask);
+        ForRequestedNodes(node_id, [sweep_id](NodeState& node)
+        {
+            if (node.position_pending &&
+                node.pending_sweep_id != sweep_id)
+            {
+                if (node.total_position_losses !=
+                    std::numeric_limits<uint32_t>::max())
+                    ++node.total_position_losses;
+                if (node.consecutive_position_losses !=
+                    std::numeric_limits<uint16_t>::max())
+                    ++node.consecutive_position_losses;
+            }
+            node.position_pending = true;
+            node.pending_sweep_id = sweep_id;
+        });
+        return;
+    }
     if (node_id == 0U)
     {
         if (current_sweep_request_mask_ != 0U)
@@ -99,11 +126,13 @@ void CanFeedbackMonitor::OnPositionRequest(uint8_t node_id, uint32_t now_us)
     });
 }
 
-void CanFeedbackMonitor::OnPositionResponse(uint8_t node_id, uint32_t now_us)
+bool CanFeedbackMonitor::OnPositionResponse(uint8_t node_id, uint32_t now_us)
 {
     if (node_id < 1 || node_id > nodes_.size())
-        return;
+        return false;
     NodeState& node = nodes_[node_id - 1];
+    if (!node.position_pending || node.pending_sweep_id == 0U)
+        return false;
     node.last_position_us = now_us;
     node.position_sweep_id = node.pending_sweep_id;
     node.position_seen = true;
@@ -112,7 +141,7 @@ void CanFeedbackMonitor::OnPositionResponse(uint8_t node_id, uint32_t now_us)
 
     const uint32_t candidate_sweep = node.position_sweep_id;
     if (candidate_sweep == 0U)
-        return;
+        return true;
     uint32_t newest_age_us = 0U;
     uint32_t oldest_age_us = 0U;
     bool first = true;
@@ -120,7 +149,7 @@ void CanFeedbackMonitor::OnPositionResponse(uint8_t node_id, uint32_t now_us)
     {
         if (!candidate.position_seen ||
             candidate.position_sweep_id != candidate_sweep)
-            return;
+            return true;
         const uint32_t age_us = now_us - candidate.last_position_us;
         if (first)
         {
@@ -142,6 +171,7 @@ void CanFeedbackMonitor::OnPositionResponse(uint8_t node_id, uint32_t now_us)
         coherent_.position_sample_us[index] = nodes_[index].last_position_us;
         coherent_.position_sweep_id[index] = nodes_[index].position_sweep_id;
     }
+    return true;
 }
 
 void CanFeedbackMonitor::OnPositionTimeout(uint8_t node_id)
@@ -168,16 +198,19 @@ void CanFeedbackMonitor::OnTemperatureRequest(uint8_t node_id, uint32_t now_us)
     });
 }
 
-void CanFeedbackMonitor::OnTemperatureResponse(uint8_t node_id, uint32_t now_us,
+bool CanFeedbackMonitor::OnTemperatureResponse(uint8_t node_id, uint32_t now_us,
                                                 float temperature_c)
 {
     if (node_id < 1 || node_id > nodes_.size() || !std::isfinite(temperature_c))
-        return;
+        return false;
     NodeState& node = nodes_[node_id - 1];
+    if (!node.temperature_pending)
+        return false;
     node.last_temperature_us = now_us;
     node.temperature_c = temperature_c;
     node.temperature_seen = true;
     node.temperature_pending = false;
+    return true;
 }
 
 void CanFeedbackMonitor::OnTemperatureTimeout(uint8_t node_id)
@@ -213,6 +246,17 @@ CanFeedbackMonitor::Snapshot(uint32_t now_us) const
 CoherentFeedbackStatus CanFeedbackMonitor::CoherentSnapshot() const
 {
     return coherent_;
+}
+
+void CanFeedbackMonitor::CancelPendingRequests()
+{
+    for (auto& node : nodes_)
+    {
+        node.position_pending = false;
+        node.temperature_pending = false;
+        node.pending_sweep_id = 0U;
+    }
+    current_sweep_request_mask_ = 0U;
 }
 
 void CanFeedbackMonitor::Reset()

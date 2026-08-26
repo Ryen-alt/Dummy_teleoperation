@@ -43,15 +43,18 @@ public:
     explicit CanFeedbackMonitor(uint32_t coherent_max_skew_us = 30000U)
         : coherent_max_skew_us_(coherent_max_skew_us)
     {}
-    void OnPositionRequest(uint8_t node_id, uint32_t now_us);
-    void OnPositionResponse(uint8_t node_id, uint32_t now_us);
+    void OnPositionRequest(uint8_t node_id, uint32_t now_us,
+                           uint32_t sweep_id = 0U);
+    bool OnPositionResponse(uint8_t node_id, uint32_t now_us);
     void OnPositionTimeout(uint8_t node_id);
     void OnTemperatureRequest(uint8_t node_id, uint32_t now_us);
-    void OnTemperatureResponse(uint8_t node_id, uint32_t now_us, float temperature_c);
+    bool OnTemperatureResponse(uint8_t node_id, uint32_t now_us,
+                               float temperature_c);
     void OnTemperatureTimeout(uint8_t node_id);
 
     std::array<NodeFeedbackStatus, kActuatorNodeCount> Snapshot(uint32_t now_us) const;
     CoherentFeedbackStatus CoherentSnapshot() const;
+    void CancelPendingRequests();
     void Reset();
 
 private:

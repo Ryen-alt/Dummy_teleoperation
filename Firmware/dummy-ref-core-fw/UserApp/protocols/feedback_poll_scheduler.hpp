@@ -31,14 +31,18 @@ struct FeedbackResponseEvents
 {
     uint8_t position_mask = 0;
     uint8_t temperature_mask = 0;
+    uint32_t unexpected_position_count = 0;
+    uint32_t unexpected_temperature_count = 0;
 };
 
 struct CanDispatchStep
 {
     CanDispatchAction action = CanDispatchAction::None;
     uint8_t node_id = 0;
+    uint32_t feedback_sweep_id = 0;
     CanDispatchAction timed_out_action = CanDispatchAction::None;
     uint8_t timed_out_node_id = 0;
+    bool timed_out_final = false;
     bool transition = false;
 };
 
@@ -58,6 +62,8 @@ struct CanDispatchDiagnostics
     uint32_t idle_slot_count = 0;
     uint32_t deferred_send_count = 0;
     uint32_t unexpected_response_count = 0;
+    uint32_t maintenance_response_count = 0;
+    uint32_t query_target_overlap_count = 0;
     std::array<uint32_t, kActuatorNodeCount> target_queued{};
     std::array<uint32_t, kActuatorNodeCount> position_requested{};
     std::array<uint32_t, kActuatorNodeCount> position_responded{};
@@ -110,8 +116,9 @@ private:
     uint8_t SelectTemperatureNode(uint32_t now_us) const;
     void ConsumeResponses(const FeedbackResponseEvents& responses,
                           uint32_t now_us);
-    void CountUnexpectedResponses(uint8_t mask, CanDispatchAction action,
-                                  uint8_t expected_node);
+    void AdvancePositionSweep(uint32_t now_us);
+    void FinishPositionSweep(uint32_t now_us);
+    uint8_t SelectPositionRetryNode() const;
     static uint32_t PeriodUs(uint32_t hz_per_node);
     static uint32_t CyclePeriodUs(uint32_t hz_per_node);
     static bool DeadlineDue(uint32_t now_us, uint32_t deadline_us);
@@ -138,6 +145,12 @@ private:
     uint8_t position_sweep_start_node_ = 1U;
     uint8_t position_sweep_node_ = 1U;
     uint8_t position_sweep_count_ = 0U;
+    uint32_t position_sweep_id_ = 0U;
+    uint32_t next_position_sweep_id_ = 1U;
+    uint8_t position_retry_mask_ = 0U;
+    bool position_retry_phase_ = false;
+    std::array<bool, kActuatorNodeCount> position_pending_{};
+    std::array<uint8_t, kActuatorNodeCount> position_attempts_{};
     std::array<uint32_t, kActuatorNodeCount> last_node_tx_us_{};
     std::array<bool, kActuatorNodeCount> node_transmitted_{};
     bool query_pending_ = false;

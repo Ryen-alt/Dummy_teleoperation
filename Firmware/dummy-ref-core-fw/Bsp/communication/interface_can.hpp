@@ -36,6 +36,7 @@ struct CanTxMetadata
     uint32_t session_epoch = 0;
     uint32_t action_sequence = 0;
     uint32_t fanout_generation = 0;
+    uint32_t feedback_sweep_id = 0;
     uint32_t enqueued_time_us = 0;
     uint8_t node_id = 0;
 };

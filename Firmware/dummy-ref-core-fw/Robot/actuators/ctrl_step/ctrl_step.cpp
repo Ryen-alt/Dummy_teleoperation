@@ -4,10 +4,20 @@
 
 namespace
 {
+struct PositionRequestContext
+{
+    uint8_t node_id = 0U;
+    uint32_t sweep_id = 0U;
+};
+
 void RecordPositionRequest(void* context)
 {
     if (context != nullptr)
-        dummy::protocol::RecordPositionFeedbackRequest(*static_cast<uint8_t*>(context));
+    {
+        const auto* request = static_cast<PositionRequestContext*>(context);
+        dummy::protocol::RecordPositionFeedbackRequest(
+            request->node_id, request->sweep_id);
+    }
 }
 
 void RecordTemperatureRequest(void* context)
@@ -365,9 +375,10 @@ void CtrlStepMotor::UpdateAngle()
     CAN_TxHeaderTypeDef request_header = txHeader;
     request_header.StdId = nodeID << 7 | mode;
     uint8_t request_data[8] = {};
+    PositionRequestContext request_context{nodeID, 0U};
 
     CanSendMessage(get_can_ctx(hcan), request_data, &request_header,
-                   RecordPositionRequest, &nodeID);
+                   RecordPositionRequest, &request_context);
 }
 
 
@@ -377,9 +388,11 @@ bool CtrlStepMotor::TryUpdateAngle(const CanTxMetadata* metadata)
     CAN_TxHeaderTypeDef request_header = txHeader;
     request_header.StdId = nodeID << 7 | mode;
     uint8_t request_data[8] = {};
+    PositionRequestContext request_context{
+        nodeID, metadata == nullptr ? 0U : metadata->feedback_sweep_id};
 
     return CanTrySendMessage(get_can_ctx(hcan), request_data, &request_header,
-                             RecordPositionRequest, &nodeID, metadata) ==
+                             RecordPositionRequest, &request_context, metadata) ==
         CanTxStatus::Queued;
 }
 

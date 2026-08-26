@@ -267,6 +267,8 @@ void TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap()
 
     // Reproduces the runtime race where CAN RX updates the response timestamp
     // a few microseconds after the control task captured its snapshot time.
+    monitor.OnPositionRequest(1U, 900U);
+    monitor.OnTemperatureRequest(1U, 900U);
     monitor.OnPositionResponse(1, 1001U);
     monitor.OnTemperatureResponse(1, 1002U, 35.0F);
     auto status = monitor.Snapshot(1000U);
@@ -275,6 +277,8 @@ void TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap()
 
     // A real 32-bit micros() wrap remains a small positive elapsed interval.
     monitor.Reset();
+    monitor.OnPositionRequest(
+        1U, std::numeric_limits<uint32_t>::max() - 999U);
     monitor.OnPositionResponse(
         1, std::numeric_limits<uint32_t>::max() - 499U);
     status = monitor.Snapshot(500U);
@@ -821,8 +825,124 @@ void TestCanDispatcherWaitsForResponseAndTimesOut()
     CanDispatchStep timeout = scheduler.Next(now_us + 4000U);
     assert(timeout.timed_out_action == CanDispatchAction::PositionRequest);
     assert(timeout.timed_out_node_id == request.node_id);
-    assert(timeout.action == CanDispatchAction::None);
+    assert(!timeout.timed_out_final);
+    assert(timeout.action == CanDispatchAction::PositionRequest);
+    assert(timeout.node_id != request.node_id);
     assert(scheduler.diagnostics().position_timed_out[request.node_id - 1U] == 1U);
+}
+
+void TestCanDispatcherContinuesSweepAndRetriesOnlyMissingNode()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    assert(scheduler.Next(0U).action == CanDispatchAction::None);
+    uint32_t now_us = 25000U;
+
+    CanDispatchStep step = scheduler.Next(now_us);
+    assert(step.action == CanDispatchAction::PositionRequest);
+    const uint8_t missing_node = step.node_id;
+    const uint32_t sweep_id = step.feedback_sweep_id;
+    scheduler.OnQueued(step, now_us);
+
+    // The first timeout continues with the next node while preserving the
+    // missing node's sweep identity for one tail retry.
+    now_us += config.response_timeout_us;
+    step = scheduler.Next(now_us);
+    assert(step.timed_out_node_id == missing_node);
+    assert(!step.timed_out_final);
+    assert(step.action == CanDispatchAction::PositionRequest);
+    assert(step.node_id != missing_node);
+    assert(step.feedback_sweep_id == sweep_id);
+
+    for (size_t completed = 1U; completed < kActuatorNodeCount; ++completed)
+    {
+        scheduler.OnQueued(step, now_us);
+        FeedbackResponseEvents response{};
+        response.position_mask = static_cast<uint8_t>(
+            1U << (step.node_id - 1U));
+        now_us += 100U;
+        step = scheduler.Next(now_us, response);
+    }
+
+    assert(step.action == CanDispatchAction::PositionRequest);
+    assert(step.node_id == missing_node);
+    assert(step.feedback_sweep_id == sweep_id);
+    scheduler.OnQueued(step, now_us);
+    FeedbackResponseEvents retry_response{};
+    retry_response.position_mask = static_cast<uint8_t>(
+        1U << (missing_node - 1U));
+    scheduler.Next(now_us + 100U, retry_response);
+
+    const auto diagnostics = scheduler.diagnostics();
+    assert(diagnostics.position_requested[missing_node - 1U] == 2U);
+    assert(diagnostics.position_responded[missing_node - 1U] == 1U);
+    assert(diagnostics.position_timed_out[missing_node - 1U] == 1U);
+    for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
+    {
+        if (node_id != missing_node)
+            assert(diagnostics.position_requested[node_id - 1U] == 1U);
+    }
+}
+
+void TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+
+    CanDispatchScheduler late_scheduler(config);
+    late_scheduler.Next(0U);
+    uint32_t now_us = 25000U;
+    CanDispatchStep step = late_scheduler.Next(now_us);
+    const uint8_t late_node = step.node_id;
+    late_scheduler.OnQueued(step, now_us);
+    now_us += config.response_timeout_us;
+    step = late_scheduler.Next(now_us);
+    assert(!step.timed_out_final);
+
+    for (size_t completed = 1U; completed < kActuatorNodeCount; ++completed)
+    {
+        late_scheduler.OnQueued(step, now_us);
+        FeedbackResponseEvents response{};
+        response.position_mask = static_cast<uint8_t>(
+            1U << (step.node_id - 1U));
+        if (completed == 1U)
+            response.position_mask = static_cast<uint8_t>(
+                response.position_mask | (1U << (late_node - 1U)));
+        now_us += 100U;
+        step = late_scheduler.Next(now_us, response);
+    }
+    assert(step.action == CanDispatchAction::None);
+    assert(late_scheduler.diagnostics().position_requested[late_node - 1U] == 1U);
+
+    CanDispatchScheduler exhausted_scheduler(config);
+    exhausted_scheduler.Next(0U);
+    now_us = 25000U;
+    step = exhausted_scheduler.Next(now_us);
+    const uint8_t missing_node = step.node_id;
+    exhausted_scheduler.OnQueued(step, now_us);
+    now_us += config.response_timeout_us;
+    step = exhausted_scheduler.Next(now_us);
+    for (size_t completed = 1U; completed < kActuatorNodeCount; ++completed)
+    {
+        exhausted_scheduler.OnQueued(step, now_us);
+        FeedbackResponseEvents response{};
+        response.position_mask = static_cast<uint8_t>(
+            1U << (step.node_id - 1U));
+        now_us += 100U;
+        step = exhausted_scheduler.Next(now_us, response);
+    }
+    assert(step.node_id == missing_node);
+    exhausted_scheduler.OnQueued(step, now_us);
+    const CanDispatchStep exhausted = exhausted_scheduler.Next(
+        now_us + config.response_timeout_us);
+    assert(exhausted.timed_out_action == CanDispatchAction::PositionRequest);
+    assert(exhausted.timed_out_node_id == missing_node);
+    assert(exhausted.timed_out_final);
+    assert(exhausted_scheduler.diagnostics().position_timed_out[
+        missing_node - 1U] == 2U);
 }
 
 void TestCanDispatcherDoesNotBurstAfterDeferredDeadline()
@@ -1205,6 +1325,8 @@ int main()
     TestControlAcquisitionRequiresFeedbackBootstrap();
     TestCanDispatcherTransitionsAndFrequencyPlan();
     TestCanDispatcherWaitsForResponseAndTimesOut();
+    TestCanDispatcherContinuesSweepAndRetriesOnlyMissingNode();
+    TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion();
     TestCanDispatcherDoesNotBurstAfterDeferredDeadline();
     TestCanDispatcherRejectsInvalidRatePlanWithoutFallback();
     TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery();

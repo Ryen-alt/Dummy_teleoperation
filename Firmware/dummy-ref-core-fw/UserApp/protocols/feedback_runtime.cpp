@@ -11,6 +11,8 @@ CanFeedbackMonitor feedback_monitor(
     dummy::generated_config::kCoherentMaxSkewUs);
 volatile uint8_t position_response_mask = 0U;
 volatile uint8_t temperature_response_mask = 0U;
+volatile uint32_t unexpected_position_response_count = 0U;
+volatile uint32_t unexpected_temperature_response_count = 0U;
 uint8_t runtime_status = 0U;
 bool feedback_ready = false;
 uint32_t readiness_sweep_id = 0U;
@@ -25,20 +27,26 @@ uint8_t NodeMask(uint8_t node_id)
 }
 }
 
-void RecordPositionFeedbackRequest(uint8_t node_id)
+void RecordPositionFeedbackRequest(uint8_t node_id, uint32_t sweep_id)
 {
     taskENTER_CRITICAL();
-    feedback_monitor.OnPositionRequest(node_id, micros());
+    feedback_monitor.OnPositionRequest(node_id, micros(), sweep_id);
     taskEXIT_CRITICAL();
 }
 
-void RecordPositionFeedbackResponse(uint8_t node_id)
+bool RecordPositionFeedbackResponse(uint8_t node_id)
 {
     // Called from the CAN RX ISR. Normal task code masks interrupts while it
     // mutates or snapshots the monitor.
-    feedback_monitor.OnPositionResponse(node_id, micros());
+    if (!feedback_monitor.OnPositionResponse(node_id, micros()))
+    {
+        if (unexpected_position_response_count != UINT32_MAX)
+            ++unexpected_position_response_count;
+        return false;
+    }
     position_response_mask = static_cast<uint8_t>(
         position_response_mask | NodeMask(node_id));
+    return true;
 }
 
 void RecordPositionFeedbackTimeout(uint8_t node_id)
@@ -57,7 +65,12 @@ void RecordTemperatureFeedbackRequest(uint8_t node_id)
 
 void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c)
 {
-    feedback_monitor.OnTemperatureResponse(node_id, micros(), temperature_c);
+    if (!feedback_monitor.OnTemperatureResponse(node_id, micros(), temperature_c))
+    {
+        if (unexpected_temperature_response_count != UINT32_MAX)
+            ++unexpected_temperature_response_count;
+        return;
+    }
     temperature_response_mask = static_cast<uint8_t>(
         temperature_response_mask | NodeMask(node_id));
 }
@@ -94,11 +107,24 @@ FeedbackResponseEvents ConsumeFeedbackResponseEvents()
     const FeedbackResponseEvents events{
         position_response_mask,
         temperature_response_mask,
+        unexpected_position_response_count,
+        unexpected_temperature_response_count,
     };
     position_response_mask = 0U;
     temperature_response_mask = 0U;
+    unexpected_position_response_count = 0U;
+    unexpected_temperature_response_count = 0U;
     taskEXIT_CRITICAL();
     return events;
+}
+
+void CancelPendingFeedbackRequests()
+{
+    taskENTER_CRITICAL();
+    feedback_monitor.CancelPendingRequests();
+    position_response_mask = 0U;
+    temperature_response_mask = 0U;
+    taskEXIT_CRITICAL();
 }
 
 std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(uint32_t now_us)

@@ -403,6 +403,7 @@ void ThreadCanDispatch(void* argument)
             target_fanout = {};
             target_fanout_active = false;
             application_tracker.Reset();
+            dummy::protocol::CancelPendingFeedbackRequests();
             can_dispatch_scheduler.SetMode(dispatch_mode);
         }
 
@@ -427,7 +428,7 @@ void ThreadCanDispatch(void* argument)
                 coherent.sweep_id, coherent_now_us, earliest_sample_us);
         }
         const auto step = can_dispatch_scheduler.Next(now_us, responses);
-        if (step.timed_out_action ==
+        if (step.timed_out_final && step.timed_out_action ==
             dummy::protocol::CanDispatchAction::PositionRequest)
             dummy::protocol::RecordPositionFeedbackTimeout(
                 step.timed_out_node_id);
@@ -443,6 +444,7 @@ void ThreadCanDispatch(void* argument)
             dummy::protocol::ReadBinaryControlSnapshot(
                 dummy::protocol::BinaryControlMonotonicMicros()).session_epoch;
         tx_metadata.node_id = step.node_id;
+        tx_metadata.feedback_sweep_id = step.feedback_sweep_id;
         tx_metadata.enqueued_time_us = now_us;
         if (step.action == dummy::protocol::CanDispatchAction::ActuatorTarget)
             tx_metadata.channel = step.transition
