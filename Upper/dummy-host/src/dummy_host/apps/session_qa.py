@@ -212,8 +212,8 @@ def analyze_session(session_dir: str | Path) -> tuple[SessionQaReport, tuple[np.
                 can_row = connection.execute(
                     """
                     SELECT COUNT(*),
-                           COALESCE(SUM(position_timeout_count + temperature_timeout_count), 0),
-                           COALESCE(SUM(tx_abort_count + tx_error_count), 0),
+                           COALESCE(MAX(position_timeout_count + temperature_timeout_count), 0),
+                           COALESCE(MAX(tx_abort_count + tx_error_count), 0),
                            COALESCE(MAX(max_fanout_us), 0)
                     FROM can_diagnostics
                     """
@@ -495,7 +495,9 @@ td,th{{border:1px solid #d1d5db;padding:.4rem .6rem}}code{{word-break:break-all}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze and visualize a Dummy Raw Session v2")
+    parser = argparse.ArgumentParser(
+        description="Analyze and visualize a Dummy Raw Session v2-v5"
+    )
     parser.add_argument("--session", required=True)
     parser.add_argument("--json-output")
     parser.add_argument("--html-output")

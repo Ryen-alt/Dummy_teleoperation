@@ -6,6 +6,7 @@ import logging
 import time
 
 from dummy_host.cameras import CameraManager
+from dummy_host.protocol import PROTOCOL_VERSION
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import load_robot_config
 from dummy_host.transport_serial import SerialTransport
@@ -39,6 +40,9 @@ def main() -> None:
     try:
         with robot:
             print(f"firmware_version={robot.firmware_version}")
+            print(f"binary_protocol_version={PROTOCOL_VERSION}")
+            print(f"session_epoch={robot.session_id}")
+            print(f"firmware_capabilities=0x{robot.firmware_capabilities:08x}")
             started = time.monotonic()
             while args.duration is None or time.monotonic() - started < args.duration:
                 state = robot.read_state()

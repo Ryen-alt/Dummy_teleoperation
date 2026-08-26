@@ -570,7 +570,7 @@ def run_teleop_collection(
     final_state: RobotState | None = None
     last_command: TeleopCommand | None = None
     scheduler_stats = SchedulerStats(0, 0, 0.0, 0.0, 0.0)
-    deadline_ns = None if duration_s is None else clock_ns() + int(duration_s * 1e9)
+    deadline_ns: int | None = None
     lease: _LeaseCoordinator | None = None
     evidence_telemetry: _EvidenceTelemetryWorker | None = None
     control_had_lease = False
@@ -730,6 +730,18 @@ def run_teleop_collection(
         input_worker.start()
         if input_worker.snapshot(wait_s=0.5) is None:
             raise TeleopError("input thread did not produce an initial snapshot")
+
+        collection_started_ns = clock_ns()
+        deadline_ns = (
+            None
+            if duration_s is None
+            else collection_started_ns + int(duration_s * 1e9)
+        )
+        recorder.record_event(
+            "collection_started",
+            monotonic_ns=collection_started_ns,
+            payload={"requested_duration_s": duration_s},
+        )
 
         def tick(scheduled: ScheduledTick) -> None:
             nonlocal actions_sent, episode_events, final_state, last_command
@@ -1409,6 +1421,11 @@ def run_teleop_collection(
             )
 
         scheduler_stats = scheduler.run_timed(tick, stop)
+        recorder.record_event(
+            "collection_stopped",
+            monotonic_ns=clock_ns(),
+            payload={"requested_duration_s": duration_s},
+        )
     except BaseException as exc:
         runtime_error = exc
         # Safety must not depend on Episode/recorder bookkeeping succeeding.

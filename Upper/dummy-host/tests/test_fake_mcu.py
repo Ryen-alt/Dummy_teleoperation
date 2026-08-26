@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 
 from dummy_host.fake_mcu import FakeMcuTransport
-from dummy_host.protocol import MessageType, Packet, pack_hello
+from dummy_host.protocol import (
+    ACTION_PROGRESS,
+    ActionProgressStage,
+    MessageType,
+    Packet,
+    pack_hello,
+)
 from dummy_host.robot_driver import CommandRejected, DummyRobot, RobotError
 from dummy_host.schema import ConfigError, ControlMode
 from dummy_host.domain.models import ActionStage, FaultBits, HoldReasonBits
@@ -60,6 +66,22 @@ class AckWithoutExactCanTransport(FakeMcuTransport):
         finally:
             self._progress = progress
             self._last_applied = applied
+
+
+class StateReplayOnlyTransport(FakeMcuTransport):
+    """Drop every EVENT so action progress must be recovered from STATE."""
+
+    def receive(self, timeout: float | None = None) -> Packet | None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            packet = super().receive(timeout=remaining)
+            if packet is None or packet.message_type != MessageType.EVENT:
+                return packet
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
 
 
 class OldV21WithoutMultiChannelSequence(FakeMcuTransport):
@@ -200,8 +222,8 @@ def test_protocol_v4_firmware_is_rejected_by_v5_host(config) -> None:
     assert not robot.is_connected
 
 
-def test_nonblocking_action_reports_exact_can_queue_and_post_feedback(config) -> None:
-    robot = DummyRobot(config, FakeMcuTransport(config))
+def test_state_replay_recovers_complete_action_when_every_event_is_lost(config) -> None:
+    robot = DummyRobot(config, StateReplayOnlyTransport(config))
     stages = []
     robot.set_action_lifecycle_listener(stages.append)
     with robot:
@@ -230,6 +252,47 @@ def test_nonblocking_action_reports_exact_can_queue_and_post_feedback(config) ->
         assert ActionStage.CAN_QUEUED_EXACT in observed
         assert ActionStage.CAN_TX_COMPLETE_EXACT in observed
         assert ActionStage.POST_COMMAND_FEEDBACK in observed
+
+
+def test_action_progress_from_an_old_session_epoch_is_ignored(config) -> None:
+    transport = AckWithoutExactCanTransport(config)
+    robot = DummyRobot(config, transport)
+    stages = []
+    robot.set_action_lifecycle_listener(stages.append)
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        target = robot.read_state().position.copy()
+        target[0] += np.float32(0.005)
+        applied = robot.enqueue_absolute_action(target, source="old-epoch")
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline and not any(
+            update.sequence == applied.sequence
+            and update.stage is ActionStage.ACKNOWLEDGED
+            for update in stages
+        ):
+            time.sleep(0.005)
+
+        stale_epoch = robot.session_id % 0xFFFFFFFF + 1
+        transport._rx.put(
+            Packet(
+                MessageType.EVENT,
+                stale_epoch,
+                applied.sequence,
+                robot.clock_ns() // 1_000,
+                ACTION_PROGRESS.pack(
+                    applied.sequence,
+                    int(ActionProgressStage.CAN_TX_COMPLETE_EXACT),
+                    robot.clock_ns() // 1_000,
+                    0,
+                ),
+            )
+        )
+        time.sleep(0.02)
+        observed = {
+            update.stage for update in stages if update.sequence == applied.sequence
+        }
+        assert ActionStage.ACKNOWLEDGED in observed
+        assert ActionStage.CAN_TX_COMPLETE_EXACT not in observed
 
 
 def test_action_watchdog_expires_lost_ack_while_state_continues(config) -> None:

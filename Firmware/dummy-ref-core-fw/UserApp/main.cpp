@@ -281,7 +281,8 @@ void ThreadCanDispatch(void* argument)
     uint32_t observed_completion_overflow_count = 0U;
     std::array<uint32_t, dummy::protocol::kActuatorNodeCount>
         target_tx_complete_count{};
-    uint32_t can_diagnostics_window_start_us = micros();
+    const uint64_t can_diagnostics_window_start_us =
+        dummy::protocol::BinaryControlMonotonicMicros();
     uint32_t max_fanout_us = 0U;
     uint32_t safety_preemption_count = 0U;
     uint32_t max_safety_wait_us = 0U;
@@ -571,7 +572,8 @@ void ThreadCanDispatch(void* argument)
         dummy::protocol::CanDiagnosticsPayload can_diagnostics{};
         can_diagnostics.window_start_us = can_diagnostics_window_start_us;
         can_diagnostics.window_duration_us =
-            static_cast<uint32_t>(now_us - can_diagnostics_window_start_us);
+            dummy::protocol::BinaryControlMonotonicMicros() -
+            can_diagnostics_window_start_us;
         for (size_t index = 0;
              index < dummy::protocol::kActuatorNodeCount; ++index)
         {

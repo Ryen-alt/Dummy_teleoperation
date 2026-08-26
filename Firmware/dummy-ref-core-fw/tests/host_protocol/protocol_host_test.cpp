@@ -955,6 +955,65 @@ void TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery()
     assert(hold.transition);
 }
 
+uint32_t CompleteStreamTransition(CanDispatchScheduler& scheduler)
+{
+    scheduler.SetMode(CanDispatchMode::Stream);
+    uint32_t now_us = 0U;
+    for (uint8_t index = 0U; index < kActuatorNodeCount + 1U; ++index)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us);
+        assert(step.transition);
+        if (index < kActuatorNodeCount)
+        {
+            assert(step.action == CanDispatchAction::ActuatorTarget);
+            assert(step.node_id == index + 1U);
+        }
+        else
+        {
+            assert(step.action == CanDispatchAction::EnableBroadcast);
+        }
+        scheduler.OnQueued(step, now_us);
+        ++now_us;
+    }
+    assert(scheduler.Next(now_us).action == CanDispatchAction::None);
+    return now_us;
+}
+
+void TestSafetyModesPreemptPartialTargetFanout()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.position_hz_per_node = 0U;
+    config.temperature_hz_per_node = 0U;
+
+    CanDispatchScheduler hold_scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(hold_scheduler) + 20000U;
+    const CanDispatchStep normal_target = hold_scheduler.Next(now_us);
+    assert(normal_target.action == CanDispatchAction::ActuatorTarget);
+    assert(normal_target.node_id == 1U);
+    assert(!normal_target.transition);
+    hold_scheduler.OnQueued(normal_target, now_us);
+
+    hold_scheduler.SetMode(CanDispatchMode::Hold);
+    const CanDispatchStep hold = hold_scheduler.Next(now_us + 1U);
+    assert(hold.action == CanDispatchAction::ActuatorTarget);
+    assert(hold.node_id == 1U);
+    assert(hold.transition);
+
+    CanDispatchScheduler fault_scheduler(config);
+    now_us = CompleteStreamTransition(fault_scheduler) + 20000U;
+    const CanDispatchStep fault_target = fault_scheduler.Next(now_us);
+    assert(fault_target.action == CanDispatchAction::ActuatorTarget);
+    assert(fault_target.node_id == 1U);
+    assert(!fault_target.transition);
+    fault_scheduler.OnQueued(fault_target, now_us);
+
+    fault_scheduler.SetMode(CanDispatchMode::Fault);
+    const CanDispatchStep fault = fault_scheduler.Next(now_us + 1U);
+    assert(fault.action == CanDispatchAction::DisableBroadcast);
+    assert(fault.transition);
+}
+
 void TestActuatorApplicationTrackerRequiresEverySuccessfulNode()
 {
     ActuatorApplicationTracker tracker;
@@ -977,6 +1036,28 @@ void TestActuatorApplicationTrackerRequiresEverySuccessfulNode()
     assert(!tracker.RecordTransmission(12U, 1U, false));
     assert(!tracker.RecordTransmission(13U, 1U, true));
     assert(tracker.TakeSupersededSequence() == 12U);
+}
+
+void TestActuatorApplicationTrackerRejectsAbortAtEveryNode()
+{
+    for (uint8_t aborted_node = 1U;
+         aborted_node <= kActuatorNodeCount; ++aborted_node)
+    {
+        ActuatorApplicationTracker tracker;
+        const uint32_t sequence = 100U + aborted_node;
+        for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
+        {
+            const bool transmitted = node_id != aborted_node;
+            assert(!tracker.RecordTransmission(sequence, node_id, transmitted));
+        }
+        // Repeated notifications for successful nodes cannot fill the missing
+        // bit or manufacture an exact seven-node completion.
+        for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
+        {
+            if (node_id != aborted_node)
+                assert(!tracker.RecordTransmission(sequence, node_id, true));
+        }
+    }
 }
 
 void TestLatestTargetExecutorIsBoundedAndHolds()
@@ -1127,7 +1208,9 @@ int main()
     TestCanDispatcherDoesNotBurstAfterDeferredDeadline();
     TestCanDispatcherRejectsInvalidRatePlanWithoutFallback();
     TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery();
+    TestSafetyModesPreemptPartialTargetFanout();
     TestActuatorApplicationTrackerRequiresEverySuccessfulNode();
+    TestActuatorApplicationTrackerRejectsAbortAtEveryNode();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
     TestSessionTargetAndTimeout();
