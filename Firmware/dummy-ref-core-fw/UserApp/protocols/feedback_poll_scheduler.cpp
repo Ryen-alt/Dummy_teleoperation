@@ -256,7 +256,8 @@ void CanDispatchScheduler::ConsumeResponses(
         pending_action_ == CanDispatchAction::PositionRequest &&
         (responses.position_mask & NodeMask(pending_node_id_)) != 0U;
     const bool current_temperature_matched = query_pending_ &&
-        pending_action_ == CanDispatchAction::TemperatureRequest &&
+        (pending_action_ == CanDispatchAction::TemperatureRequest ||
+         pending_action_ == CanDispatchAction::MotorDiagnosticsRequest) &&
         (responses.temperature_mask & NodeMask(pending_node_id_)) != 0U;
 
     for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
@@ -284,6 +285,18 @@ void CanDispatchScheduler::ConsumeResponses(
         if (completed_action == CanDispatchAction::PositionRequest &&
             position_sweep_active_)
             AdvancePositionSweep(now_us);
+        else if (completed_action ==
+                 CanDispatchAction::MotorDiagnosticsRequest &&
+                 transition_ == Transition::MotorDiagnostics)
+        {
+            if (transition_node_ < kActuatorNodeCount)
+                transition_node_ = NextNode(transition_node_);
+            else
+            {
+                transition_node_ = 1U;
+                transition_ = Transition::ConfigureGripper;
+            }
+        }
     }
 
     if (position_sweep_active_ && position_retry_phase_ &&
@@ -360,15 +373,24 @@ CanDispatchStep CanDispatchScheduler::Next(
                     position_retry_mask_ | NodeMask(pending_node_id_));
             }
         }
-        else if (pending_action_ == CanDispatchAction::TemperatureRequest)
+        else if (pending_action_ == CanDispatchAction::TemperatureRequest ||
+                 pending_action_ ==
+                     CanDispatchAction::MotorDiagnosticsRequest)
         {
             step.timed_out_final = true;
             diagnostics_.temperature_timed_out[index] = SaturatingIncrement(
                 diagnostics_.temperature_timed_out[index]);
-            const uint32_t period_us = PeriodUs(
-                config_.temperature_hz_per_node);
-            next_temperature_deadline_us_ = period_us == 0U
-                ? 0U : now_us + period_us;
+            if (pending_action_ == CanDispatchAction::TemperatureRequest)
+            {
+                const uint32_t period_us = PeriodUs(
+                    config_.temperature_hz_per_node);
+                next_temperature_deadline_us_ = period_us == 0U
+                    ? 0U : now_us + period_us;
+            }
+            else
+            {
+                transition_ = Transition::None;
+            }
         }
         query_pending_ = false;
         pending_action_ = CanDispatchAction::None;
@@ -394,6 +416,40 @@ CanDispatchStep CanDispatchScheduler::Next(
         {
             step.action = CanDispatchAction::ActuatorTarget;
             step.node_id = transition_node_;
+            step.transition = true;
+            return step;
+        }
+        diagnostics_.idle_slot_count = SaturatingIncrement(
+            diagnostics_.idle_slot_count);
+        return step;
+    }
+
+    if (transition_ == Transition::MotorDiagnostics)
+    {
+        if (query_pending_)
+        {
+            diagnostics_.idle_slot_count = SaturatingIncrement(
+                diagnostics_.idle_slot_count);
+            return step;
+        }
+        if (NodeQuiet(transition_node_, now_us))
+        {
+            step.action = CanDispatchAction::MotorDiagnosticsRequest;
+            step.node_id = transition_node_;
+            step.transition = true;
+            return step;
+        }
+        diagnostics_.idle_slot_count = SaturatingIncrement(
+            diagnostics_.idle_slot_count);
+        return step;
+    }
+
+    if (transition_ == Transition::ConfigureGripper)
+    {
+        if (NodeQuiet(kActuatorNodeCount, now_us))
+        {
+            step.action = CanDispatchAction::ConfigureGripperVelocity;
+            step.node_id = kActuatorNodeCount;
             step.transition = true;
             return step;
         }
@@ -569,6 +625,16 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
         pending_node_id_ = step.node_id;
         pending_since_us_ = now_us;
     }
+    else if (step.action == CanDispatchAction::MotorDiagnosticsRequest)
+    {
+        diagnostics_.temperature_requested[step.node_id - 1U] =
+            SaturatingIncrement(
+                diagnostics_.temperature_requested[step.node_id - 1U]);
+        query_pending_ = true;
+        pending_action_ = step.action;
+        pending_node_id_ = step.node_id;
+        pending_since_us_ = now_us;
+    }
 
     if (!step.transition)
         return;
@@ -577,8 +643,15 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
         if (transition_node_ < kActuatorNodeCount)
             transition_node_ = NextNode(transition_node_);
         else
+        {
+            transition_node_ = 1U;
             transition_ = mode_ == CanDispatchMode::Stream
-                ? Transition::Enable : Transition::None;
+                ? Transition::MotorDiagnostics : Transition::None;
+        }
+    }
+    else if (transition_ == Transition::ConfigureGripper)
+    {
+        transition_ = Transition::Enable;
     }
     else if (transition_ == Transition::Enable ||
              transition_ == Transition::Disable)

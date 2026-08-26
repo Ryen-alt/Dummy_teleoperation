@@ -66,6 +66,9 @@ public:
     bool SetStreamingNormalizedPosition(
         float normalized, float max_velocity_per_s,
         const CanTxMetadata* metadata = nullptr);
+    bool TryConfigureStreamingVelocity(
+        float max_velocity_per_s,
+        const CanTxMetadata* metadata = nullptr);
     void SetGripCurrent(float _current);
     void DriveWithCurrent(float _direction);
     void HandCalibration();
@@ -194,6 +197,9 @@ public:
     // per-node hold targets have been admitted by the CAN dispatcher.
     bool TrySetExternalEnable(
         bool enable, const CanTxMetadata* metadata = nullptr);
+    bool TryConfigureGripperStreaming(
+        float max_velocity_per_s,
+        const CanTxMetadata* metadata = nullptr);
     void UpdateJointAnglesCallback();
     void UpdateJointPose6D();
     void Reboot();

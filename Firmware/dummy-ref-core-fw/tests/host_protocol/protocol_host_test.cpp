@@ -730,22 +730,41 @@ void TestCanDispatcherTransitionsAndFrequencyPlan()
     scheduler.SetMode(CanDispatchMode::Stream);
     uint32_t now_us = 0U;
     std::vector<uint8_t> transition_nodes;
+    std::vector<uint8_t> diagnostic_nodes;
+    FeedbackResponseEvents transition_responses{};
+    bool configured = false;
     bool enabled = false;
-    for (size_t tick = 0; tick < 30U && !enabled; ++tick)
+    for (size_t tick = 0; tick < 50U && !enabled; ++tick)
     {
-        const CanDispatchStep step = scheduler.Next(now_us);
+        const CanDispatchStep step = scheduler.Next(
+            now_us, transition_responses);
+        transition_responses = {};
         if (step.action != CanDispatchAction::None)
         {
             assert(step.transition);
             scheduler.OnQueued(step, now_us);
             if (step.action == CanDispatchAction::ActuatorTarget)
                 transition_nodes.push_back(step.node_id);
+            else if (step.action ==
+                     CanDispatchAction::MotorDiagnosticsRequest)
+            {
+                diagnostic_nodes.push_back(step.node_id);
+                transition_responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            }
+            else if (step.action ==
+                     CanDispatchAction::ConfigureGripperVelocity)
+            {
+                configured = true;
+            }
             else if (step.action == CanDispatchAction::EnableBroadcast)
                 enabled = true;
         }
         now_us += 1429U;
     }
     assert((transition_nodes == std::vector<uint8_t>{1U, 2U, 3U, 4U, 5U, 6U, 7U}));
+    assert((diagnostic_nodes == std::vector<uint8_t>{1U, 2U, 3U, 4U, 5U, 6U, 7U}));
+    assert(configured);
     assert(enabled);
 
     const CanDispatchDiagnostics before = scheduler.diagnostics();
@@ -945,7 +964,57 @@ void TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion()
         missing_node - 1U] == 2U);
 }
 
-void TestCanDispatcherDoesNotBurstAfterDeferredDeadline()
+uint32_t CompleteStreamTransition(CanDispatchScheduler& scheduler)
+{
+    scheduler.SetMode(CanDispatchMode::Stream);
+    uint32_t now_us = 0U;
+    FeedbackResponseEvents responses{};
+    uint8_t hold_count = 0U;
+    uint8_t diagnostics_count = 0U;
+    bool configured = false;
+    bool enabled = false;
+    for (size_t attempt = 0U; attempt < 64U && !enabled; ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            assert(step.transition);
+            scheduler.OnQueued(step, now_us);
+            if (step.action == CanDispatchAction::ActuatorTarget)
+            {
+                assert(step.node_id == hold_count + 1U);
+                ++hold_count;
+            }
+            else if (step.action ==
+                     CanDispatchAction::MotorDiagnosticsRequest)
+            {
+                assert(step.node_id == diagnostics_count + 1U);
+                ++diagnostics_count;
+                responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            }
+            else if (step.action ==
+                     CanDispatchAction::ConfigureGripperVelocity)
+            {
+                configured = true;
+            }
+            else if (step.action == CanDispatchAction::EnableBroadcast)
+            {
+                enabled = true;
+            }
+        }
+        ++now_us;
+    }
+    assert(hold_count == kActuatorNodeCount);
+    assert(diagnostics_count == kActuatorNodeCount);
+    assert(configured);
+    assert(enabled);
+    assert(scheduler.Next(now_us).action == CanDispatchAction::None);
+    return now_us;
+}
+
+void TestCanDispatcherPreflightTimeoutStopsEnable()
 {
     CanDispatchConfig config{};
     config.node_quiet_us = 0U;
@@ -954,16 +1023,39 @@ void TestCanDispatcherDoesNotBurstAfterDeferredDeadline()
     CanDispatchScheduler scheduler(config);
     scheduler.SetMode(CanDispatchMode::Stream);
     uint32_t now_us = 0U;
-
-    // Complete the seven-node HOLD plus enable transition first.
-    while (scheduler.mode() == CanDispatchMode::Stream)
+    for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
     {
-        const CanDispatchStep transition = scheduler.Next(now_us);
-        if (!transition.transition)
-            break;
-        scheduler.OnQueued(transition, now_us);
-        now_us += 1429U;
+        const CanDispatchStep hold = scheduler.Next(now_us++);
+        assert(hold.action == CanDispatchAction::ActuatorTarget);
+        assert(hold.node_id == node_id);
+        scheduler.OnQueued(hold, now_us);
     }
+
+    const CanDispatchStep request = scheduler.Next(now_us++);
+    assert(request.action == CanDispatchAction::MotorDiagnosticsRequest);
+    assert(request.node_id == 1U);
+    scheduler.OnQueued(request, now_us);
+    now_us += config.response_timeout_us;
+    const CanDispatchStep timeout = scheduler.Next(now_us);
+    assert(timeout.timed_out_final);
+    assert(timeout.timed_out_action ==
+           CanDispatchAction::MotorDiagnosticsRequest);
+    assert(timeout.timed_out_node_id == 1U);
+    assert(timeout.action != CanDispatchAction::ConfigureGripperVelocity);
+    assert(timeout.action != CanDispatchAction::EnableBroadcast);
+    const CanDispatchDiagnostics diagnostics = scheduler.diagnostics();
+    assert(diagnostics.temperature_timed_out[0] == 1U);
+    assert(!diagnostics.query_pending);
+}
+
+void TestCanDispatcherDoesNotBurstAfterDeferredDeadline()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.position_hz_per_node = 0U;
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
 
     CanDispatchStep due{};
     for (size_t tick = 0; tick < 50U; ++tick)
@@ -1073,30 +1165,6 @@ void TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery()
     }
     assert(hold.action == CanDispatchAction::ActuatorTarget);
     assert(hold.transition);
-}
-
-uint32_t CompleteStreamTransition(CanDispatchScheduler& scheduler)
-{
-    scheduler.SetMode(CanDispatchMode::Stream);
-    uint32_t now_us = 0U;
-    for (uint8_t index = 0U; index < kActuatorNodeCount + 1U; ++index)
-    {
-        const CanDispatchStep step = scheduler.Next(now_us);
-        assert(step.transition);
-        if (index < kActuatorNodeCount)
-        {
-            assert(step.action == CanDispatchAction::ActuatorTarget);
-            assert(step.node_id == index + 1U);
-        }
-        else
-        {
-            assert(step.action == CanDispatchAction::EnableBroadcast);
-        }
-        scheduler.OnQueued(step, now_us);
-        ++now_us;
-    }
-    assert(scheduler.Next(now_us).action == CanDispatchAction::None);
-    return now_us;
 }
 
 void TestSafetyModesPreemptPartialTargetFanout()
@@ -1327,6 +1395,7 @@ int main()
     TestCanDispatcherWaitsForResponseAndTimesOut();
     TestCanDispatcherContinuesSweepAndRetriesOnlyMissingNode();
     TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion();
+    TestCanDispatcherPreflightTimeoutStopsEnable();
     TestCanDispatcherDoesNotBurstAfterDeferredDeadline();
     TestCanDispatcherRejectsInvalidRatePlanWithoutFallback();
     TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery();

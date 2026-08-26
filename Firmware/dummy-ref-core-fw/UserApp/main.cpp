@@ -331,6 +331,12 @@ void ThreadCanDispatch(void* argument)
                     static_cast<uint32_t>(completed_us -
                         completion.metadata.enqueued_time_us));
             }
+            if (completion.metadata.channel == CanTxChannel::Configuration &&
+                completion.status != CanTxCompletionStatus::Complete)
+            {
+                dummy::protocol::RequestBinaryRuntimeHold();
+                continue;
+            }
             if (completion.metadata.channel != CanTxChannel::Target ||
                 completion.metadata.action_sequence == 0U)
                 continue;
@@ -404,6 +410,8 @@ void ThreadCanDispatch(void* argument)
             target_fanout_active = false;
             application_tracker.Reset();
             dummy::protocol::CancelPendingFeedbackRequests();
+            if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
+                dummy::protocol::ResetMotorTransportDiagnostics();
             can_dispatch_scheduler.SetMode(dispatch_mode);
         }
 
@@ -428,14 +436,28 @@ void ThreadCanDispatch(void* argument)
                 coherent.sweep_id, coherent_now_us, earliest_sample_us);
         }
         const auto step = can_dispatch_scheduler.Next(now_us, responses);
-        if (step.timed_out_final && step.timed_out_action ==
-            dummy::protocol::CanDispatchAction::PositionRequest)
-            dummy::protocol::RecordPositionFeedbackTimeout(
-                step.timed_out_node_id);
-        else if (step.timed_out_action ==
-                 dummy::protocol::CanDispatchAction::TemperatureRequest)
-            dummy::protocol::RecordTemperatureFeedbackTimeout(
-                step.timed_out_node_id);
+        if (step.timed_out_final)
+        {
+            if (step.timed_out_action ==
+                dummy::protocol::CanDispatchAction::PositionRequest)
+            {
+                dummy::protocol::RecordPositionFeedbackTimeout(
+                    step.timed_out_node_id);
+            }
+            else if (step.timed_out_action ==
+                         dummy::protocol::CanDispatchAction::TemperatureRequest ||
+                     step.timed_out_action ==
+                         dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
+            {
+                dummy::protocol::RecordTemperatureFeedbackTimeout(
+                    step.timed_out_node_id);
+            }
+            if (step.timed_out_action ==
+                dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
+            {
+                dummy::protocol::RequestBinaryRuntimeHold();
+            }
+        }
 
         bool queued = false;
         ScheduledActuatorRequest latest = scheduled;
@@ -453,6 +475,12 @@ void ThreadCanDispatch(void* argument)
             tx_metadata.channel = CanTxChannel::Position;
         else if (step.action == dummy::protocol::CanDispatchAction::TemperatureRequest)
             tx_metadata.channel = CanTxChannel::Temperature;
+        else if (step.action ==
+                 dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
+            tx_metadata.channel = CanTxChannel::Diagnostics;
+        else if (step.action ==
+                 dummy::protocol::CanDispatchAction::ConfigureGripperVelocity)
+            tx_metadata.channel = CanTxChannel::Configuration;
         else if (step.action == dummy::protocol::CanDispatchAction::EnableBroadcast ||
                  step.action == dummy::protocol::CanDispatchAction::DisableBroadcast)
             tx_metadata.channel =
@@ -505,6 +533,24 @@ void ThreadCanDispatch(void* argument)
             case dummy::protocol::CanDispatchAction::TemperatureRequest:
                 queued = robot.TryRequestTemperatureFeedback(
                     step.node_id, &tx_metadata);
+                break;
+            case dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest:
+                queued = robot.TryRequestTemperatureFeedback(
+                    step.node_id, &tx_metadata);
+                break;
+            case dummy::protocol::CanDispatchAction::ConfigureGripperVelocity:
+                if (dummy::protocol::ReadMotorTransportDiagnostics().valid_mask !=
+                    static_cast<uint8_t>(
+                        (1U << dummy::protocol::kActuatorNodeCount) - 1U))
+                {
+                    dummy::protocol::RequestBinaryRuntimeHold();
+                }
+                else
+                {
+                    queued = robot.TryConfigureGripperStreaming(
+                        dummy::generated_config::kGripperVelocityLimitPerS,
+                        &tx_metadata);
+                }
                 break;
             case dummy::protocol::CanDispatchAction::EnableBroadcast:
                 latest = ReadScheduledActuatorRequest();

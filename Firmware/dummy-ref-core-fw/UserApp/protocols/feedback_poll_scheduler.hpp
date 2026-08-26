@@ -23,6 +23,8 @@ enum class CanDispatchAction : uint8_t
     ActuatorTarget,
     PositionRequest,
     TemperatureRequest,
+    MotorDiagnosticsRequest,
+    ConfigureGripperVelocity,
     EnableBroadcast,
     DisableBroadcast,
 };
@@ -104,6 +106,8 @@ private:
     {
         None,
         HoldTargets,
+        MotorDiagnostics,
+        ConfigureGripper,
         Enable,
         Disable,
     };

@@ -305,6 +305,14 @@ bool DummyRobot::TrySetExternalEnable(
 }
 
 
+bool DummyRobot::TryConfigureGripperStreaming(
+    float max_velocity_per_s, const CanTxMetadata* metadata)
+{
+    return hand != nullptr &&
+        hand->TryConfigureStreamingVelocity(max_velocity_per_s, metadata);
+}
+
+
 void DummyRobot::UpdateJointAnglesCallback()
 {
     for (int i = 1; i <= 6; i++)
@@ -512,6 +520,18 @@ bool StepHand::SetStreamingNormalizedPosition(float normalized,
 }
 
 
+bool StepHand::TryConfigureStreamingVelocity(
+    float max_velocity_per_s, const CanTxMetadata* metadata)
+{
+    if (max_velocity_per_s <= 0.0F)
+        return false;
+    const float motor_velocity =
+        fabsf(closedAngle - openedAngle) / 360.0F *
+        static_cast<float>(reduction) * max_velocity_per_s;
+    return TrySetVelocityLimitRam(motor_velocity, metadata);
+}
+
+
 bool StepHand::SendNormalizedPosition(float normalized, float max_velocity_per_s,
                                       bool streaming,
                                       const CanTxMetadata* metadata)
@@ -529,8 +549,7 @@ bool StepHand::SendNormalizedPosition(float normalized, float max_velocity_per_s
         fabsf(travel_degrees) / 360.0F * static_cast<float>(reduction) *
         max_velocity_per_s;
     if (streaming)
-        return SetStreamingAngleWithVelocityLimit(
-            target_angle, motor_velocity, metadata);
+        return SetStreamingAngle(target_angle, metadata);
     SetAngleWithVelocityLimit(target_angle, motor_velocity);
     return true;
 }

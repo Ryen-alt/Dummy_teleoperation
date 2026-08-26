@@ -151,6 +151,13 @@ MotorTransportDiagnostics ReadMotorTransportDiagnostics()
     return snapshot;
 }
 
+void ResetMotorTransportDiagnostics()
+{
+    taskENTER_CRITICAL();
+    motor_transport_diagnostics = {};
+    taskEXIT_CRITICAL();
+}
+
 void PublishCanRuntimeStatus(uint8_t status)
 {
     taskENTER_CRITICAL();

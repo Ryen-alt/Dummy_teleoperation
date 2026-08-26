@@ -51,6 +51,8 @@ public:
     void SetNodeID(uint32_t _id);
     void SetCurrentLimit(float _val);
     void SetVelocityLimit(float _val);
+    bool TrySetVelocityLimitRam(
+        float _val, const CanTxMetadata* metadata = nullptr);
     void SetAcceleration(float _val);
     void SetDceKp(int32_t _val);
     void SetDceKv(int32_t _val);

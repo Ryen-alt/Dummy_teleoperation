@@ -34,6 +34,7 @@ void CancelPendingFeedbackRequests();
 std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(uint32_t now_us);
 CoherentFeedbackStatus ReadCoherentFeedbackStatus();
 MotorTransportDiagnostics ReadMotorTransportDiagnostics();
+void ResetMotorTransportDiagnostics();
 
 enum CanRuntimeStatusBits : uint8_t
 {

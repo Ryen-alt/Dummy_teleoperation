@@ -238,6 +238,21 @@ void CtrlStepMotor::SetVelocityLimit(float _val)
 }
 
 
+bool CtrlStepMotor::TrySetVelocityLimitRam(
+    float _val, const CanTxMetadata* metadata)
+{
+    constexpr uint8_t mode = 0x13;
+    CAN_TxHeaderTypeDef request_header = txHeader;
+    request_header.StdId = nodeID << 7 | mode;
+    uint8_t request_data[8] = {};
+    memcpy(request_data, &_val, sizeof(_val));
+    request_data[4] = 0U;
+    return CanTrySendMessage(
+        get_can_ctx(hcan), request_data, &request_header, nullptr, nullptr,
+        metadata) == CanTxStatus::Queued;
+}
+
+
 void CtrlStepMotor::SetAcceleration(float _val)
 {
     uint8_t mode = 0x14;
