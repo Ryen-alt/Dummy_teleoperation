@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 /*---------------------------- C Scope ---------------------------*/
-#include "stdint-gcc.h"
+#include <stdint.h>
 
 void Main();
 void OnUartCmd(uint8_t* _data, uint16_t _len);
