@@ -47,6 +47,8 @@ void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* d
             {
                 memcpy(&actuator->temperature, data, sizeof(actuator->temperature));
                 dummy::protocol::RecordTemperatureFeedbackResponse(id, actuator->temperature);
+                dummy::protocol::RecordMotorTransportDiagnostics(
+                    id, data, rxHeader->DLC);
             }
             break;
         default:

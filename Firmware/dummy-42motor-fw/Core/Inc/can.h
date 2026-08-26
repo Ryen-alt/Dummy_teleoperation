@@ -28,6 +28,7 @@ extern "C" {
 #include "main.h"
 
 /* USER CODE BEGIN Includes */
+#include <stdbool.h>
 extern CAN_HandleTypeDef hcan;
 extern CAN_TxHeaderTypeDef TxHeader;
 extern CAN_RxHeaderTypeDef RxHeader;
@@ -35,6 +36,9 @@ extern uint8_t TxData[8];
 extern uint8_t RxData[8];
 extern uint32_t TxMailbox;
 extern float motor_temperature;
+extern volatile uint8_t can_tx_drop_count;
+extern volatile uint8_t can_rx_error_count;
+extern volatile uint8_t can_busoff_count;
 /* USER CODE END Includes */
 
 extern CAN_HandleTypeDef hcan;
@@ -46,7 +50,7 @@ extern CAN_HandleTypeDef hcan;
 void MX_CAN_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-void CAN_Send(CAN_TxHeaderTypeDef* pHeader, uint8_t* data);
+bool CAN_Send(CAN_TxHeaderTypeDef* pHeader, uint8_t* data);
 
 /* USER CODE END Prototypes */
 

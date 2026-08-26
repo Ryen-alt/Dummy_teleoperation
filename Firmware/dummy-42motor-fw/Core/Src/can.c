@@ -23,12 +23,17 @@
 /* USER CODE BEGIN 0 */
 #include "common_inc.h"
 #include "configurations.h"
+#include "../../../can_transport_contract.h"
 
 CAN_TxHeaderTypeDef TxHeader;
 CAN_RxHeaderTypeDef RxHeader;
 uint8_t TxData[8];
 uint8_t RxData[8];
 uint32_t TxMailbox;
+volatile uint8_t can_tx_drop_count;
+volatile uint8_t can_rx_error_count;
+volatile uint8_t can_busoff_count;
+static bool can_busoff_latched;
 
 /* USER CODE END 0 */
 
@@ -52,9 +57,9 @@ void MX_CAN_Init(void)
   hcan.Init.TimeSeg1 = CAN_BS1_5TQ;
   hcan.Init.TimeSeg2 = CAN_BS2_3TQ;
   hcan.Init.TimeTriggeredMode = DISABLE;
-  hcan.Init.AutoBusOff = DISABLE;
+  hcan.Init.AutoBusOff = ENABLE;
   hcan.Init.AutoWakeUp = ENABLE;
-  hcan.Init.AutoRetransmission = DISABLE;
+  hcan.Init.AutoRetransmission = ENABLE;
   hcan.Init.ReceiveFifoLocked = DISABLE;
   hcan.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan) != HAL_OK)
@@ -178,12 +183,15 @@ void HAL_CAN_MspDeInit(CAN_HandleTypeDef* canHandle)
 }
 
 /* USER CODE BEGIN 1 */
-void CAN_Send(CAN_TxHeaderTypeDef* pHeader, uint8_t* data)
+bool CAN_Send(CAN_TxHeaderTypeDef* pHeader, uint8_t* data)
 {
     if (HAL_CAN_AddTxMessage(&hcan, pHeader, data, &TxMailbox) != HAL_OK)
     {
-        Error_Handler();
+        can_tx_drop_count = DummyCanSaturatingIncrement8(can_tx_drop_count);
+        return false;
     }
+    can_busoff_latched = false;
+    return true;
 }
 
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* CanHandle)
@@ -191,15 +199,28 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* CanHandle)
     /* Get RX message */
     if (HAL_CAN_GetRxMessage(CanHandle, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
     {
-        /* Reception Error */
-        Error_Handler();
+        can_rx_error_count = DummyCanSaturatingIncrement8(can_rx_error_count);
+        return;
     }
+    can_busoff_latched = false;
 
     uint8_t id = (RxHeader.StdId >> 7); // 4Bits ID & 7Bits Msg
     uint8_t cmd = RxHeader.StdId & 0x7F; // 4Bits ID & 7Bits Msg
     if (id == 0 || id == boardConfig.canNodeId)
     {
         OnCanCmd(cmd, RxData, RxHeader.DLC);
+    }
+}
+
+void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* CanHandle)
+{
+    if (CanHandle == NULL)
+        return;
+    if ((CanHandle->ErrorCode & HAL_CAN_ERROR_BOF) != 0U &&
+        !can_busoff_latched)
+    {
+        can_busoff_count = DummyCanSaturatingIncrement8(can_busoff_count);
+        can_busoff_latched = true;
     }
 }
 /* USER CODE END 1 */

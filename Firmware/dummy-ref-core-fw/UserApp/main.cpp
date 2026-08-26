@@ -31,6 +31,8 @@ DummyRobot robot(&hcan1);
 
 namespace
 {
+constexpr uint32_t kCanTxAbortTimeoutUs = 5000U;
+
 dummy::protocol::ExecutorConfig MakeExternalExecutorConfig()
 {
     dummy::protocol::ExecutorConfig config{};
@@ -314,6 +316,8 @@ void ThreadCanDispatch(void* argument)
             completion_sequence = 0U;
             dummy::protocol::RequestBinaryRuntimeHold();
         }
+        CanServiceTxDeadline(
+            can_context, micros(), kCanTxAbortTimeoutUs);
         CanTxCompletion completion{};
         while (CanTakeTxCompletion(can_context, completion))
         {
@@ -565,8 +569,11 @@ void ThreadCanDispatch(void* argument)
             runtime_status |= dummy::protocol::kCanRuntimeQueryPending;
         if (dummy::protocol::ReadCanFeedbackReady())
             runtime_status |= dummy::protocol::kCanRuntimeFeedbackReady;
-        if (can_context != nullptr && can_context->tx_recovery_count != 0U)
-            runtime_status |= dummy::protocol::kCanRuntimeTxRecovered;
+        if (can_context != nullptr &&
+            (can_context->tx_recovery_count != 0U ||
+             can_context->tx_completion_overflow_count != 0U ||
+             can_context->busoff_count != 0U))
+            runtime_status |= dummy::protocol::kCanRuntimeDegraded;
         dummy::protocol::PublishCanRuntimeStatus(runtime_status);
 
         dummy::protocol::CanDiagnosticsPayload can_diagnostics{};

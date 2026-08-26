@@ -1,6 +1,7 @@
 #include "common_inc.h"
 #include "configurations.h"
 #include <can.h>
+#include "../../../can_transport_contract.h"
 
 
 extern Motor motor;
@@ -231,10 +232,11 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             auto* b = (unsigned char*) &boardConfig.motor_temperature;
             for (int i = 0; i < 4; i++)
                 _data[i] = *(b + i);
-            _data[4] = 0;
-            _data[5] = 0;
-            _data[6] = 0;
-            _data[7] = 0;
+            _data[DUMMY_MOTOR_DIAGNOSTICS_FORMAT_OFFSET] =
+                DUMMY_MOTOR_DIAGNOSTICS_FORMAT_V2;
+            _data[DUMMY_MOTOR_TX_DROP_OFFSET] = can_tx_drop_count;
+            _data[DUMMY_MOTOR_RX_ERROR_OFFSET] = can_rx_error_count;
+            _data[DUMMY_MOTOR_BUSOFF_OFFSET] = can_busoff_count;
             txHeader.StdId = (boardConfig.canNodeId << 7) | 0x25;
             CAN_Send(&txHeader, _data);
         }

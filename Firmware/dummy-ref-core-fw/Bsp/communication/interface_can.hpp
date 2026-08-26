@@ -23,6 +23,13 @@ enum class CanTxCompletionStatus : uint8_t
     Error,
 };
 
+enum class CanTxLifecycleState : uint8_t
+{
+    Idle,
+    InFlight,
+    AbortRequested,
+};
+
 struct CanTxMetadata
 {
     CanTxChannel channel = CanTxChannel::Untracked;
@@ -58,8 +65,11 @@ struct CAN_context
     uint32_t tx_busy_count = 0;
     uint32_t tx_recovery_count = 0;
     uint32_t tx_enqueue_error_count = 0;
-    volatile uint32_t tx_started_ms = 0;
-    volatile bool tx_in_flight = false;
+    uint32_t busoff_count = 0;
+    bool busoff_active = false;
+    volatile uint32_t tx_started_us = 0;
+    volatile CanTxLifecycleState tx_state = CanTxLifecycleState::Idle;
+    volatile uint8_t active_mailbox_index = 0;
     CanTxMetadata active_tx_metadata{};
     volatile bool active_tx_metadata_valid = false;
     CanTxCompletion tx_completion_ring[kCanTxCompletionCapacity]{};
@@ -117,6 +127,8 @@ bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* t
                     void* callback_context = nullptr,
                     const CanTxMetadata* metadata = nullptr);
 bool CanTakeTxCompletion(CAN_context* canCtx, CanTxCompletion& completion);
+void CanServiceTxDeadline(CAN_context* canCtx, uint32_t now_us,
+                          uint32_t timeout_us);
 void NotifyCanDispatcherFromIsr();
 void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* data);
 

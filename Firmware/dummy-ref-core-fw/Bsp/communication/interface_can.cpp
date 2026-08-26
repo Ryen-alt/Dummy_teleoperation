@@ -47,7 +47,6 @@ static uint8_t data[8];
 
 namespace
 {
-constexpr uint32_t kCanTxStallMs = 5U;
 constexpr uint32_t kCanBlockingCompatibilityWaitMs = 8U;
 
 osSemaphoreId TxSemaphore(CAN_HandleTypeDef* hcan)
@@ -67,7 +66,7 @@ void ReleaseTxToken(CAN_HandleTypeDef* hcan)
 }
 
 void PushTxCompletion(CAN_context* ctx, CanTxCompletionStatus status,
-                      uint8_t mailbox_idx)
+                      uint8_t mailbox_idx, bool notify_from_isr = true)
 {
     if (ctx == nullptr)
         return;
@@ -90,7 +89,19 @@ void PushTxCompletion(CAN_context* ctx, CanTxCompletionStatus status,
     }
     ctx->active_tx_metadata = {};
     ctx->active_tx_metadata_valid = false;
-    NotifyCanDispatcherFromIsr();
+    if (notify_from_isr)
+        NotifyCanDispatcherFromIsr();
+}
+
+bool FinishActiveTx(CAN_context* ctx, CanTxCompletionStatus status,
+                    uint8_t mailbox_idx, bool notify_from_isr = true)
+{
+    if (ctx == nullptr || ctx->tx_state == CanTxLifecycleState::Idle)
+        return false;
+    PushTxCompletion(ctx, status, mailbox_idx, notify_from_isr);
+    ctx->tx_state = CanTxLifecycleState::Idle;
+    ReleaseTxToken(ctx->handle);
+    return true;
 }
 }
 
@@ -167,14 +178,12 @@ void tx_complete_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
     CAN_context* ctx = get_can_ctx(hcan);
     if (ctx == nullptr)
         return;
-    const bool was_in_flight = ctx->tx_in_flight;
-    if (was_in_flight || ctx->active_tx_metadata_valid)
-        PushTxCompletion(ctx, CanTxCompletionStatus::Complete, mailbox_idx);
-    ctx->tx_in_flight = false;
-    ctx->tx_msg_cnt++;
-    ctx->TxMailboxCompleteCallbackCnt++;
-    if (was_in_flight)
-        ReleaseTxToken(hcan);
+    if (FinishActiveTx(ctx, CanTxCompletionStatus::Complete, mailbox_idx))
+    {
+        ctx->busoff_active = false;
+        ctx->tx_msg_cnt++;
+        ctx->TxMailboxCompleteCallbackCnt++;
+    }
 }
 
 void tx_aborted_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
@@ -182,29 +191,8 @@ void tx_aborted_callback(CAN_HandleTypeDef* hcan, uint8_t mailbox_idx)
     CAN_context* ctx = get_can_ctx(hcan);
     if (ctx == nullptr)
         return;
-    const bool was_in_flight = ctx->tx_in_flight;
-    if (was_in_flight || ctx->active_tx_metadata_valid)
-        PushTxCompletion(ctx, CanTxCompletionStatus::Aborted, mailbox_idx);
-    ctx->tx_in_flight = false;
-    ctx->TxMailboxAbortCallbackCnt++;
-    // An aborted transfer never reaches a mailbox-complete callback. Return
-    // the single-flight token so a transient CAN error cannot deadlock every
-    // subsequent feedback and motion command.
-    if (was_in_flight)
-        ReleaseTxToken(hcan);
-}
-
-void tx_error(CAN_context* ctx, uint8_t mailbox_idx)
-{
-    if (ctx == nullptr || ctx->handle == nullptr)
-        return;
-    ctx->unexpected_errors++;
-    PushTxCompletion(ctx, CanTxCompletionStatus::Error, mailbox_idx);
-    ctx->tx_in_flight = false;
-    (void) HAL_CAN_AbortTxRequest(ctx->handle, 1UL << mailbox_idx);
-    // Auto retransmission is disabled. A transmit error therefore has no
-    // successful completion callback to restore the single-flight token.
-    ReleaseTxToken(ctx->handle);
+    if (FinishActiveTx(ctx, CanTxCompletionStatus::Aborted, mailbox_idx))
+        ctx->TxMailboxAbortCallbackCnt++;
 }
 
 void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef* hcan)
@@ -237,6 +225,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
         ctx->unexpected_errors++;
         return;
     }
+    ctx->busoff_active = false;
 
     OnCanMessage(ctx, &headerRx, data);
     NotifyCanDispatcherFromIsr();
@@ -259,51 +248,16 @@ void HAL_CAN_WakeUpFromRxMsgCallback(CAN_HandleTypeDef* hcan)
 
 void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* hcan)
 {
-    //__asm volatile ("bkpt");
     CAN_context* ctx = get_can_ctx(hcan);
     if (!ctx) return;
-    volatile uint32_t original_error = hcan->ErrorCode;
-    (void) original_error;
-
-    // handle transmit errors in all three mailboxes
-    if (hcan->ErrorCode & HAL_CAN_ERROR_TX_ALST0)
+    const uint32_t errors = hcan->ErrorCode;
+    if ((errors & HAL_CAN_ERROR_BOF) != 0U && !ctx->busoff_active)
     {
-        SET_BIT(hcan->Instance->sTxMailBox[0].TIR, CAN_TI0R_TXRQ);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_ALST0;
-    } else if (hcan->ErrorCode & HAL_CAN_ERROR_TX_TERR0)
-    {
-        tx_error(ctx, 0);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_EWG;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_ACK;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_TERR0;
+        ++ctx->busoff_count;
+        ctx->busoff_active = true;
     }
-
-    if (hcan->ErrorCode & HAL_CAN_ERROR_TX_ALST1)
-    {
-        SET_BIT(hcan->Instance->sTxMailBox[1].TIR, CAN_TI1R_TXRQ);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_ALST1;
-    } else if (hcan->ErrorCode & HAL_CAN_ERROR_TX_TERR1)
-    {
-        tx_error(ctx, 1);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_EWG;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_ACK;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_TERR1;
-    }
-
-    if (hcan->ErrorCode & HAL_CAN_ERROR_TX_ALST2)
-    {
-        SET_BIT(hcan->Instance->sTxMailBox[2].TIR, CAN_TI2R_TXRQ);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_ALST2;
-    } else if (hcan->ErrorCode & HAL_CAN_ERROR_TX_TERR2)
-    {
-        tx_error(ctx, 2);
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_EWG;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_ACK;
-        hcan->ErrorCode &= ~HAL_CAN_ERROR_TX_TERR2;
-    }
-
-    if (hcan->ErrorCode)
-        ctx->unexpected_errors++;
+    if (errors != HAL_CAN_ERROR_NONE)
+        ++ctx->unexpected_errors;
 }
 
 CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
@@ -325,33 +279,6 @@ CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
     if (osSemaphoreAcquire(semaphore, 0U) != osOK)
     {
         canCtx->tx_busy_count++;
-        const uint32_t now_ms = HAL_GetTick();
-        constexpr uint32_t kAllMailboxes =
-            CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2;
-        if (canCtx->tx_in_flight &&
-            now_ms - canCtx->tx_started_ms >= kCanTxStallMs &&
-            HAL_CAN_GetTxMailboxesFreeLevel(canCtx->handle) == 3U)
-        {
-            // The peripheral is idle but the completion callback was lost.
-            canCtx->tx_in_flight = false;
-            canCtx->tx_recovery_count++;
-            ReleaseTxToken(canCtx->handle);
-        }
-        else if (canCtx->tx_in_flight &&
-                 now_ms - canCtx->tx_started_ms >= kCanTxStallMs)
-        {
-            canCtx->tx_recovery_count++;
-            (void) HAL_CAN_AbortTxRequest(canCtx->handle, kAllMailboxes);
-        }
-        else if (!canCtx->tx_in_flight &&
-                 HAL_CAN_GetTxMailboxesFreeLevel(canCtx->handle) == 3U)
-        {
-            // Recover a token lost across a peripheral reset or an omitted HAL
-            // completion callback. Do not enqueue in this call; the dispatcher
-            // will retry on its next tick.
-            canCtx->tx_recovery_count++;
-            ReleaseTxToken(canCtx->handle);
-        }
         return CanTxStatus::Busy;
     }
 
@@ -363,8 +290,14 @@ CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
         canCtx->handle, txHeader, txData, &canCtx->last_heartbeat_mailbox);
     if (send_status == HAL_OK)
     {
-        canCtx->tx_in_flight = true;
-        canCtx->tx_started_ms = HAL_GetTick();
+        canCtx->tx_state = CanTxLifecycleState::InFlight;
+        canCtx->tx_started_us = micros();
+        if (canCtx->last_heartbeat_mailbox == CAN_TX_MAILBOX0)
+            canCtx->active_mailbox_index = 0U;
+        else if (canCtx->last_heartbeat_mailbox == CAN_TX_MAILBOX1)
+            canCtx->active_mailbox_index = 1U;
+        else
+            canCtx->active_mailbox_index = 2U;
         canCtx->tx_queued_count++;
         canCtx->active_tx_metadata = metadata == nullptr
             ? CanTxMetadata{} : *metadata;
@@ -383,6 +316,41 @@ CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,
         return CanTxStatus::Error;
     }
     return CanTxStatus::Queued;
+}
+
+void CanServiceTxDeadline(CAN_context* canCtx, uint32_t now_us,
+                          uint32_t timeout_us)
+{
+    if (canCtx == nullptr || canCtx->handle == nullptr || timeout_us == 0U ||
+        canCtx->tx_state != CanTxLifecycleState::InFlight ||
+        now_us - canCtx->tx_started_us < timeout_us)
+        return;
+
+    taskENTER_CRITICAL();
+    if (canCtx->tx_state != CanTxLifecycleState::InFlight ||
+        now_us - canCtx->tx_started_us < timeout_us)
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
+    canCtx->tx_state = CanTxLifecycleState::AbortRequested;
+    const uint8_t mailbox_index = canCtx->active_mailbox_index;
+    taskEXIT_CRITICAL();
+
+    const HAL_StatusTypeDef abort_status = HAL_CAN_AbortTxRequest(
+        canCtx->handle, 1UL << mailbox_index);
+    if (abort_status == HAL_OK)
+        return;
+
+    taskENTER_CRITICAL();
+    if (canCtx->tx_state == CanTxLifecycleState::AbortRequested)
+    {
+        ++canCtx->tx_enqueue_error_count;
+        ++canCtx->unexpected_errors;
+        (void) FinishActiveTx(
+            canCtx, CanTxCompletionStatus::Error, mailbox_index, false);
+    }
+    taskEXIT_CRITICAL();
 }
 
 bool CanSendMessage(CAN_context* canCtx, uint8_t* txData,

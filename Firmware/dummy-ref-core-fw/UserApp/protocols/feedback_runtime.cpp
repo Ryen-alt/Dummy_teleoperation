@@ -1,6 +1,7 @@
 #include "common_inc.h"
 #include "feedback_runtime.hpp"
 #include "configurations/robot_config_generated.hpp"
+#include "../../../can_transport_contract.h"
 
 namespace dummy::protocol
 {
@@ -15,6 +16,7 @@ bool feedback_ready = false;
 uint32_t readiness_sweep_id = 0U;
 uint8_t consecutive_coherent_sweeps = 0U;
 CanDiagnosticsPayload can_diagnostics{};
+MotorTransportDiagnostics motor_transport_diagnostics{};
 
 uint8_t NodeMask(uint8_t node_id)
 {
@@ -60,6 +62,25 @@ void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c)
         temperature_response_mask | NodeMask(node_id));
 }
 
+void RecordMotorTransportDiagnostics(uint8_t node_id, const uint8_t* data,
+                                     uint32_t length)
+{
+    if (node_id < 1U || node_id > kActuatorNodeCount || data == nullptr ||
+        length < 8U ||
+        data[DUMMY_MOTOR_DIAGNOSTICS_FORMAT_OFFSET] !=
+            DUMMY_MOTOR_DIAGNOSTICS_FORMAT_V2)
+        return;
+    const size_t index = node_id - 1U;
+    motor_transport_diagnostics.valid_mask = static_cast<uint8_t>(
+        motor_transport_diagnostics.valid_mask | NodeMask(node_id));
+    motor_transport_diagnostics.tx_drop[index] =
+        data[DUMMY_MOTOR_TX_DROP_OFFSET];
+    motor_transport_diagnostics.rx_error[index] =
+        data[DUMMY_MOTOR_RX_ERROR_OFFSET];
+    motor_transport_diagnostics.busoff[index] =
+        data[DUMMY_MOTOR_BUSOFF_OFFSET];
+}
+
 void RecordTemperatureFeedbackTimeout(uint8_t node_id)
 {
     taskENTER_CRITICAL();
@@ -92,6 +113,14 @@ CoherentFeedbackStatus ReadCoherentFeedbackStatus()
 {
     taskENTER_CRITICAL();
     const auto snapshot = feedback_monitor.CoherentSnapshot();
+    taskEXIT_CRITICAL();
+    return snapshot;
+}
+
+MotorTransportDiagnostics ReadMotorTransportDiagnostics()
+{
+    taskENTER_CRITICAL();
+    const MotorTransportDiagnostics snapshot = motor_transport_diagnostics;
     taskEXIT_CRITICAL();
     return snapshot;
 }
