@@ -32,6 +32,7 @@ DummyRobot robot(&hcan1);
 namespace
 {
 constexpr uint32_t kCanTxAbortTimeoutUs = 5000U;
+constexpr uint32_t kCanTargetFanoutTimeoutUs = 15000U;
 
 dummy::protocol::ExecutorConfig MakeExternalExecutorConfig()
 {
@@ -276,16 +277,15 @@ void ThreadCanDispatch(void* argument)
     ScheduledActuatorRequest target_fanout{};
     bool target_fanout_active = false;
     uint32_t fanout_generation = 0U;
-    dummy::protocol::ActuatorApplicationTracker completion_tracker;
-    uint32_t completion_generation = 0U;
-    uint32_t completion_sequence = 0U;
-    uint32_t completion_first_enqueue_us = 0U;
+    dummy::protocol::TargetCompletionTracker completion_tracker(
+        kCanTargetFanoutTimeoutUs);
+    ScheduledActuatorRequest completion_target{};
+    bool stream_fail_closed = false;
     uint32_t observed_completion_overflow_count = 0U;
     std::array<uint32_t, dummy::protocol::kActuatorNodeCount>
         target_tx_complete_count{};
     const uint64_t can_diagnostics_window_start_us =
         dummy::protocol::BinaryControlMonotonicMicros();
-    uint32_t max_fanout_us = 0U;
     uint32_t safety_preemption_count = 0U;
     uint32_t max_safety_wait_us = 0U;
     for (;;)
@@ -295,29 +295,104 @@ void ThreadCanDispatch(void* argument)
         // a seven-node fan-out without turning the timer into a throughput cap.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         CAN_context* can_context = get_can_ctx(&hcan1);
+        CanServiceTxDeadline(
+            can_context, micros(), kCanTxAbortTimeoutUs);
+
+        const ScheduledActuatorRequest scheduled =
+            ReadScheduledActuatorRequest();
+        dummy::protocol::CanDispatchMode dispatch_mode =
+            dummy::protocol::CanDispatchMode::Bootstrap;
+        if (scheduled.mode == ScheduledActuatorMode::Stream)
+            dispatch_mode = dummy::protocol::CanDispatchMode::Stream;
+        else if (scheduled.mode == ScheduledActuatorMode::Hold)
+            dispatch_mode = dummy::protocol::CanDispatchMode::Hold;
+        else if (scheduled.mode == ScheduledActuatorMode::Fault)
+            dispatch_mode = dummy::protocol::CanDispatchMode::Fault;
+        const uint64_t dispatch_now_us =
+            dummy::protocol::BinaryControlMonotonicMicros();
+        const auto control_snapshot =
+            dummy::protocol::ReadBinaryControlSnapshot(dispatch_now_us);
+
+        // Observe the safety mailbox before crediting or retrying any target
+        // completion from the same wake. Once the mode changes, stale target
+        // completions can no longer revive the preempted generation.
+        if (dispatch_mode != can_dispatch_scheduler.mode())
+        {
+            uint32_t preempted_sequence = 0U;
+            if (completion_tracker.active())
+                preempted_sequence =
+                    completion_tracker.key().action_sequence;
+            else if (target_fanout_active)
+                preempted_sequence = target_fanout.sequence;
+            if (preempted_sequence != 0U)
+            {
+                dummy::protocol::RecordBinaryTargetPreemptedBySafety(
+                    preempted_sequence,
+                    dummy::protocol::BinaryControlMonotonicMicros());
+                ++safety_preemption_count;
+            }
+            target_fanout = {};
+            target_fanout_active = false;
+            completion_target = {};
+            application_tracker.Reset();
+            completion_tracker.Cancel();
+            stream_fail_closed = false;
+            dummy::protocol::CancelPendingFeedbackRequests();
+            if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
+                dummy::protocol::ResetMotorTransportDiagnostics();
+            can_dispatch_scheduler.SetMode(dispatch_mode);
+        }
+
+        const bool binary_stream_authorized =
+            control_snapshot.lease_active &&
+            (control_snapshot.mode == dummy::protocol::ControlMode::Teleop ||
+             control_snapshot.mode == dummy::protocol::ControlMode::Policy);
+        if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream &&
+            (!binary_stream_authorized ||
+             (completion_tracker.active() &&
+              control_snapshot.session_epoch !=
+                  completion_tracker.key().session_epoch)))
+        {
+            const uint32_t preempted_sequence = completion_tracker.active()
+                ? completion_tracker.key().action_sequence
+                : target_fanout.sequence;
+            if (preempted_sequence != 0U)
+            {
+                dummy::protocol::RecordBinaryTargetPreemptedBySafety(
+                    preempted_sequence, dispatch_now_us);
+                ++safety_preemption_count;
+            }
+            target_fanout = {};
+            target_fanout_active = false;
+            completion_target = {};
+            application_tracker.Reset();
+            completion_tracker.Cancel();
+            stream_fail_closed = true;
+            dummy::protocol::RequestBinaryRuntimeHold();
+        }
+
         if (can_context != nullptr &&
             can_context->tx_completion_overflow_count !=
                 observed_completion_overflow_count)
         {
             observed_completion_overflow_count =
                 can_context->tx_completion_overflow_count;
-            if (target_fanout_active && target_fanout.sequence != 0U)
+            const uint32_t failed_sequence = completion_tracker.active()
+                ? completion_tracker.key().action_sequence
+                : target_fanout.sequence;
+            if (failed_sequence != 0U)
                 dummy::protocol::RecordBinaryTargetFailed(
-                    target_fanout.sequence,
-                    dummy::protocol::BinaryControlMonotonicMicros());
-            if (completion_sequence != 0U)
-                dummy::protocol::RecordBinaryTargetFailed(
-                    completion_sequence,
+                    failed_sequence,
                     dummy::protocol::BinaryControlMonotonicMicros());
             target_fanout = {};
             target_fanout_active = false;
+            completion_target = {};
             application_tracker.Reset();
-            completion_tracker.Reset();
-            completion_sequence = 0U;
+            completion_tracker.Cancel();
+            stream_fail_closed = true;
             dummy::protocol::RequestBinaryRuntimeHold();
         }
-        CanServiceTxDeadline(
-            can_context, micros(), kCanTxAbortTimeoutUs);
+
         CanTxCompletion completion{};
         while (CanTakeTxCompletion(can_context, completion))
         {
@@ -334,88 +409,70 @@ void ThreadCanDispatch(void* argument)
             if (completion.metadata.channel == CanTxChannel::Configuration &&
                 completion.status != CanTxCompletionStatus::Complete)
             {
+                stream_fail_closed = true;
                 dummy::protocol::RequestBinaryRuntimeHold();
                 continue;
             }
             if (completion.metadata.channel != CanTxChannel::Target ||
                 completion.metadata.action_sequence == 0U)
                 continue;
-            if (completion.status != CanTxCompletionStatus::Complete)
+            const dummy::protocol::TargetFanoutKey completion_key{
+                completion.metadata.session_epoch,
+                completion.metadata.action_sequence,
+                completion.metadata.fanout_generation};
+            const auto completion_result =
+                completion_tracker.RecordCompletion(
+                    completion_key, completion.metadata.node_id,
+                    completion.status == CanTxCompletionStatus::Complete,
+                    static_cast<uint32_t>(completed_us));
+            if (completion_result !=
+                    dummy::protocol::TargetCompletionResult::Ignored &&
+                completion.metadata.node_id >= 1U &&
+                completion.metadata.node_id <=
+                    dummy::protocol::kActuatorNodeCount &&
+                completion.status == CanTxCompletionStatus::Complete)
+            {
+                ++target_tx_complete_count[
+                    completion.metadata.node_id - 1U];
+            }
+            if (completion_result ==
+                dummy::protocol::TargetCompletionResult::CompleteExact)
+            {
+                dummy::protocol::RecordBinaryTargetCanTxCompleteExact(
+                    completion.metadata.action_sequence, completed_us);
+                completion_target = {};
+                completion_tracker.Cancel();
+            }
+            else if (completion_result ==
+                     dummy::protocol::TargetCompletionResult::Failed)
             {
                 dummy::protocol::RecordBinaryTargetFailed(
                     completion.metadata.action_sequence, completed_us);
+                target_fanout = {};
+                target_fanout_active = false;
+                completion_target = {};
+                application_tracker.Reset();
+                stream_fail_closed = true;
                 dummy::protocol::RequestBinaryRuntimeHold();
-                completion_tracker.Reset();
-                continue;
             }
-            if (completion.metadata.node_id >= 1U &&
-                completion.metadata.node_id <=
-                    dummy::protocol::kActuatorNodeCount)
-                ++target_tx_complete_count[
-                    completion.metadata.node_id - 1U];
-            if (completion_generation !=
-                completion.metadata.fanout_generation)
-            {
-                completion_generation =
-                    completion.metadata.fanout_generation;
-                completion_sequence = completion.metadata.action_sequence;
-                completion_first_enqueue_us =
-                    completion.metadata.enqueued_time_us;
-                completion_tracker.Reset();
-            }
-            const bool tx_complete_exact =
-                completion_tracker.RecordTransmission(
-                    completion.metadata.action_sequence,
-                    completion.metadata.node_id, true);
-            if (tx_complete_exact)
-            {
-                const uint32_t elapsed_us = static_cast<uint32_t>(
-                    completed_us - completion_first_enqueue_us);
-                max_fanout_us = std::max(max_fanout_us, elapsed_us);
-                if (elapsed_us > 10000U)
-                {
-                    dummy::protocol::RecordBinaryTargetFailed(
-                        completion.metadata.action_sequence, completed_us);
-                    dummy::protocol::RequestBinaryRuntimeHold();
-                }
-                else
-                {
-                    dummy::protocol::RecordBinaryTargetCanTxCompleteExact(
-                        completion.metadata.action_sequence, completed_us);
-                }
-                completion_tracker.Reset();
-                completion_sequence = 0U;
-            }
-        }
-        const ScheduledActuatorRequest scheduled = ReadScheduledActuatorRequest();
-        dummy::protocol::CanDispatchMode dispatch_mode =
-            dummy::protocol::CanDispatchMode::Bootstrap;
-        if (scheduled.mode == ScheduledActuatorMode::Stream)
-            dispatch_mode = dummy::protocol::CanDispatchMode::Stream;
-        else if (scheduled.mode == ScheduledActuatorMode::Hold)
-            dispatch_mode = dummy::protocol::CanDispatchMode::Hold;
-        else if (scheduled.mode == ScheduledActuatorMode::Fault)
-            dispatch_mode = dummy::protocol::CanDispatchMode::Fault;
-
-        if (dispatch_mode != can_dispatch_scheduler.mode())
-        {
-            if (target_fanout_active && target_fanout.sequence != 0U)
-            {
-                dummy::protocol::RecordBinaryTargetPreemptedBySafety(
-                    target_fanout.sequence,
-                    dummy::protocol::BinaryControlMonotonicMicros());
-                ++safety_preemption_count;
-            }
-            target_fanout = {};
-            target_fanout_active = false;
-            application_tracker.Reset();
-            dummy::protocol::CancelPendingFeedbackRequests();
-            if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
-                dummy::protocol::ResetMotorTransportDiagnostics();
-            can_dispatch_scheduler.SetMode(dispatch_mode);
         }
 
         const uint32_t now_us = micros();
+        if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream &&
+            completion_tracker.CheckDeadline(now_us) ==
+                dummy::protocol::TargetCompletionResult::Failed)
+        {
+            dummy::protocol::RecordBinaryTargetFailed(
+                completion_tracker.key().action_sequence,
+                dummy::protocol::BinaryControlMonotonicMicros());
+            target_fanout = {};
+            target_fanout_active = false;
+            completion_target = {};
+            application_tracker.Reset();
+            stream_fail_closed = true;
+            dummy::protocol::RequestBinaryRuntimeHold();
+        }
+
         const auto responses = dummy::protocol::ConsumeFeedbackResponseEvents();
         dummy::protocol::LatchCoherentRobotMeasurement();
         const auto coherent = dummy::protocol::ReadCoherentFeedbackStatus();
@@ -455,20 +512,35 @@ void ThreadCanDispatch(void* argument)
             if (step.timed_out_action ==
                 dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
             {
+                stream_fail_closed = true;
                 dummy::protocol::RequestBinaryRuntimeHold();
             }
         }
 
         bool queued = false;
         ScheduledActuatorRequest latest = scheduled;
+        const auto target_retry = completion_tracker.retry_request();
+        const bool dispatching_target_retry = target_retry.valid &&
+            dispatch_mode == dummy::protocol::CanDispatchMode::Stream &&
+            !stream_fail_closed;
+        const bool block_normal_stream_dispatch = stream_fail_closed &&
+            dispatch_mode == dummy::protocol::CanDispatchMode::Stream;
         CanTxMetadata tx_metadata{};
-        tx_metadata.session_epoch =
-            dummy::protocol::ReadBinaryControlSnapshot(
-                dummy::protocol::BinaryControlMonotonicMicros()).session_epoch;
-        tx_metadata.node_id = step.node_id;
+        tx_metadata.session_epoch = control_snapshot.session_epoch;
+        tx_metadata.node_id = dispatching_target_retry
+            ? target_retry.node_id : step.node_id;
         tx_metadata.feedback_sweep_id = step.feedback_sweep_id;
         tx_metadata.enqueued_time_us = now_us;
-        if (step.action == dummy::protocol::CanDispatchAction::ActuatorTarget)
+        if (dispatching_target_retry)
+        {
+            tx_metadata.channel = CanTxChannel::Target;
+            tx_metadata.session_epoch = target_retry.key.session_epoch;
+            tx_metadata.action_sequence = target_retry.key.action_sequence;
+            tx_metadata.fanout_generation =
+                target_retry.key.fanout_generation;
+        }
+        else if (step.action ==
+                 dummy::protocol::CanDispatchAction::ActuatorTarget)
             tx_metadata.channel = step.transition
                 ? CanTxChannel::Safety : CanTxChannel::Target;
         else if (step.action == dummy::protocol::CanDispatchAction::PositionRequest)
@@ -487,12 +559,28 @@ void ThreadCanDispatch(void* argument)
                 step.action == dummy::protocol::CanDispatchAction::DisableBroadcast &&
                 dispatch_mode == dummy::protocol::CanDispatchMode::Fault
                 ? CanTxChannel::Emergency : CanTxChannel::Safety;
-        switch (step.action)
+        if (dispatching_target_retry)
         {
+            if (completion_target.mode == ScheduledActuatorMode::Stream &&
+                completion_target.sequence ==
+                    target_retry.key.action_sequence)
+            {
+                latest = completion_target;
+                queued = robot.ApplyExternalUrdfTargetNodeRad(
+                    target_retry.node_id, completion_target.position,
+                    &tx_metadata);
+            }
+        }
+        else if (!block_normal_stream_dispatch)
+        {
+            switch (step.action)
+            {
             case dummy::protocol::CanDispatchAction::ActuatorTarget:
-                if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
+                if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream &&
+                    !step.transition)
                 {
-                    if (!target_fanout_active)
+                    if (!target_fanout_active &&
+                        !completion_tracker.active())
                     {
                         const ScheduledActuatorRequest candidate =
                             ReadScheduledActuatorRequest();
@@ -543,6 +631,7 @@ void ThreadCanDispatch(void* argument)
                     static_cast<uint8_t>(
                         (1U << dummy::protocol::kActuatorNodeCount) - 1U))
                 {
+                    stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
                 }
                 else
@@ -562,17 +651,64 @@ void ThreadCanDispatch(void* argument)
                 break;
             case dummy::protocol::CanDispatchAction::None:
                 break;
+            }
         }
 
-        if (step.action != dummy::protocol::CanDispatchAction::None)
+        if (dispatching_target_retry)
+        {
+            if (queued)
+            {
+                if (!completion_tracker.MarkRetryQueued(target_retry))
+                {
+                    dummy::protocol::RecordBinaryTargetFailed(
+                        target_retry.key.action_sequence, dispatch_now_us);
+                    target_fanout = {};
+                    target_fanout_active = false;
+                    completion_target = {};
+                    application_tracker.Reset();
+                    completion_tracker.Cancel();
+                    stream_fail_closed = true;
+                    dummy::protocol::RequestBinaryRuntimeHold();
+                }
+            }
+            else
+            {
+                can_dispatch_scheduler.OnDeferred();
+            }
+            if (step.action != dummy::protocol::CanDispatchAction::None)
+                can_dispatch_scheduler.OnDeferred();
+        }
+        else if (step.action != dummy::protocol::CanDispatchAction::None)
         {
             if (queued)
             {
                 can_dispatch_scheduler.OnQueued(step, now_us);
                 if (step.action == dummy::protocol::CanDispatchAction::ActuatorTarget &&
+                    !step.transition &&
                     latest.mode == ScheduledActuatorMode::Stream &&
                     latest.sequence != 0U)
                 {
+                    if (!completion_tracker.active())
+                    {
+                        const dummy::protocol::TargetFanoutKey key{
+                            tx_metadata.session_epoch,
+                            latest.sequence,
+                            tx_metadata.fanout_generation};
+                        if (!completion_tracker.Begin(key, now_us))
+                        {
+                            dummy::protocol::RecordBinaryTargetFailed(
+                                latest.sequence, dispatch_now_us);
+                            target_fanout = {};
+                            target_fanout_active = false;
+                            application_tracker.Reset();
+                            stream_fail_closed = true;
+                            dummy::protocol::RequestBinaryRuntimeHold();
+                        }
+                        else
+                        {
+                            completion_target = latest;
+                        }
+                    }
                     const bool completed = application_tracker.RecordTransmission(
                         latest.sequence, step.node_id, true);
                     if (completed)
@@ -589,7 +725,18 @@ void ThreadCanDispatch(void* argument)
             }
             else
             {
-                can_dispatch_scheduler.OnDeferred();
+                if (step.action ==
+                        dummy::protocol::CanDispatchAction::ConfigureGripperVelocity ||
+                    step.action ==
+                        dummy::protocol::CanDispatchAction::EnableBroadcast)
+                {
+                    stream_fail_closed = true;
+                    dummy::protocol::RequestBinaryRuntimeHold();
+                }
+                else
+                {
+                    can_dispatch_scheduler.OnDeferred();
+                }
             }
         }
 
@@ -655,7 +802,8 @@ void ThreadCanDispatch(void* argument)
         }
         can_diagnostics.safety_preemption_count = safety_preemption_count;
         can_diagnostics.max_safety_wait_us = max_safety_wait_us;
-        can_diagnostics.max_fanout_us = max_fanout_us;
+        can_diagnostics.max_fanout_us =
+            completion_tracker.diagnostics().max_fanout_us;
         dummy::protocol::PublishCanDiagnostics(can_diagnostics);
     }
 }

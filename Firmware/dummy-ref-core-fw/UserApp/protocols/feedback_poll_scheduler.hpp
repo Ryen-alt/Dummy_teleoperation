@@ -180,6 +180,75 @@ private:
     uint32_t superseded_sequence_ = 0;
 };
 
+struct TargetFanoutKey
+{
+    uint32_t session_epoch = 0U;
+    uint32_t action_sequence = 0U;
+    uint32_t fanout_generation = 0U;
+};
+
+struct TargetRetryRequest
+{
+    TargetFanoutKey key{};
+    uint8_t node_id = 0U;
+    bool valid = false;
+};
+
+enum class TargetCompletionResult : uint8_t
+{
+    Ignored,
+    Awaiting,
+    RetryRequired,
+    CompleteExact,
+    Failed,
+};
+
+struct TargetCompletionDiagnostics
+{
+    uint32_t retry_count = 0U;
+    uint32_t retry_exhausted_count = 0U;
+    uint32_t deadline_failure_count = 0U;
+    uint32_t max_fanout_us = 0U;
+};
+
+// Tracks one frozen seven-node target from its first hardware admission until
+// every node completes. A failed node may be admitted once more only under the
+// exact original session/sequence/generation key. The total deadline includes
+// both the first attempt and that retry.
+class TargetCompletionTracker
+{
+public:
+    explicit TargetCompletionTracker(uint32_t fanout_timeout_us = 15000U);
+
+    bool Begin(const TargetFanoutKey& key, uint32_t first_enqueue_us);
+    TargetCompletionResult RecordCompletion(
+        const TargetFanoutKey& key, uint8_t node_id, bool complete,
+        uint32_t completed_us);
+    TargetCompletionResult CheckDeadline(uint32_t now_us);
+    bool MarkRetryQueued(const TargetRetryRequest& request);
+    void Cancel();
+
+    bool active() const { return active_; }
+    TargetFanoutKey key() const { return key_; }
+    TargetRetryRequest retry_request() const { return retry_request_; }
+    TargetCompletionDiagnostics diagnostics() const { return diagnostics_; }
+
+private:
+    static bool KeysMatch(const TargetFanoutKey& left,
+                          const TargetFanoutKey& right);
+    TargetCompletionResult Fail(uint32_t elapsed_us, bool retry_exhausted,
+                                bool deadline_failure);
+
+    uint32_t fanout_timeout_us_ = 15000U;
+    TargetFanoutKey key_{};
+    uint32_t first_enqueue_us_ = 0U;
+    uint8_t completed_mask_ = 0U;
+    uint8_t retried_mask_ = 0U;
+    TargetRetryRequest retry_request_{};
+    bool active_ = false;
+    TargetCompletionDiagnostics diagnostics_{};
+};
+
 } // namespace dummy::protocol
 
 #endif // DUMMY_FEEDBACK_POLL_SCHEDULER_HPP

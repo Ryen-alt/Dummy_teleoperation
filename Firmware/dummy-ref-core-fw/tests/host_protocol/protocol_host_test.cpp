@@ -1202,6 +1202,87 @@ void TestSafetyModesPreemptPartialTargetFanout()
     assert(fault.transition);
 }
 
+void TestTargetCompletionRetriesOnlyTheExactFailedNode()
+{
+    TargetCompletionTracker tracker(15000U);
+    const TargetFanoutKey key{7U, 19U, 3U};
+    assert(tracker.Begin(key, 100U));
+    assert(tracker.RecordCompletion(key, 1U, true, 200U) ==
+           TargetCompletionResult::Awaiting);
+    assert(tracker.RecordCompletion(key, 2U, false, 300U) ==
+           TargetCompletionResult::RetryRequired);
+
+    const TargetRetryRequest retry = tracker.retry_request();
+    assert(retry.valid);
+    assert(retry.key.session_epoch == key.session_epoch);
+    assert(retry.key.action_sequence == key.action_sequence);
+    assert(retry.key.fanout_generation == key.fanout_generation);
+    assert(retry.node_id == 2U);
+    TargetRetryRequest wrong = retry;
+    ++wrong.key.session_epoch;
+    assert(!tracker.MarkRetryQueued(wrong));
+    assert(tracker.retry_request().valid);
+    assert(tracker.MarkRetryQueued(retry));
+    assert(!tracker.retry_request().valid);
+    assert(tracker.RecordCompletion(key, 2U, true, 400U) ==
+           TargetCompletionResult::Awaiting);
+    for (uint8_t node_id = 3U; node_id < kActuatorNodeCount; ++node_id)
+    {
+        assert(tracker.RecordCompletion(
+                   key, node_id, true,
+                   static_cast<uint32_t>(400U + node_id * 100U)) ==
+               TargetCompletionResult::Awaiting);
+    }
+    assert(tracker.RecordCompletion(key, kActuatorNodeCount, true, 1200U) ==
+           TargetCompletionResult::CompleteExact);
+    assert(!tracker.active());
+    const TargetCompletionDiagnostics diagnostics = tracker.diagnostics();
+    assert(diagnostics.retry_count == 1U);
+    assert(diagnostics.retry_exhausted_count == 0U);
+    assert(diagnostics.deadline_failure_count == 0U);
+    assert(diagnostics.max_fanout_us == 1100U);
+}
+
+void TestTargetCompletionFailsOnSecondErrorOrFanoutDeadline()
+{
+    const TargetFanoutKey key{9U, 22U, 5U};
+    TargetCompletionTracker retry_exhausted(15000U);
+    assert(retry_exhausted.Begin(key, 1000U));
+    assert(retry_exhausted.RecordCompletion(key, 4U, false, 1100U) ==
+           TargetCompletionResult::RetryRequired);
+    const TargetRetryRequest retry = retry_exhausted.retry_request();
+    assert(retry_exhausted.MarkRetryQueued(retry));
+    assert(retry_exhausted.RecordCompletion(key, 4U, false, 1200U) ==
+           TargetCompletionResult::Failed);
+    assert(!retry_exhausted.active());
+    assert(retry_exhausted.diagnostics().retry_count == 1U);
+    assert(retry_exhausted.diagnostics().retry_exhausted_count == 1U);
+
+    TargetCompletionTracker deadline(15000U);
+    assert(deadline.Begin(key, 0xFFFFFF00U));
+    assert(deadline.CheckDeadline(0x00003997U) ==
+           TargetCompletionResult::Awaiting);
+    assert(deadline.CheckDeadline(0x00003998U) ==
+           TargetCompletionResult::Failed);
+    assert(deadline.diagnostics().deadline_failure_count == 1U);
+    assert(deadline.diagnostics().max_fanout_us == 15000U);
+}
+
+void TestTargetCompletionSafetyCancelRejectsStaleRetry()
+{
+    TargetCompletionTracker tracker;
+    const TargetFanoutKey key{11U, 28U, 8U};
+    assert(tracker.Begin(key, 10U));
+    assert(tracker.RecordCompletion(key, 6U, false, 20U) ==
+           TargetCompletionResult::RetryRequired);
+    const TargetRetryRequest retry = tracker.retry_request();
+    tracker.Cancel();
+    assert(!tracker.active());
+    assert(!tracker.MarkRetryQueued(retry));
+    assert(tracker.RecordCompletion(key, 6U, true, 30U) ==
+           TargetCompletionResult::Ignored);
+}
+
 void TestActuatorApplicationTrackerRequiresEverySuccessfulNode()
 {
     ActuatorApplicationTracker tracker;
@@ -1400,6 +1481,9 @@ int main()
     TestCanDispatcherRejectsInvalidRatePlanWithoutFallback();
     TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery();
     TestSafetyModesPreemptPartialTargetFanout();
+    TestTargetCompletionRetriesOnlyTheExactFailedNode();
+    TestTargetCompletionFailsOnSecondErrorOrFanoutDeadline();
+    TestTargetCompletionSafetyCancelRejectsStaleRetry();
     TestActuatorApplicationTrackerRequiresEverySuccessfulNode();
     TestActuatorApplicationTrackerRejectsAbortAtEveryNode();
     TestUrdfJointSpaceMapping();

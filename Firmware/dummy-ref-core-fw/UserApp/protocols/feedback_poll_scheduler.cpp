@@ -756,4 +756,116 @@ void ActuatorApplicationTracker::Reset()
     superseded_sequence_ = 0U;
 }
 
+TargetCompletionTracker::TargetCompletionTracker(uint32_t fanout_timeout_us)
+    : fanout_timeout_us_(fanout_timeout_us)
+{
+}
+
+bool TargetCompletionTracker::KeysMatch(const TargetFanoutKey& left,
+                                        const TargetFanoutKey& right)
+{
+    return left.session_epoch == right.session_epoch &&
+        left.action_sequence == right.action_sequence &&
+        left.fanout_generation == right.fanout_generation;
+}
+
+bool TargetCompletionTracker::Begin(const TargetFanoutKey& key,
+                                    uint32_t first_enqueue_us)
+{
+    if (fanout_timeout_us_ == 0U || key.session_epoch == 0U ||
+        key.action_sequence == 0U || key.fanout_generation == 0U)
+        return false;
+    key_ = key;
+    first_enqueue_us_ = first_enqueue_us;
+    completed_mask_ = 0U;
+    retried_mask_ = 0U;
+    retry_request_ = {};
+    active_ = true;
+    return true;
+}
+
+TargetCompletionResult TargetCompletionTracker::Fail(
+    uint32_t elapsed_us, bool retry_exhausted, bool deadline_failure)
+{
+    diagnostics_.max_fanout_us = std::max(
+        diagnostics_.max_fanout_us, elapsed_us);
+    if (retry_exhausted)
+        diagnostics_.retry_exhausted_count = SaturatingIncrement(
+            diagnostics_.retry_exhausted_count);
+    if (deadline_failure)
+        diagnostics_.deadline_failure_count = SaturatingIncrement(
+            diagnostics_.deadline_failure_count);
+    retry_request_ = {};
+    active_ = false;
+    return TargetCompletionResult::Failed;
+}
+
+TargetCompletionResult TargetCompletionTracker::RecordCompletion(
+    const TargetFanoutKey& key, uint8_t node_id, bool complete,
+    uint32_t completed_us)
+{
+    if (!active_ || !KeysMatch(key_, key) || node_id < 1U ||
+        node_id > kActuatorNodeCount)
+        return TargetCompletionResult::Ignored;
+
+    const uint32_t elapsed_us = completed_us - first_enqueue_us_;
+    if (elapsed_us >= fanout_timeout_us_)
+        return Fail(elapsed_us, false, true);
+
+    const uint8_t node_mask = NodeMask(node_id);
+    if (!complete)
+    {
+        if ((retried_mask_ & node_mask) != 0U)
+            return Fail(elapsed_us, true, false);
+        retried_mask_ = static_cast<uint8_t>(retried_mask_ | node_mask);
+        retry_request_ = {key_, node_id, true};
+        diagnostics_.retry_count = SaturatingIncrement(
+            diagnostics_.retry_count);
+        return TargetCompletionResult::RetryRequired;
+    }
+
+    completed_mask_ = static_cast<uint8_t>(completed_mask_ | node_mask);
+    constexpr uint8_t kAllNodes = static_cast<uint8_t>(
+        (1U << kActuatorNodeCount) - 1U);
+    if (completed_mask_ != kAllNodes)
+        return TargetCompletionResult::Awaiting;
+
+    diagnostics_.max_fanout_us = std::max(
+        diagnostics_.max_fanout_us, elapsed_us);
+    retry_request_ = {};
+    active_ = false;
+    return TargetCompletionResult::CompleteExact;
+}
+
+TargetCompletionResult TargetCompletionTracker::CheckDeadline(uint32_t now_us)
+{
+    if (!active_)
+        return TargetCompletionResult::Ignored;
+    const uint32_t elapsed_us = now_us - first_enqueue_us_;
+    if (elapsed_us < fanout_timeout_us_)
+        return TargetCompletionResult::Awaiting;
+    return Fail(elapsed_us, false, true);
+}
+
+bool TargetCompletionTracker::MarkRetryQueued(
+    const TargetRetryRequest& request)
+{
+    if (!active_ || !request.valid || !retry_request_.valid ||
+        request.node_id != retry_request_.node_id ||
+        !KeysMatch(request.key, retry_request_.key))
+        return false;
+    retry_request_ = {};
+    return true;
+}
+
+void TargetCompletionTracker::Cancel()
+{
+    key_ = {};
+    first_enqueue_us_ = 0U;
+    completed_mask_ = 0U;
+    retried_mask_ = 0U;
+    retry_request_ = {};
+    active_ = false;
+}
+
 } // namespace dummy::protocol
