@@ -34,6 +34,7 @@ dummy-host-session-qa = "dummy_host.apps.session_qa:main"
 dummy-host-fault-inject = "dummy_host.apps.fault_inject:main"
 dummy-host-calibrate = "dummy_host.apps.calibrate:main"
 dummy-host-cartesian-ik-benchmark = "dummy_host.apps.cartesian_ik_benchmark:main"
+dummy-host-migrate-teleop-v5 = "dummy_host.apps.migrate_teleop_v5:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

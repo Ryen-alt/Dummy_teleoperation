@@ -117,6 +117,23 @@ def test_state_flood_never_evicts_reliable_ack_or_nack() -> None:
     assert transport.diagnostics().state_overwritten == 1
 
 
+def test_diagnostics_are_latest_value_without_delaying_reliable_events() -> None:
+    transport = SerialTransport("unused", rx_queue_size=2)
+    first = Packet(MessageType.CAN_DIAGNOSTICS, 1, 1, 1, b"first")
+    latest = Packet(MessageType.CAN_DIAGNOSTICS, 1, 2, 2, b"latest")
+    event = Packet(MessageType.EVENT, 1, 3, 3, b"event")
+
+    transport._publish(first)
+    transport._publish(latest)
+    transport._publish(event)
+
+    assert transport.receive(timeout=0) is event
+    assert transport.receive(timeout=0) is latest
+    diagnostics = transport.diagnostics()
+    assert diagnostics.diagnostics_overwritten == 1
+    assert not diagnostics.diagnostics_pending
+
+
 def test_reliable_rx_overflow_is_fatal_without_dropping_old_packet() -> None:
     transport = SerialTransport("unused", rx_queue_size=1)
     first = Packet(MessageType.ACK, 1, 1, 1, b"ack")

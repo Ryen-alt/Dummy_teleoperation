@@ -6,6 +6,7 @@ import threading
 import time
 import heapq
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -70,6 +71,17 @@ class CommandRejected(RobotError):
         self.detail = detail
 
 
+class ActionCreditUnavailable(RobotError):
+    """The preceding motion action has not reached exact CAN TX completion."""
+
+
+@dataclass(frozen=True)
+class ActionCredit:
+    reservation_id: int
+    control_tick_id: int
+    reserved_ns: int
+
+
 class DummyRobot:
     def __init__(
         self,
@@ -81,6 +93,7 @@ class DummyRobot:
         allow_unverified_hardware: bool = False,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         response_timeout_s: float = 0.5,
+        action_ack_timeout_s: float = 0.05,
         connect_timeout_s: float = 2.0,
         action_observation_timeout_s: float = 0.25,
     ) -> None:
@@ -101,11 +114,14 @@ class DummyRobot:
         self.clock_ns = clock_ns
         if response_timeout_s <= 0:
             raise ValueError("response_timeout_s must be positive")
+        if action_ack_timeout_s <= 0:
+            raise ValueError("action_ack_timeout_s must be positive")
         if connect_timeout_s <= 0:
             raise ValueError("connect_timeout_s must be positive")
         if action_observation_timeout_s <= 0:
             raise ValueError("action_observation_timeout_s must be positive")
         self.response_timeout_s = response_timeout_s
+        self.action_ack_timeout_s = action_ack_timeout_s
         self.connect_timeout_s = connect_timeout_s
         self.action_observation_timeout_s = action_observation_timeout_s
         self.safety = SafetyFilter(config)
@@ -122,6 +138,9 @@ class DummyRobot:
         self._deadline_heap: list[tuple[int, int, int]] = []
         self._action_stages: dict[int, set[ActionStage]] = {}
         self._active_action_sequence: int | None = None
+        self._action_credit_generation = 0
+        self._action_credit: ActionCredit | None = None
+        self._action_credit_sequence: int | None = None
         self._action_listener: Callable[[ActionLifecycleUpdate], None] | None = None
         self._pending_lock = threading.Lock()
         self._watchdog_condition = threading.Condition(self._pending_lock)
@@ -256,6 +275,7 @@ class DummyRobot:
         self._wait_for_mode(target_mode)
         self._control_acquired = True
         self._active_action_sequence = None
+        self._clear_action_credit()
         self.action_gateway.reset()
 
     def wait_for_feedback_ready(
@@ -309,6 +329,7 @@ class DummyRobot:
         self._expect_ack(self._request(MessageType.RELEASE_CONTROL), MessageType.RELEASE_CONTROL)
         self._control_acquired = False
         self._active_action_sequence = None
+        self._clear_action_credit()
         self.action_gateway.reset()
 
     def read_state(self, max_age_ms: int | None = None) -> RobotState:
@@ -374,6 +395,7 @@ class DummyRobot:
         source: str = "direct",
         max_velocity_rad_s: np.ndarray | None = None,
         generated_at_ns: int | None = None,
+        action_credit: ActionCredit | None = None,
     ) -> AppliedAction:
         """Safety-check and non-blockingly enqueue one target for serial TX.
 
@@ -383,10 +405,16 @@ class DummyRobot:
 
         self._require_control()
         received_ns = self.clock_ns()
-        sequence = self._next_sequence()
-        control_tick_id = self._next_control_tick_id()
-        self._prepare_action_sequence(sequence)
-        self._emit_action_stage(sequence, ActionStage.RECEIVED, received_ns)
+        owned_credit = action_credit
+        if owned_credit is None:
+            control_tick_id = self.advance_control_tick()
+            owned_credit = self.reserve_action_credit(
+                control_tick_id, reserved_ns=received_ns
+            )
+            if owned_credit is None:
+                raise ActionCreditUnavailable(
+                    "previous action has not reached CAN_TX_COMPLETE_EXACT"
+                )
         generated_ns = received_ns if generated_at_ns is None else generated_at_ns
         try:
             proposal = ActionProposal(
@@ -402,27 +430,38 @@ class DummyRobot:
                 received_ns,
                 velocity_limit_rad_s=max_velocity_rad_s,
             )
-        except (ValueError, SafetyError) as exc:
-            self._emit_action_stage(
-                sequence, ActionStage.REJECTED, self.clock_ns(), detail=str(exc)
-            )
+        except (ValueError, SafetyError):
+            self.cancel_action_credit(owned_credit)
             raise
         accepted_ns = self.clock_ns()
+        # Sequence allocation happens only after the candidate has passed the
+        # safety gateway. Rejected desired snapshots therefore cannot consume
+        # protocol sequence numbers or manufacture partial action lifecycles.
+        sequence = self._next_sequence()
+        self._prepare_action_sequence(sequence)
+        self._bind_action_credit(owned_credit, sequence)
+        self._emit_action_stage(sequence, ActionStage.RECEIVED, received_ns)
         self._emit_action_stage(sequence, ActionStage.SAFETY_ACCEPTED, accepted_ns)
-        packet = Packet(
-            MessageType.SET_JOINT_TARGET,
-            self.session_id,
-            sequence,
-            monotonic_us(accepted_ns),
-            pack_joint_target(
-                result.applied,
-                self.config.joint_velocity_limit_rad_s
-                if max_velocity_rad_s is None
-                else max_velocity_rad_s,
-                self.config.target_ttl_ms,
-                control_tick_id,
-            ),
-        )
+        try:
+            packet = Packet(
+                MessageType.SET_JOINT_TARGET,
+                self.session_id,
+                sequence,
+                monotonic_us(accepted_ns),
+                pack_joint_target(
+                    result.applied,
+                    self.config.joint_velocity_limit_rad_s
+                    if max_velocity_rad_s is None
+                    else max_velocity_rad_s,
+                    self.config.target_ttl_ms,
+                    owned_credit.control_tick_id,
+                ),
+            )
+        except BaseException as exc:
+            self._emit_action_stage(
+                sequence, ActionStage.FAILED, self.clock_ns(), detail=str(exc)
+            )
+            raise
         enqueued_ns = self.clock_ns()
         self._emit_action_stage(sequence, ActionStage.SEND_ENQUEUED, enqueued_ns)
         previous_active_sequence = self._active_action_sequence
@@ -500,9 +539,7 @@ class DummyRobot:
         self._require_control()
         self._expect_ack(self._request(MessageType.HEARTBEAT), MessageType.HEARTBEAT)
 
-    def refresh_target(
-        self, action_sequence: int, control_tick_id: int | None = None
-    ) -> None:
+    def refresh_target(self, action_sequence: int, control_tick_id: int) -> None:
         """Refresh exactly one active motion target from a healthy control tick.
 
         This is deliberately separate from HEARTBEAT: a lease heartbeat must
@@ -519,8 +556,6 @@ class DummyRobot:
                 result=ResultCode.BAD_SEQUENCE,
             )
         try:
-            if control_tick_id is None:
-                control_tick_id = self._next_control_tick_id()
             self._expect_ack(
                 self._request(
                     MessageType.TARGET_KEEPALIVE,
@@ -546,6 +581,7 @@ class DummyRobot:
         self._expect_ack(self._request(MessageType.HOLD), MessageType.HOLD)
         self._wait_for_mode(ControlMode.HOLD)
         self._active_action_sequence = None
+        self._clear_action_credit()
         self.action_gateway.reset()
 
     def request_priority_hold(self) -> None:
@@ -566,6 +602,7 @@ class DummyRobot:
         self._wait_for_mode(ControlMode.FAULT)
         self._control_acquired = False
         self._active_action_sequence = None
+        self._clear_action_credit()
         self.action_gateway.reset()
 
     def health(self) -> RobotHealth:
@@ -620,7 +657,12 @@ class DummyRobot:
     def _hello_with_retry(self, deadline: float) -> Packet:
         payload = pack_hello(
             self.config.config_hash_bytes,
-            CAPABILITY_MULTI_CHANNEL_SEQUENCE | CAPABILITY_TARGET_KEEPALIVE,
+            CAPABILITY_MULTI_CHANNEL_SEQUENCE
+            | CAPABILITY_TARGET_KEEPALIVE
+            | CAPABILITY_CAN_TX_COMPLETE_EXACT
+            | CAPABILITY_CONTROL_FRESHNESS_TOKEN
+            | CAPABILITY_TIME_SYNC
+            | CAPABILITY_CAN_DIAGNOSTICS,
         )
         last_timeout: RobotError | None = None
         while True:
@@ -994,6 +1036,8 @@ class DummyRobot:
                     oldest = next(iter(self._action_stages))
                     if oldest != sequence:
                         self._action_stages.pop(oldest, None)
+            if stage is ActionStage.CAN_TX_COMPLETE_EXACT or terminal:
+                self._release_action_credit_locked(sequence)
             if (
                 stage
                 in {
@@ -1057,7 +1101,7 @@ class DummyRobot:
                 stages = self._action_stages.get(sequence, set())
                 if ActionStage.ACKNOWLEDGED not in stages:
                     deadline_ns = update.finished_ns + int(
-                        self.response_timeout_s * 1e9
+                        self.action_ack_timeout_s * 1e9
                     )
                     self._ack_deadlines[sequence] = deadline_ns
                     heapq.heappush(
@@ -1080,6 +1124,56 @@ class DummyRobot:
             if self._control_tick_id == 0:
                 self._control_tick_id = 1
             return self._control_tick_id
+
+    def advance_control_tick(self) -> int:
+        """Publish one new control-health generation for target freshness."""
+
+        self._require_control()
+        return self._next_control_tick_id()
+
+    def reserve_action_credit(
+        self, control_tick_id: int, *, reserved_ns: int | None = None
+    ) -> ActionCredit | None:
+        """Atomically reserve the sole uncompleted-CAN motion slot."""
+
+        self._require_control()
+        if not 0 < control_tick_id <= 0xFFFFFFFF:
+            raise ValueError("control_tick_id must be a non-zero uint32")
+        with self._pending_lock:
+            if self._action_credit is not None:
+                return None
+            self._action_credit_generation += 1
+            credit = ActionCredit(
+                self._action_credit_generation,
+                control_tick_id,
+                self.clock_ns() if reserved_ns is None else reserved_ns,
+            )
+            self._action_credit = credit
+            self._action_credit_sequence = None
+            return credit
+
+    def cancel_action_credit(self, credit: ActionCredit) -> None:
+        """Release an unbound reservation after candidate generation fails."""
+
+        with self._pending_lock:
+            if self._action_credit == credit and self._action_credit_sequence is None:
+                self._action_credit = None
+
+    def _bind_action_credit(self, credit: ActionCredit, sequence: int) -> None:
+        with self._pending_lock:
+            if self._action_credit != credit or self._action_credit_sequence is not None:
+                raise ActionCreditUnavailable("action credit is stale or already consumed")
+            self._action_credit_sequence = sequence
+
+    def _release_action_credit_locked(self, sequence: int) -> None:
+        if self._action_credit_sequence == sequence:
+            self._action_credit = None
+            self._action_credit_sequence = None
+
+    def _clear_action_credit(self) -> None:
+        with self._pending_lock:
+            self._action_credit = None
+            self._action_credit_sequence = None
 
     def _enqueue_priority_hold(self) -> None:
         """Non-blockingly preempt motion without waiting on the serial writer."""
@@ -1161,3 +1255,5 @@ class DummyRobot:
             self._completion_deadlines.clear()
             self._deadline_heap.clear()
             self._pending.clear()
+            self._action_credit = None
+            self._action_credit_sequence = None

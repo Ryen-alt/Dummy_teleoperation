@@ -47,8 +47,12 @@ def _kinematics(
         position_tolerance_m=cartesian.position_tolerance_m,
         orientation_tolerance_rad=cartesian.orientation_tolerance_rad,
         max_iterations=cartesian.max_iterations,
-        damping=cartesian.damping,
-        finite_difference_rad=cartesian.finite_difference_rad,
+        sigma_warn=cartesian.sigma_warn,
+        sigma_hard=cartesian.sigma_hard,
+        damping_min=cartesian.damping_min,
+        damping_max=cartesian.damping_max,
+        task_trust_region=cartesian.task_trust_region,
+        soft_limit_zone_rad=cartesian.soft_limit_zone_rad,
         max_solver_step_rad=cartesian.max_solver_step_rad,
         max_solution_step_rad=cartesian.max_solution_step_rad,
         translation_scale_m=cartesian.translation_scale_m,
@@ -514,22 +518,68 @@ def test_geometric_jacobian_matches_central_difference(config: RobotConfig) -> N
     np.testing.assert_allclose(analytic, numeric, atol=2e-6, rtol=2e-5)
 
 
+def test_adaptive_ik_suppresses_hard_singular_direction_and_limit_motion(
+    config: RobotConfig,
+) -> None:
+    backend = _kinematics(config, _profile())
+    jacobian = np.eye(6, dtype=np.float64)
+    # After translation weighting this direction has sigma=0.002, below
+    # sigma_hard=0.004, so motion along it must be suppressed.
+    jacobian[0, 0] = backend.translation_scale_m * 0.002
+    middle = (backend.lower + backend.upper) * 0.5
+    singular_step, singular = backend._adaptive_task_step(
+        jacobian,
+        np.asarray([0.01, 0.0, 0.0]),
+        np.zeros(3),
+        middle,
+        None,
+        "test_singular",
+    )
+    assert singular == pytest.approx(0.002)
+    assert singular_step[0] == pytest.approx(0.0, abs=1e-12)
+    assert backend._singularity_flags(singular) == ("singularity_hard",)
+
+    regular = np.eye(6, dtype=np.float64)
+    near_lower = middle.copy()
+    near_lower[0] = backend.lower[0] + backend.soft_limit_zone_rad * 0.5
+    blocked, _ = backend._adaptive_task_step(
+        regular,
+        np.asarray([-0.01, 0.0, 0.0]),
+        np.zeros(3),
+        near_lower,
+        None,
+        "test_lower_blocked",
+    )
+    recovery, _ = backend._adaptive_task_step(
+        regular,
+        np.asarray([0.01, 0.0, 0.0]),
+        np.zeros(3),
+        near_lower,
+        None,
+        "test_lower_recovery",
+    )
+    assert blocked[0] == pytest.approx(0.0, abs=1e-12)
+    assert recovery[0] > 0.0
+
+
 class _ScriptedCartesianGamepad:
     def __init__(
         self,
         mapper: CartesianGamepadMapper,
         *,
         start_episode: bool = False,
+        deadman_until_poll: int = 9,
     ) -> None:
         self.mapper = mapper
         self.start_episode = start_episode
+        self.deadman_until_poll = deadman_until_poll
         self.polls = 0
         self.closed = False
 
     def poll(self, now_ns: int | None = None) -> TeleopCommand:
         assert now_ns is not None
         self.polls += 1
-        pressed = {"lb"} if 2 <= self.polls <= 9 else set()
+        pressed = {"lb"} if 2 <= self.polls <= self.deadman_until_poll else set()
         if self.start_episode and self.polls == 2:
             pressed.add("y")
         return self.mapper.map(
@@ -697,7 +747,9 @@ def test_runtime_stalled_coherent_sweep_holds_and_fails_episode(
 ) -> None:
     profile = _profile()
     source = _ScriptedCartesianGamepad(
-        CartesianGamepadMapper(profile), start_episode=True
+        CartesianGamepadMapper(profile),
+        start_episode=True,
+        deadman_until_poll=20,
     )
     robot = DummyRobot(config, _FreezingSweepFakeMcu(config))
     recorder = SessionRecorder(
@@ -712,7 +764,7 @@ def test_runtime_stalled_coherent_sweep_holds_and_fails_episode(
         source,
         recorder,
         profile,
-        duration_s=0.56,
+        duration_s=0.76,
         teleop_mode="cartesian",
         kinematics=_LinearKinematics(),
     )

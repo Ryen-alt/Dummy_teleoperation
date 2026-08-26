@@ -41,17 +41,21 @@ class TransportTxUpdate:
 
 @dataclass(frozen=True)
 class TransportDiagnostics:
+    estop_depth: int
     safety_depth: int
     reliable_tx_depth: int
     target_pending: bool
     reliable_rx_depth: int
     state_pending: bool
+    diagnostics_pending: bool
+    estop_high_watermark: int
     safety_high_watermark: int
     reliable_tx_high_watermark: int
     reliable_rx_high_watermark: int
     target_superseded: int
     target_preempted_by_safety: int
     state_overwritten: int
+    diagnostics_overwritten: int
     reliable_rx_overflow: int
     max_safety_wait_ns: int
 
@@ -112,8 +116,10 @@ class SerialTransport:
         self._tx_capacity = tx_queue_size
         self._rx_reliable: deque[Packet] = deque()
         self._latest_state: Packet | None = None
+        self._latest_diagnostics: Packet | None = None
         self._rx_error: BaseException | None = None
         self._rx_condition = threading.Condition()
+        self._estop_tx: deque[_TxItem] = deque()
         self._safety_tx: deque[_TxItem] = deque()
         self._reliable_tx: deque[_TxItem] = deque()
         self._target_tx: _TxItem | None = None
@@ -123,12 +129,14 @@ class SerialTransport:
         self._threads: list[threading.Thread] = []
         self._serial = None
         self.decoder = StreamDecoder()
+        self._estop_high_watermark = 0
         self._safety_high_watermark = 0
         self._reliable_tx_high_watermark = 0
         self._reliable_rx_high_watermark = 0
         self._target_superseded = 0
         self._target_preempted = 0
         self._state_overwritten = 0
+        self._diagnostics_overwritten = 0
         self._reliable_rx_overflow = 0
         self._max_safety_wait_ns = 0
 
@@ -157,8 +165,10 @@ class SerialTransport:
         with self._rx_condition:
             self._rx_reliable.clear()
             self._latest_state = None
+            self._latest_diagnostics = None
             self._rx_error = None
         with self._tx_condition:
+            self._estop_tx.clear()
             self._safety_tx.clear()
             self._reliable_tx.clear()
             self._target_tx = None
@@ -200,7 +210,12 @@ class SerialTransport:
                     self._target_superseded += 1
                 self._target_tx = item
             elif packet.message_type in _SAFETY_TYPES:
-                if len(self._safety_tx) >= self._tx_capacity:
+                target_queue = (
+                    self._estop_tx
+                    if packet.message_type == MessageType.ESTOP
+                    else self._safety_tx
+                )
+                if len(target_queue) >= self._tx_capacity:
                     raise TransportError("serial safety queue is full")
                 if (
                     packet.message_type in _MOTION_FLUSH_TYPES
@@ -210,7 +225,10 @@ class SerialTransport:
                     self._target_tx = None
                     self._target_preempted += 1
                 if packet.message_type == MessageType.ESTOP:
-                    self._safety_tx.appendleft(item)
+                    self._estop_tx.append(item)
+                    self._estop_high_watermark = max(
+                        self._estop_high_watermark, len(self._estop_tx)
+                    )
                 else:
                     self._safety_tx.append(item)
                 self._safety_high_watermark = max(
@@ -261,6 +279,10 @@ class SerialTransport:
                     raise TransportError(str(error)) from error
                 if self._rx_reliable:
                     return self._rx_reliable.popleft()
+                if self._latest_diagnostics is not None:
+                    diagnostics = self._latest_diagnostics
+                    self._latest_diagnostics = None
+                    return diagnostics
                 if self._latest_state is not None:
                     state = self._latest_state
                     self._latest_state = None
@@ -280,17 +302,21 @@ class SerialTransport:
     def diagnostics(self) -> TransportDiagnostics:
         with self._tx_condition, self._rx_condition:
             return TransportDiagnostics(
+                estop_depth=len(self._estop_tx),
                 safety_depth=len(self._safety_tx),
                 reliable_tx_depth=len(self._reliable_tx),
                 target_pending=self._target_tx is not None,
                 reliable_rx_depth=len(self._rx_reliable),
                 state_pending=self._latest_state is not None,
+                diagnostics_pending=self._latest_diagnostics is not None,
+                estop_high_watermark=self._estop_high_watermark,
                 safety_high_watermark=self._safety_high_watermark,
                 reliable_tx_high_watermark=self._reliable_tx_high_watermark,
                 reliable_rx_high_watermark=self._reliable_rx_high_watermark,
                 target_superseded=self._target_superseded,
                 target_preempted_by_safety=self._target_preempted,
                 state_overwritten=self._state_overwritten,
+                diagnostics_overwritten=self._diagnostics_overwritten,
                 reliable_rx_overflow=self._reliable_rx_overflow,
                 max_safety_wait_ns=self._max_safety_wait_ns,
             )
@@ -308,6 +334,10 @@ class SerialTransport:
                 if self._latest_state is not None:
                     self._state_overwritten += 1
                 self._latest_state = item
+            elif item.message_type == MessageType.CAN_DIAGNOSTICS:
+                if self._latest_diagnostics is not None:
+                    self._diagnostics_overwritten += 1
+                self._latest_diagnostics = item
             elif len(self._rx_reliable) >= self._rx_capacity:
                 self._reliable_rx_overflow += 1
                 self._rx_error = TransportError(
@@ -357,6 +387,8 @@ class SerialTransport:
     def _next_tx(self) -> _TxItem | None:
         with self._tx_condition:
             while not self._stop.is_set():
+                if self._estop_tx:
+                    return self._estop_tx.popleft()
                 if self._safety_tx:
                     return self._safety_tx.popleft()
                 if self._reliable_tx:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import sqlite3
+import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,7 +15,7 @@ from dummy_host.recording import RecorderBackpressure, SessionRecorder
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import RobotConfig
 from dummy_host.teleop import KeyboardMapper, TeleopCommand, TeleopError, load_teleop_profile
-from dummy_host.teleop_runtime import run_teleop_collection
+from dummy_host.teleop_runtime import _LeaseCoordinator, run_teleop_collection
 
 
 class ScriptedKeyboard:
@@ -147,6 +149,61 @@ class DelayedExactFanoutTransport(FakeMcuTransport):
             self.hidden_sequence = None
 
 
+def test_lease_coordinator_holds_within_75_ms_when_control_ticks_stop() -> None:
+    class Robot:
+        config = SimpleNamespace(lease_timeout_ms=500)
+
+        def __init__(self) -> None:
+            self.priority_holds = 0
+
+        def acquire_control(self, _mode) -> None:
+            pass
+
+        def heartbeat(self) -> None:
+            pass
+
+        def refresh_target(self, _sequence: int, _tick: int) -> None:
+            pass
+
+        def request_priority_hold(self) -> None:
+            self.priority_holds += 1
+
+        def hold(self) -> None:
+            pass
+
+        def release_control(self) -> None:
+            pass
+
+        def emergency_stop(self) -> None:
+            pass
+
+    robot = Robot()
+    events: list[str] = []
+    coordinator = _LeaseCoordinator(
+        robot,  # type: ignore[arg-type]
+        clock_ns=time.monotonic_ns,
+        event_callback=lambda event, _now, _payload: events.append(event),
+    )
+    coordinator.start()
+    coordinator.request("teleop")
+    deadline = time.monotonic() + 0.3
+    while not coordinator.snapshot()[0] and time.monotonic() < deadline:
+        time.sleep(0.002)
+    assert coordinator.snapshot()[0]
+    coordinator.note_control_tick(1, time.monotonic_ns())
+
+    deadline = time.monotonic() + 0.3
+    while robot.priority_holds == 0 and time.monotonic() < deadline:
+        time.sleep(0.002)
+    acquired, error = coordinator.snapshot()
+    coordinator.close()
+
+    assert not acquired
+    assert isinstance(error, TeleopError)
+    assert robot.priority_holds == 1
+    assert "control_health_timeout" in events
+
+
 def test_keyboard_fake_mcu_collection_closes_in_hold(
     config: RobotConfig, tmp_path: Path
 ) -> None:
@@ -191,7 +248,7 @@ def test_keyboard_fake_mcu_collection_closes_in_hold(
     assert not robot.is_connected
 
 
-def test_runtime_refreshes_target_and_waits_for_exact_fanout(
+def test_runtime_missing_exact_fanout_credit_fails_closed_without_overlap(
     config: RobotConfig, tmp_path: Path
 ) -> None:
     profile = load_teleop_profile(
@@ -218,9 +275,11 @@ def test_runtime_refreshes_target_and_waits_for_exact_fanout(
     recorder.close()
 
     assert result.actions_sent >= 1
-    assert transport.target_keepalives >= 1
+    assert result.action_credit_misses == 1
+    assert transport.target_keepalives == 0
     assert transport.lease_heartbeats <= 5
     assert not transport.target_overlap
+    assert result.final_mode == "HOLD"
     with sqlite3.connect(recorder.db_path) as connection:
         superseded = connection.execute(
             "SELECT COUNT(*) FROM action_lifecycle WHERE terminal_stage = 'superseded'"

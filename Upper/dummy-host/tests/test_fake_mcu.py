@@ -10,6 +10,7 @@ from dummy_host.protocol import MessageType, Packet, pack_hello
 from dummy_host.robot_driver import CommandRejected, DummyRobot, RobotError
 from dummy_host.schema import ConfigError, ControlMode
 from dummy_host.domain.models import ActionStage, FaultBits, HoldReasonBits
+from dummy_host.safety import SafetyError
 
 
 class DropFirstHelloTransport(FakeMcuTransport):
@@ -45,6 +46,19 @@ class ExactCanWithoutPostFeedbackTransport(FakeMcuTransport):
         try:
             super()._emit_state(sequence)
         finally:
+            self._last_applied = applied
+
+
+class AckWithoutExactCanTransport(FakeMcuTransport):
+    def _emit_state(self, sequence: int) -> None:
+        progress = self._progress
+        applied = self._last_applied
+        self._progress = []
+        self._last_applied = 0
+        try:
+            super()._emit_state(sequence)
+        finally:
+            self._progress = progress
             self._last_applied = applied
 
 
@@ -92,11 +106,14 @@ def test_target_keepalive_is_exact_and_heartbeat_does_not_refresh_target(config)
         action = robot.send_action(target)
 
         time.sleep(0.06)
-        robot.refresh_target(action.sequence)
+        robot.refresh_target(action.sequence, robot.advance_control_tick())
         time.sleep(0.06)
         assert robot.read_state().mode == ControlMode.TELEOP
         with pytest.raises(CommandRejected, match="BAD_SEQUENCE"):
-            robot.refresh_target((action.sequence + 1) & 0xFFFFFFFF or 1)
+            robot.refresh_target(
+                (action.sequence + 1) & 0xFFFFFFFF or 1,
+                robot.advance_control_tick(),
+            )
 
         # A lease heartbeat is intentionally unable to keep that motion target
         # alive. Without another control-bound refresh, the configured target TTL
@@ -108,6 +125,60 @@ def test_target_keepalive_is_exact_and_heartbeat_does_not_refresh_target(config)
         state = robot.read_state()
         assert state.mode == ControlMode.HOLD
         assert state.hold_reason_bits & int(HoldReasonBits.TARGET_TIMEOUT)
+
+
+def test_freshness_token_rejects_duplicate_and_backward_values(config) -> None:
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        target = robot.read_state().position.copy()
+        target[0] += np.float32(0.002)
+        action = robot.enqueue_absolute_action(target, source="freshness-token")
+        refresh_tick = robot.advance_control_tick()
+        robot.refresh_target(action.sequence, refresh_tick)
+        with pytest.raises(CommandRejected, match="BAD_SEQUENCE"):
+            robot.refresh_target(action.sequence, refresh_tick)
+        with pytest.raises(CommandRejected, match="BAD_SEQUENCE"):
+            robot.refresh_target(action.sequence, (refresh_tick - 1) or 0xFFFFFFFF)
+
+
+def test_action_credit_is_released_only_by_exact_can_completion(config) -> None:
+    robot = DummyRobot(config, AckWithoutExactCanTransport(config))
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        target = robot.read_state().position.copy()
+        target[0] += np.float32(0.002)
+        action = robot.enqueue_absolute_action(target, source="credit")
+        assert robot.reserve_action_credit(robot.advance_control_tick()) is None
+
+        robot._emit_action_stage(
+            action.sequence,
+            ActionStage.CAN_TX_COMPLETE_EXACT,
+            robot.clock_ns(),
+        )
+        credit = robot.reserve_action_credit(robot.advance_control_tick())
+        assert credit is not None
+        robot.cancel_action_credit(credit)
+
+
+def test_rejected_candidate_consumes_neither_sequence_nor_credit(config) -> None:
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+        robot._sequence = 41
+        credit = robot.reserve_action_credit(robot.advance_control_tick())
+        assert credit is not None
+        with pytest.raises(SafetyError, match="not valid"):
+            robot.enqueue_absolute_action(
+                robot.read_state().position.copy(),
+                source="expired",
+                generated_at_ns=0,
+                action_credit=credit,
+            )
+        assert robot._sequence == 41
+        replacement = robot.reserve_action_credit(robot.advance_control_tick())
+        assert replacement is not None
+        robot.cancel_action_credit(replacement)
 
 
 def test_protocol_v4_firmware_is_rejected_by_v5_host(config) -> None:

@@ -32,15 +32,14 @@ def test_evdev_background_reader_uses_kernel_time_and_marks_syn_dropped() -> Non
         SYN_REPORT=0,
         SYN_DROPPED=3,
     )
-    events = (
-        SimpleNamespace(type=1, code=30, value=1, sec=1, usec=10),
-        SimpleNamespace(type=0, code=0, value=0, sec=1, usec=20),
-        SimpleNamespace(type=0, code=3, value=0, sec=1, usec=30),
-    )
+    published_mid_frame: list[set[int]] = []
 
     class Device:
         def read_loop(self):
-            return iter(events)
+            yield SimpleNamespace(type=1, code=30, value=1, sec=1, usec=10)
+            published_mid_frame.append(set(device._active_keys))
+            yield SimpleNamespace(type=0, code=0, value=0, sec=1, usec=20)
+            yield SimpleNamespace(type=0, code=3, value=0, sec=1, usec=30)
 
         def active_keys(self):
             return [31]
@@ -52,12 +51,15 @@ def test_evdev_background_reader_uses_kernel_time_and_marks_syn_dropped() -> Non
     device._lock = Lock()
     device._active_keys = set()
     device._axis_values = {}
+    device._pending_active_keys = set()
+    device._pending_axis_values = {}
     device._last_event_ns = 0
     device._sync_lost = False
     device.last_error = None
 
     device._event_loop()
 
+    assert published_mid_frame == [set()]
     assert device._active_keys == {31}
     assert device.event_metadata() == (1_000_030_000, True)
     assert device.event_metadata() == (1_000_030_000, False)

@@ -1,4 +1,4 @@
-version: 4
+version: 5
 
 control:
   # These are deliberately below robot_config.yaml limits. Raise them only
@@ -98,8 +98,14 @@ cartesian:
     position_tolerance_m: 0.0003
     orientation_tolerance_rad: 0.003
     max_iterations: 80
-    damping: 0.02
-    finite_difference_rad: 0.0001
+    # v5 adaptive DLS policy. These reviewed thresholds replace the single
+    # v4 damping scalar and are intentionally explicit in every formal profile.
+    sigma_warn: 0.04
+    sigma_hard: 0.004
+    damping_min: 0.01
+    damping_max: 0.08
+    task_trust_region: 0.25
+    soft_limit_zone_rad: 0.08
     max_solver_step_rad: 0.12
     max_solution_step_rad: 0.12
     translation_scale_m: 0.10

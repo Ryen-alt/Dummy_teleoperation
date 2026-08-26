@@ -37,6 +37,12 @@ class ControlTimingError(TeleopError):
         self.budget_s = budget_s
 
 
+IK_SIGMA_WARN = 0.04
+IK_SIGMA_HARD = 0.004
+IK_DAMPING_MIN = 0.01
+IK_DAMPING_MAX = 0.08
+
+
 def integration_substeps(measured_dt_s: float, nominal_period_s: float) -> tuple[float, ...]:
     """Integrate the real interval without hiding jitter by clipping dt."""
 
@@ -79,8 +85,12 @@ class CartesianTeleopProfile:
     position_tolerance_m: float
     orientation_tolerance_rad: float
     max_iterations: int
-    damping: float
-    finite_difference_rad: float
+    sigma_warn: float
+    sigma_hard: float
+    damping_min: float
+    damping_max: float
+    task_trust_region: float
+    soft_limit_zone_rad: float
     max_solver_step_rad: float
     max_solution_step_rad: float
     translation_scale_m: float
@@ -309,6 +319,36 @@ def _load_cartesian_profile(
         raise TeleopConfigError(
             "cartesian.solver.hard_budget_ms must be greater than soft_budget_ms"
         )
+    if "damping" in solver or "finite_difference_rad" in solver:
+        raise TeleopConfigError(
+            "teleop v5 uses adaptive damping; remove legacy damping/"
+            "finite_difference_rad or run dummy-host-migrate-teleop-v5"
+        )
+    sigma_warn = _positive_float(solver, "sigma_warn")
+    sigma_hard = _positive_float(solver, "sigma_hard")
+    damping_min = _positive_float(solver, "damping_min")
+    damping_max = _positive_float(solver, "damping_max")
+    if sigma_hard >= sigma_warn:
+        raise TeleopConfigError("cartesian.solver.sigma_hard must be below sigma_warn")
+    if damping_min > damping_max:
+        raise TeleopConfigError("cartesian.solver.damping_min must not exceed damping_max")
+    reviewed_policy = {
+        "sigma_warn": IK_SIGMA_WARN,
+        "sigma_hard": IK_SIGMA_HARD,
+        "damping_min": IK_DAMPING_MIN,
+        "damping_max": IK_DAMPING_MAX,
+    }
+    received_policy = {
+        "sigma_warn": sigma_warn,
+        "sigma_hard": sigma_hard,
+        "damping_min": damping_min,
+        "damping_max": damping_max,
+    }
+    for name, expected in reviewed_policy.items():
+        if not math.isclose(received_policy[name], expected, rel_tol=0.0, abs_tol=1e-12):
+            raise TeleopConfigError(
+                f"cartesian.solver.{name} is fixed at {expected:g} for teleop v5"
+            )
 
     return CartesianTeleopProfile(
         linear_speed_m_s=_vector3(raw, "linear_speed_m_s", positive=True),
@@ -326,8 +366,12 @@ def _load_cartesian_profile(
         position_tolerance_m=_positive_float(solver, "position_tolerance_m"),
         orientation_tolerance_rad=_positive_float(solver, "orientation_tolerance_rad"),
         max_iterations=max_iterations,
-        damping=_positive_float(solver, "damping"),
-        finite_difference_rad=_positive_float(solver, "finite_difference_rad"),
+        sigma_warn=sigma_warn,
+        sigma_hard=sigma_hard,
+        damping_min=damping_min,
+        damping_max=damping_max,
+        task_trust_region=_positive_float(solver, "task_trust_region"),
+        soft_limit_zone_rad=_positive_float(solver, "soft_limit_zone_rad"),
         max_solver_step_rad=_positive_float(solver, "max_solver_step_rad"),
         max_solution_step_rad=_positive_float(solver, "max_solution_step_rad"),
         translation_scale_m=_positive_float(solver, "translation_scale_m"),
@@ -425,6 +469,13 @@ def load_teleop_profile(path: str | Path) -> TeleopProfile:
     version = raw.get("version")
     if not isinstance(version, int) or isinstance(version, bool) or version <= 0:
         raise TeleopConfigError("version must be a positive integer")
+    if version == 4:
+        raise TeleopConfigError(
+            "teleop input schema v4 requires explicit adaptive-IK migration; "
+            "run dummy-host-migrate-teleop-v5 INPUT OUTPUT"
+        )
+    if version != 5:
+        raise TeleopConfigError(f"teleop input schema v5 is required, received v{version}")
 
     control = raw.get("control")
     if not isinstance(control, dict):

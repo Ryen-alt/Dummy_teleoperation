@@ -5,13 +5,16 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
+from dummy_host.apps.migrate_teleop_v5 import migrate_file
 from dummy_host.schema import ControlMode, RobotConfig, RobotState
 from dummy_host.teleop import (
     GamepadMapper,
     ControlTimingError,
     JointVelocityIntegrator,
     KeyboardMapper,
+    TeleopConfigError,
     load_teleop_profile,
     shape_axis,
     validate_profile_for_robot,
@@ -21,6 +24,46 @@ from dummy_host.teleop_runtime import mask_teleop_command
 
 def _profile():
     return load_teleop_profile(Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml")
+
+
+def test_v4_profile_requires_explicit_migration_and_v5_policy_is_fixed(
+    tmp_path: Path,
+) -> None:
+    source = Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    raw["version"] = 4
+    solver = raw["cartesian"]["solver"]
+    for key in (
+        "sigma_warn",
+        "sigma_hard",
+        "damping_min",
+        "damping_max",
+        "task_trust_region",
+        "soft_limit_zone_rad",
+    ):
+        solver.pop(key)
+    solver["damping"] = 0.02
+    solver["finite_difference_rad"] = 0.0001
+    legacy = tmp_path / "teleop_v4.yaml"
+    legacy.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(TeleopConfigError, match="explicit adaptive-IK migration"):
+        load_teleop_profile(legacy)
+    migrated_path = migrate_file(legacy, tmp_path / "teleop_v5.yaml")
+    migrated = load_teleop_profile(migrated_path)
+    assert migrated.version == 5
+    assert migrated.cartesian is not None
+    assert migrated.cartesian.sigma_warn == pytest.approx(0.04)
+    assert migrated.cartesian.sigma_hard == pytest.approx(0.004)
+    assert migrated.cartesian.damping_min == pytest.approx(0.01)
+    assert migrated.cartesian.damping_max == pytest.approx(0.08)
+
+    changed = yaml.safe_load(migrated_path.read_text(encoding="utf-8"))
+    changed["cartesian"]["solver"]["sigma_warn"] = 0.05
+    changed_path = tmp_path / "teleop_v5_changed.yaml"
+    changed_path.write_text(yaml.safe_dump(changed, sort_keys=False), encoding="utf-8")
+    with pytest.raises(TeleopConfigError, match="sigma_warn is fixed at 0.04"):
+        load_teleop_profile(changed_path)
 
 
 def _state(config: RobotConfig, now_ns: int) -> RobotState:

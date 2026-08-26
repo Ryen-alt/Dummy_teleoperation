@@ -34,7 +34,7 @@ class DummyUrdfKinematics:
     """
 
     SOLVER = "dummy_urdf_damped_least_squares"
-    SOLVER_VERSION = "2"
+    SOLVER_VERSION = "3"
 
     def __init__(
         self,
@@ -46,8 +46,12 @@ class DummyUrdfKinematics:
         position_tolerance_m: float,
         orientation_tolerance_rad: float,
         max_iterations: int,
-        damping: float,
-        finite_difference_rad: float,
+        sigma_warn: float,
+        sigma_hard: float,
+        damping_min: float,
+        damping_max: float,
+        task_trust_region: float,
+        soft_limit_zone_rad: float,
         max_solver_step_rad: float,
         max_solution_step_rad: float,
         translation_scale_m: float,
@@ -124,8 +128,12 @@ class DummyUrdfKinematics:
         for name, value in (
             ("position_tolerance_m", position_tolerance_m),
             ("orientation_tolerance_rad", orientation_tolerance_rad),
-            ("damping", damping),
-            ("finite_difference_rad", finite_difference_rad),
+            ("sigma_warn", sigma_warn),
+            ("sigma_hard", sigma_hard),
+            ("damping_min", damping_min),
+            ("damping_max", damping_max),
+            ("task_trust_region", task_trust_region),
+            ("soft_limit_zone_rad", soft_limit_zone_rad),
             ("max_solver_step_rad", max_solver_step_rad),
             ("max_solution_step_rad", max_solution_step_rad),
             ("translation_scale_m", translation_scale_m),
@@ -135,11 +143,24 @@ class DummyUrdfKinematics:
         self.position_tolerance_m = float(position_tolerance_m)
         self.orientation_tolerance_rad = float(orientation_tolerance_rad)
         self.max_iterations = int(max_iterations)
-        self.damping = float(damping)
-        self.finite_difference_rad = float(finite_difference_rad)
+        if sigma_hard >= sigma_warn:
+            raise KinematicsError("sigma_hard must be below sigma_warn")
+        if damping_min > damping_max:
+            raise KinematicsError("damping_min must not exceed damping_max")
+        self.sigma_warn = float(sigma_warn)
+        self.sigma_hard = float(sigma_hard)
+        self.damping_min = float(damping_min)
+        self.damping_max = float(damping_max)
+        self.task_trust_region = float(task_trust_region)
+        self.soft_limit_zone_rad = float(soft_limit_zone_rad)
         self.max_solver_step_rad = float(max_solver_step_rad)
         self.max_solution_step_rad = float(max_solution_step_rad)
         self.translation_scale_m = float(translation_scale_m)
+        # The backend is called from one deterministic control thread. Reuse
+        # the hot-path workspaces instead of allocating matrices at 20 Hz.
+        self._weighted_jacobian = np.empty((6, 6), dtype=np.float64)
+        self._normal = np.empty((6, 6), dtype=np.float64)
+        self._task_error = np.empty(6, dtype=np.float64)
 
     @staticmethod
     def _validated_joints(value: np.ndarray, name: str) -> np.ndarray:
@@ -225,9 +246,96 @@ class DummyUrdfKinematics:
         stage: str,
     ) -> float:
         self._check_budget(deadline_ns, f"{stage}_start")
-        value = float(np.linalg.svd(jacobian, compute_uv=False)[-1])
+        np.copyto(self._weighted_jacobian, jacobian)
+        self._weighted_jacobian[:3] /= self.translation_scale_m
+        np.matmul(
+            self._weighted_jacobian,
+            self._weighted_jacobian.T,
+            out=self._normal,
+        )
+        eigenvalues = np.linalg.eigvalsh(self._normal)
+        value = math.sqrt(max(0.0, float(eigenvalues[0])))
         self._check_budget(deadline_ns, f"{stage}_complete")
         return value
+
+    def _adaptive_task_step(
+        self,
+        jacobian: np.ndarray,
+        translation: np.ndarray,
+        angular: np.ndarray,
+        joints: np.ndarray,
+        deadline_ns: int | None,
+        stage: str,
+    ) -> tuple[np.ndarray, float]:
+        self._check_budget(deadline_ns, f"{stage}_spectrum_start")
+        np.copyto(self._weighted_jacobian, jacobian)
+        self._weighted_jacobian[:3] /= self.translation_scale_m
+        self._task_error[:3] = translation / self.translation_scale_m
+        self._task_error[3:] = angular
+        error_norm = float(np.linalg.norm(self._task_error))
+        if error_norm > self.task_trust_region:
+            self._task_error *= self.task_trust_region / error_norm
+
+        np.matmul(
+            self._weighted_jacobian,
+            self._weighted_jacobian.T,
+            out=self._normal,
+        )
+        eigenvalues, task_basis = np.linalg.eigh(self._normal)
+        singular_values = np.sqrt(np.clip(eigenvalues, 0.0, None))
+        minimum_singular = float(singular_values[0])
+
+        # Suppress only the task directions that lose authority near a
+        # singularity; well-conditioned Cartesian directions remain usable.
+        projected_error = task_basis.T @ self._task_error
+        weak = singular_values < self.sigma_warn
+        if np.any(weak):
+            directional_gain = np.clip(
+                (singular_values[weak] - self.sigma_hard)
+                / (self.sigma_warn - self.sigma_hard),
+                0.0,
+                1.0,
+            )
+            projected_error[weak] *= directional_gain
+            self._task_error[:] = task_basis @ projected_error
+
+        if minimum_singular >= self.sigma_warn:
+            damping = self.damping_min
+        elif minimum_singular <= self.sigma_hard:
+            damping = self.damping_max
+        else:
+            ratio = (self.sigma_warn - minimum_singular) / (
+                self.sigma_warn - self.sigma_hard
+            )
+            damping = self.damping_min + (
+                self.damping_max - self.damping_min
+            ) * ratio**2
+        self._normal.flat[::7] += damping**2
+        try:
+            step = self._weighted_jacobian.T @ np.linalg.solve(
+                self._normal, self._task_error
+            )
+        except np.linalg.LinAlgError as exc:
+            raise KinematicsError("adaptive DLS linear solve failed") from exc
+
+        # Soft-limit barrier: inside the reviewed zone, no component may move
+        # farther toward the nearby limit. Motion away from the limit remains
+        # available so the operator can recover without a discontinuity.
+        lower_distance = joints - self.lower
+        upper_distance = self.upper - joints
+        step[(lower_distance < self.soft_limit_zone_rad) & (step < 0.0)] = 0.0
+        step[(upper_distance < self.soft_limit_zone_rad) & (step > 0.0)] = 0.0
+        self._check_budget(deadline_ns, f"{stage}_complete")
+        return step, minimum_singular
+
+    def _singularity_flags(self, minimum_singular: float) -> tuple[str, ...]:
+        if not math.isfinite(minimum_singular):
+            return ()
+        if minimum_singular <= self.sigma_hard:
+            return ("singularity_hard",)
+        if minimum_singular < self.sigma_warn:
+            return ("singularity_warn",)
+        return ()
 
     def _solve_seed(
         self,
@@ -270,19 +378,16 @@ class DummyUrdfKinematics:
                         "unconverged_singular_values",
                     )
                     break
-                weighted_jacobian = jacobian.copy()
-                weighted_jacobian[:3] /= self.translation_scale_m
-                error = np.concatenate(
-                    (
-                        translation / self.translation_scale_m,
-                        rotation_vector(target.rotation @ pose.rotation.T),
-                    )
-                )
-                normal = weighted_jacobian @ weighted_jacobian.T
-                normal += np.eye(6, dtype=np.float64) * self.damping**2
                 try:
-                    step = weighted_jacobian.T @ np.linalg.solve(normal, error)
-                except np.linalg.LinAlgError:
+                    step, minimum_singular = self._adaptive_task_step(
+                        jacobian,
+                        translation,
+                        rotation_vector(target.rotation @ pose.rotation.T),
+                        joints,
+                        deadline_ns,
+                        f"iteration_{iteration}_adaptive_dls",
+                    )
+                except KinematicsError:
                     minimum_singular = self._minimum_singular_value(
                         jacobian,
                         deadline_ns,
@@ -439,11 +544,7 @@ class DummyUrdfKinematics:
                 orientation_error_rad=orientation_error,
                 joint_limit_margin_rad=None,
                 minimum_singular_value=singular,
-                singularity_flags=(
-                    ("low_numeric_jacobian_rank",)
-                    if math.isfinite(singular) and singular < 1e-5
-                    else ()
-                ),
+                singularity_flags=self._singularity_flags(singular),
                 clipped=False,
                 reasons=(failure_reason,),
                 iterations=iterations,
@@ -466,11 +567,7 @@ class DummyUrdfKinematics:
             orientation_error_rad=orientation_error,
             joint_limit_margin_rad=margin,
             minimum_singular_value=singular,
-            singularity_flags=(
-                ("low_numeric_jacobian_rank",)
-                if math.isfinite(singular) and singular < 1e-5
-                else ()
-            ),
+            singularity_flags=self._singularity_flags(singular),
             clipped=False,
             reasons=(),
             iterations=iterations,
@@ -497,4 +594,10 @@ class DummyUrdfKinematics:
             "position_tolerance_m": self.position_tolerance_m,
             "orientation_tolerance_rad": self.orientation_tolerance_rad,
             "max_solution_step_rad": self.max_solution_step_rad,
+            "sigma_warn": self.sigma_warn,
+            "sigma_hard": self.sigma_hard,
+            "damping_min": self.damping_min,
+            "damping_max": self.damping_max,
+            "task_trust_region": self.task_trust_region,
+            "soft_limit_zone_rad": self.soft_limit_zone_rad,
         }

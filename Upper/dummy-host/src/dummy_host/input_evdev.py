@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import json
 import math
@@ -42,6 +43,21 @@ class InputDeviceInfo:
     absolute_axes: tuple[str, ...]
     vendor_id: int | None = None
     product_id: int | None = None
+
+
+@dataclass(frozen=True)
+class InputSnapshot:
+    """One immutable evdev state published at a SYN_REPORT boundary."""
+
+    pressed: frozenset[str]
+    axes: tuple[tuple[str, float], ...]
+    event_ns: int
+    snapshot_ns: int
+    sync_lost: bool
+
+    @property
+    def axis_values(self) -> dict[str, float]:
+        return dict(self.axes)
 
 
 def _load_evdev() -> tuple[Any, Any, Callable[[], list[str]]]:
@@ -130,6 +146,8 @@ class _EvdevDevice:
             self._active_keys = set(int(code) for code in self.device.active_keys())
         except (OSError, SystemError) as exc:
             self.last_error = str(exc)
+        self._pending_active_keys = set(self._active_keys)
+        self._pending_axis_values: dict[int, Any] = {}
         self._reader: threading.Thread | None = None
         if callable(event_reader):
             self._reader = threading.Thread(
@@ -169,15 +187,58 @@ class _EvdevDevice:
                 raise InputDeviceError(f"input device disconnected: {exc}") from exc
             with self._lock:
                 self._axis_values[code] = info
+                self._pending_axis_values.setdefault(code, info)
+        return self._normalize_axis(info)
+
+    @staticmethod
+    def _normalize_axis(info: Any) -> float:
         minimum = float(info.min)
         maximum = float(info.max)
-        if not all(math.isfinite(value) for value in (minimum, maximum, float(info.value))):
+        value = float(info.value)
+        if not all(math.isfinite(item) for item in (minimum, maximum, value)):
             raise InputDeviceError("input device returned a non-finite axis value")
         if maximum <= minimum:
             raise InputDeviceError("input device axis range is invalid")
         centre = (minimum + maximum) * 0.5
         half_range = (maximum - minimum) * 0.5
-        return max(-1.0, min(1.0, (float(info.value) - centre) / half_range))
+        return max(-1.0, min(1.0, (value - centre) / half_range))
+
+    def snapshot(
+        self,
+        configured_keys: Mapping[str, int],
+        configured_axes: Mapping[str, int],
+        snapshot_ns: int,
+    ) -> InputSnapshot:
+        """Read keys, axes, and timing from one published evdev generation."""
+
+        with self._lock:
+            if self.last_error is not None:
+                raise InputDeviceError(f"input device disconnected: {self.last_error}")
+            axes: list[tuple[str, float]] = []
+            try:
+                for name, code in configured_axes.items():
+                    info = self._axis_values.get(code)
+                    if info is None:
+                        info = self.device.absinfo(code)
+                        self._axis_values[code] = info
+                        self._pending_axis_values.setdefault(code, info)
+                    axes.append((name, self._normalize_axis(info)))
+            except (OSError, SystemError) as exc:
+                self.last_error = str(exc)
+                raise InputDeviceError(f"input device disconnected: {exc}") from exc
+            result = InputSnapshot(
+                pressed=frozenset(
+                    name
+                    for name, code in configured_keys.items()
+                    if code in self._active_keys
+                ),
+                axes=tuple(sorted(axes)),
+                event_ns=self._last_event_ns,
+                snapshot_ns=snapshot_ns,
+                sync_lost=self._sync_lost,
+            )
+            self._sync_lost = False
+            return result
 
     def event_metadata(self) -> tuple[int, bool]:
         with self._lock:
@@ -198,33 +259,44 @@ class _EvdevDevice:
                 with self._lock:
                     if event.type == self.ecodes.EV_KEY:
                         if event.value:
-                            self._active_keys.add(int(event.code))
+                            self._pending_active_keys.add(int(event.code))
                         else:
-                            self._active_keys.discard(int(event.code))
+                            self._pending_active_keys.discard(int(event.code))
                     elif event.type == self.ecodes.EV_ABS:
-                        current = self._axis_values.get(int(event.code))
+                        current = self._pending_axis_values.get(int(event.code))
+                        if current is None:
+                            current = self._axis_values.get(int(event.code))
                         if current is None:
                             current = self.device.absinfo(event.code)
                         if hasattr(current, "_replace"):
                             current = current._replace(value=event.value)
                         else:
+                            current = copy.copy(current)
                             current.value = event.value
-                        self._axis_values[int(event.code)] = current
+                        self._pending_axis_values[int(event.code)] = current
+                    elif (
+                        event.type == self.ecodes.EV_SYN
+                        and event.code == self.ecodes.SYN_REPORT
+                    ):
+                        self._active_keys = set(self._pending_active_keys)
+                        self._axis_values = dict(self._pending_axis_values)
+                        self._last_event_ns = event_ns
                     elif (
                         event.type == self.ecodes.EV_SYN
                         and event.code == self.ecodes.SYN_DROPPED
                     ):
                         self._sync_lost = True
-                        self._active_keys = set(
+                        resynced_keys = set(
                             int(code) for code in self.device.active_keys()
                         )
-                        for code in tuple(self._axis_values):
-                            self._axis_values[code] = self.device.absinfo(code)
-                    if (
-                        event.type != self.ecodes.EV_SYN
-                        or event.code
-                        in {self.ecodes.SYN_REPORT, self.ecodes.SYN_DROPPED}
-                    ):
+                        resynced_axes = {
+                            code: self.device.absinfo(code)
+                            for code in tuple(self._axis_values)
+                        }
+                        self._active_keys = resynced_keys
+                        self._pending_active_keys = set(resynced_keys)
+                        self._axis_values = resynced_axes
+                        self._pending_axis_values = dict(resynced_axes)
                         self._last_event_ns = event_ns
         except (OSError, SystemError) as exc:
             if not self._closed:
@@ -266,11 +338,19 @@ class EvdevKeyboardSource:
     def poll(self, now_ns: int | None = None) -> TeleopCommand:
         now_ns = time.monotonic_ns() if now_ns is None else now_ns
         try:
-            metadata = getattr(self._device, "event_metadata", None)
-            event_ns, sync_lost = (
-                metadata() if callable(metadata) else (now_ns, False)
-            )
-            command = self._mapper.map(self._device.pressed(self._keys), now_ns)
+            snapshotter = getattr(self._device, "snapshot", None)
+            if callable(snapshotter):
+                snapshot = snapshotter(self._keys, {}, now_ns)
+                pressed = set(snapshot.pressed)
+                event_ns = snapshot.event_ns
+                sync_lost = snapshot.sync_lost
+            else:
+                metadata = getattr(self._device, "event_metadata", None)
+                event_ns, sync_lost = (
+                    metadata() if callable(metadata) else (now_ns, False)
+                )
+                pressed = self._device.pressed(self._keys)
+            command = self._mapper.map(pressed, now_ns)
             return replace(
                 command,
                 event_ns=event_ns,
@@ -342,8 +422,22 @@ class EvdevGamepadSource:
     def poll(self, now_ns: int | None = None) -> TeleopCommand:
         now_ns = time.monotonic_ns() if now_ns is None else now_ns
         try:
-            physical_pressed = self._device.pressed(self._buttons)
-            physical_axes = {name: self._device.axis(code) for name, code in self._axes.items()}
+            snapshotter = getattr(self._device, "snapshot", None)
+            if callable(snapshotter):
+                snapshot = snapshotter(self._buttons, self._axes, now_ns)
+                physical_pressed = set(snapshot.pressed)
+                physical_axes = snapshot.axis_values
+                event_ns = snapshot.event_ns
+                sync_lost = snapshot.sync_lost
+            else:
+                physical_pressed = self._device.pressed(self._buttons)
+                physical_axes = {
+                    name: self._device.axis(code) for name, code in self._axes.items()
+                }
+                metadata = getattr(self._device, "event_metadata", None)
+                event_ns, sync_lost = (
+                    metadata() if callable(metadata) else (now_ns, False)
+                )
             state = self._adapter.decode(
                 physical_axes,
                 physical_pressed,
@@ -351,10 +445,6 @@ class EvdevGamepadSource:
                 raw={"device_path": self._device.path},
             )
             command = self._mapper.map_state(state)
-            metadata = getattr(self._device, "event_metadata", None)
-            event_ns, sync_lost = (
-                metadata() if callable(metadata) else (now_ns, False)
-            )
             return replace(
                 command,
                 event_ns=event_ns,
