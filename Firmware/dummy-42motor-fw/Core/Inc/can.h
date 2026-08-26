@@ -51,6 +51,7 @@ void MX_CAN_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 bool CAN_Send(CAN_TxHeaderTypeDef* pHeader, uint8_t* data);
+HAL_StatusTypeDef CAN_ConfigureNodeFilters(uint16_t node_id);
 
 /* USER CODE END Prototypes */
 

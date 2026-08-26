@@ -35,6 +35,31 @@ volatile uint8_t can_rx_error_count;
 volatile uint8_t can_busoff_count;
 static bool can_busoff_latched;
 
+HAL_StatusTypeDef CAN_ConfigureNodeFilters(uint16_t node_id)
+{
+    const uint32_t packed_node_id =
+        (((uint32_t) node_id << 7U) & 0x7FFU) << 5U;
+    // Match the four node bits while ignoring the seven command bits. IDE and
+    // RTR are also compared, so extended and remote frames are rejected.
+    const uint32_t packed_mask = (0x780U << 5U) | (1U << 4U) | (1U << 3U);
+    CAN_FilterTypeDef filter = {
+        .FilterIdHigh = packed_node_id,
+        .FilterIdLow = 0x0000U,
+        .FilterMaskIdHigh = packed_mask,
+        .FilterMaskIdLow = packed_mask,
+        .FilterFIFOAssignment = CAN_RX_FIFO0,
+        .FilterBank = 0U,
+        .FilterMode = CAN_FILTERMODE_IDMASK,
+        .FilterScale = CAN_FILTERSCALE_16BIT,
+        .FilterActivation = ENABLE,
+        .SlaveStartFilterBank = 14U,
+    };
+    const HAL_StatusTypeDef status = HAL_CAN_ConfigFilter(&hcan, &filter);
+    if (status != HAL_OK)
+        can_rx_error_count = DummyCanSaturatingIncrement8(can_rx_error_count);
+    return status;
+}
+
 /* USER CODE END 0 */
 
 CAN_HandleTypeDef hcan;
@@ -67,23 +92,9 @@ void MX_CAN_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN CAN_Init 2 */
-    CAN_FilterTypeDef sFilterConfig;
-    //filter one (stack light blink)
-    sFilterConfig.FilterBank = 0;
-    sFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;
-    sFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;
-    sFilterConfig.FilterIdHigh = 0x0000;
-    sFilterConfig.FilterIdLow = 0x0000;
-    sFilterConfig.FilterMaskIdHigh = 0x0000;
-    sFilterConfig.FilterMaskIdLow = 0x0000;
-    sFilterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
-    sFilterConfig.FilterActivation = ENABLE;
-    sFilterConfig.SlaveStartFilterBank = 14;
-    if (HAL_CAN_ConfigFilter(&hcan, &sFilterConfig) != HAL_OK)
-    {
-        /* Filter configuration Error */
-        Error_Handler();
-    }
+    // Until the DIP-switch node ID is loaded, accept broadcast data frames
+    // only. UserApp reconfigures the first 16-bit slot for the selected node.
+    (void) CAN_ConfigureNodeFilters(0U);
 
     HAL_CAN_Start(&hcan); //start CAN
 

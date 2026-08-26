@@ -2,6 +2,7 @@
 #define __INTERFACE_CAN_HPP
 
 #include "fibre/protocol.hpp"
+#include "protocols/spsc_ring.hpp"
 #include <stm32f4xx_hal.h>
 #include <cmsis_os.h>
 
@@ -50,6 +51,14 @@ struct CanTxCompletion
 };
 
 constexpr size_t kCanTxCompletionCapacity = 16U;
+constexpr size_t kCanRxCapacity = 32U;
+
+struct CanRxFrame
+{
+    CAN_RxHeaderTypeDef header{};
+    uint8_t data[8]{};
+    uint32_t received_us = 0U;
+};
 
 struct CAN_context
 {
@@ -78,6 +87,9 @@ struct CAN_context
     volatile uint8_t tx_completion_read = 0;
     volatile uint8_t tx_completion_write = 0;
     uint32_t tx_completion_overflow_count = 0;
+    dummy::protocol::SpscRing<CanRxFrame, kCanRxCapacity> rx_ring{};
+    volatile uint32_t rx_overflow_count = 0U;
+    volatile uint8_t rx_high_water = 0U;
 
     uint8_t node_id_rng_state = 0;
 
@@ -129,9 +141,11 @@ bool CanSendMessage(CAN_context* canCtx, uint8_t* txData, CAN_TxHeaderTypeDef* t
                     void* callback_context = nullptr,
                     const CanTxMetadata* metadata = nullptr);
 bool CanTakeTxCompletion(CAN_context* canCtx, CanTxCompletion& completion);
+bool CanTakeRxFrame(CAN_context* canCtx, CanRxFrame& frame);
 void CanServiceTxDeadline(CAN_context* canCtx, uint32_t now_us,
                           uint32_t timeout_us);
 void NotifyCanDispatcherFromIsr();
-void OnCanMessage(CAN_context* canCtx, CAN_RxHeaderTypeDef* rxHeader, uint8_t* data);
+void OnCanMessage(CAN_context* canCtx, const CAN_RxHeaderTypeDef* rxHeader,
+                  const uint8_t* data, uint32_t received_us);
 
 #endif // __INTERFACE_CAN_HPP

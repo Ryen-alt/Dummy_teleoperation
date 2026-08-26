@@ -42,8 +42,6 @@ extern CAN_HandleTypeDef hcan2;
 CAN_context can1Ctx;
 CAN_context can2Ctx;
 static CAN_context* ctxs = nullptr;
-static CAN_RxHeaderTypeDef headerRx;
-static uint8_t data[8];
 
 namespace
 {
@@ -103,6 +101,40 @@ bool FinishActiveTx(CAN_context* ctx, CanTxCompletionStatus status,
     ReleaseTxToken(ctx->handle);
     return true;
 }
+
+void SaturatingIncrement(volatile uint32_t& value)
+{
+    if (value != UINT32_MAX)
+        ++value;
+}
+
+void QueueRxFrame(CAN_HandleTypeDef* hcan, uint32_t fifo)
+{
+    CAN_context* ctx = get_can_ctx(hcan);
+    if (ctx == nullptr)
+        return;
+    CanRxFrame frame{};
+    frame.received_us = micros();
+    SaturatingIncrement(ctx->received_msg_cnt);
+    if (HAL_CAN_GetRxMessage(
+            hcan, fifo, &frame.header, frame.data) != HAL_OK)
+    {
+        SaturatingIncrement(ctx->unexpected_errors);
+        return;
+    }
+    ctx->busoff_active = false;
+    if (!ctx->rx_ring.Push(frame))
+    {
+        SaturatingIncrement(ctx->rx_overflow_count);
+    }
+    else
+    {
+        const size_t depth = ctx->rx_ring.Size();
+        if (depth > ctx->rx_high_water)
+            ctx->rx_high_water = static_cast<uint8_t>(depth);
+    }
+    NotifyCanDispatcherFromIsr();
+}
 }
 
 
@@ -143,11 +175,11 @@ bool StartCanServer(CAN_TypeDef* hcan)
         .FilterMaskIdHigh = 0x0000,
         .FilterMaskIdLow = 0x0000,
         .FilterFIFOAssignment = CAN_RX_FIFO0,
-        .FilterBank = 0,
+        .FilterBank = hcan == CAN1 ? 0U : 14U,
         .FilterMode = CAN_FILTERMODE_IDMASK,
         .FilterScale = CAN_FILTERSCALE_16BIT, // two 16-bit filters
         .FilterActivation = ENABLE,
-        .SlaveStartFilterBank = 0
+        .SlaveStartFilterBank = 14U
     };
     status = HAL_CAN_ConfigFilter(ctxs->handle, &sFilterConfig);
     if (status != HAL_OK)
@@ -215,27 +247,19 @@ void HAL_CAN_TxMailbox2AbortCallback(CAN_HandleTypeDef* hcan)
 
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
 {
-    CAN_context* ctx = get_can_ctx(hcan);
-    if (!ctx) return;
-    ctx->received_msg_cnt++;
-
-    HAL_StatusTypeDef status = HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &headerRx, data);
-    if (status != HAL_OK)
-    {
-        ctx->unexpected_errors++;
-        return;
-    }
-    ctx->busoff_active = false;
-
-    OnCanMessage(ctx, &headerRx, data);
-    NotifyCanDispatcherFromIsr();
+    QueueRxFrame(hcan, CAN_RX_FIFO0);
 }
 
 void HAL_CAN_RxFifo0FullCallback(CAN_HandleTypeDef* hcan)
 { if (get_can_ctx(hcan)) get_can_ctx(hcan)->RxFifo0FullCallbackCnt++; }
 
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef* hcan)
-{ if (get_can_ctx(hcan)) get_can_ctx(hcan)->RxFifo1MsgPendingCallbackCnt++; }
+{
+    CAN_context* ctx = get_can_ctx(hcan);
+    if (ctx != nullptr)
+        ++ctx->RxFifo1MsgPendingCallbackCnt;
+    QueueRxFrame(hcan, CAN_RX_FIFO1);
+}
 
 void HAL_CAN_RxFifo1FullCallback(CAN_HandleTypeDef* hcan)
 { if (get_can_ctx(hcan)) get_can_ctx(hcan)->RxFifo1FullCallbackCnt++; }
@@ -388,4 +412,9 @@ bool CanTakeTxCompletion(CAN_context* canCtx, CanTxCompletion& completion)
         (read + 1U) % kCanTxCompletionCapacity);
     taskEXIT_CRITICAL();
     return true;
+}
+
+bool CanTakeRxFrame(CAN_context* canCtx, CanRxFrame& frame)
+{
+    return canCtx != nullptr && canCtx->rx_ring.Pop(frame);
 }

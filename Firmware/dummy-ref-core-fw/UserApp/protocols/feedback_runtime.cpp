@@ -1,6 +1,7 @@
 #include "common_inc.h"
 #include "feedback_runtime.hpp"
 #include "configurations/robot_config_generated.hpp"
+#include "published_double_buffer.hpp"
 #include "../../../can_transport_contract.h"
 
 namespace dummy::protocol
@@ -9,16 +10,25 @@ namespace
 {
 CanFeedbackMonitor feedback_monitor(
     dummy::generated_config::kCoherentMaxSkewUs);
-volatile uint8_t position_response_mask = 0U;
-volatile uint8_t temperature_response_mask = 0U;
-volatile uint32_t unexpected_position_response_count = 0U;
-volatile uint32_t unexpected_temperature_response_count = 0U;
+uint8_t position_response_mask = 0U;
+uint8_t temperature_response_mask = 0U;
+uint32_t unexpected_position_response_count = 0U;
+uint32_t unexpected_temperature_response_count = 0U;
 uint8_t runtime_status = 0U;
 bool feedback_ready = false;
 uint32_t readiness_sweep_id = 0U;
 uint8_t consecutive_coherent_sweeps = 0U;
-CanDiagnosticsPayload can_diagnostics{};
 MotorTransportDiagnostics motor_transport_diagnostics{};
+
+struct FeedbackPublishedSnapshot
+{
+    std::array<NodeFeedbackStatus, kActuatorNodeCount> nodes{};
+    CoherentFeedbackStatus coherent{};
+    MotorTransportDiagnostics motor_transport{};
+};
+
+PublishedDoubleBuffer<FeedbackPublishedSnapshot> feedback_snapshot;
+PublishedDoubleBuffer<CanDiagnosticsPayload> can_diagnostics_snapshot;
 
 uint8_t NodeMask(uint8_t node_id)
 {
@@ -29,16 +39,12 @@ uint8_t NodeMask(uint8_t node_id)
 
 void RecordPositionFeedbackRequest(uint8_t node_id, uint32_t sweep_id)
 {
-    taskENTER_CRITICAL();
     feedback_monitor.OnPositionRequest(node_id, micros(), sweep_id);
-    taskEXIT_CRITICAL();
 }
 
-bool RecordPositionFeedbackResponse(uint8_t node_id)
+bool RecordPositionFeedbackResponse(uint8_t node_id, uint32_t received_us)
 {
-    // Called from the CAN RX ISR. Normal task code masks interrupts while it
-    // mutates or snapshots the monitor.
-    if (!feedback_monitor.OnPositionResponse(node_id, micros()))
+    if (!feedback_monitor.OnPositionResponse(node_id, received_us))
     {
         if (unexpected_position_response_count != UINT32_MAX)
             ++unexpected_position_response_count;
@@ -51,21 +57,19 @@ bool RecordPositionFeedbackResponse(uint8_t node_id)
 
 void RecordPositionFeedbackTimeout(uint8_t node_id)
 {
-    taskENTER_CRITICAL();
     feedback_monitor.OnPositionTimeout(node_id);
-    taskEXIT_CRITICAL();
 }
 
 void RecordTemperatureFeedbackRequest(uint8_t node_id)
 {
-    taskENTER_CRITICAL();
     feedback_monitor.OnTemperatureRequest(node_id, micros());
-    taskEXIT_CRITICAL();
 }
 
-void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c)
+void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c,
+                                       uint32_t received_us)
 {
-    if (!feedback_monitor.OnTemperatureResponse(node_id, micros(), temperature_c))
+    if (!feedback_monitor.OnTemperatureResponse(
+            node_id, received_us, temperature_c))
     {
         if (unexpected_temperature_response_count != UINT32_MAX)
             ++unexpected_temperature_response_count;
@@ -96,14 +100,11 @@ void RecordMotorTransportDiagnostics(uint8_t node_id, const uint8_t* data,
 
 void RecordTemperatureFeedbackTimeout(uint8_t node_id)
 {
-    taskENTER_CRITICAL();
     feedback_monitor.OnTemperatureTimeout(node_id);
-    taskEXIT_CRITICAL();
 }
 
 FeedbackResponseEvents ConsumeFeedbackResponseEvents()
 {
-    taskENTER_CRITICAL();
     const FeedbackResponseEvents events{
         position_response_mask,
         temperature_response_mask,
@@ -114,48 +115,45 @@ FeedbackResponseEvents ConsumeFeedbackResponseEvents()
     temperature_response_mask = 0U;
     unexpected_position_response_count = 0U;
     unexpected_temperature_response_count = 0U;
-    taskEXIT_CRITICAL();
     return events;
 }
 
 void CancelPendingFeedbackRequests()
 {
-    taskENTER_CRITICAL();
     feedback_monitor.CancelPendingRequests();
     position_response_mask = 0U;
     temperature_response_mask = 0U;
-    taskEXIT_CRITICAL();
 }
 
-std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(uint32_t now_us)
+void PublishFeedbackSnapshot(uint32_t now_us)
 {
-    taskENTER_CRITICAL();
-    const auto snapshot = feedback_monitor.Snapshot(now_us);
-    taskEXIT_CRITICAL();
-    return snapshot;
+    FeedbackPublishedSnapshot snapshot{};
+    snapshot.nodes = feedback_monitor.Snapshot(now_us);
+    snapshot.coherent = feedback_monitor.CoherentSnapshot();
+    snapshot.motor_transport = motor_transport_diagnostics;
+    (void) feedback_snapshot.TryPublish(snapshot);
+}
+
+std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(
+    uint32_t now_us)
+{
+    (void) now_us;
+    return feedback_snapshot.Read().nodes;
 }
 
 CoherentFeedbackStatus ReadCoherentFeedbackStatus()
 {
-    taskENTER_CRITICAL();
-    const auto snapshot = feedback_monitor.CoherentSnapshot();
-    taskEXIT_CRITICAL();
-    return snapshot;
+    return feedback_snapshot.Read().coherent;
 }
 
 MotorTransportDiagnostics ReadMotorTransportDiagnostics()
 {
-    taskENTER_CRITICAL();
-    const MotorTransportDiagnostics snapshot = motor_transport_diagnostics;
-    taskEXIT_CRITICAL();
-    return snapshot;
+    return feedback_snapshot.Read().motor_transport;
 }
 
 void ResetMotorTransportDiagnostics()
 {
-    taskENTER_CRITICAL();
     motor_transport_diagnostics = {};
-    taskEXIT_CRITICAL();
 }
 
 void PublishCanRuntimeStatus(uint8_t status)
@@ -175,8 +173,8 @@ uint8_t ReadCanRuntimeStatus()
 
 void PublishCanFeedbackReady(bool ready)
 {
+    const auto coherent = feedback_snapshot.Read().coherent;
     taskENTER_CRITICAL();
-    const auto coherent = feedback_monitor.CoherentSnapshot();
     if (!ready || !coherent.valid)
     {
         feedback_ready = false;
@@ -204,17 +202,12 @@ bool ReadCanFeedbackReady()
 
 void PublishCanDiagnostics(const CanDiagnosticsPayload& diagnostics)
 {
-    taskENTER_CRITICAL();
-    can_diagnostics = diagnostics;
-    taskEXIT_CRITICAL();
+    (void) can_diagnostics_snapshot.TryPublish(diagnostics);
 }
 
 CanDiagnosticsPayload ReadCanDiagnostics()
 {
-    taskENTER_CRITICAL();
-    const CanDiagnosticsPayload snapshot = can_diagnostics;
-    taskEXIT_CRITICAL();
-    return snapshot;
+    return can_diagnostics_snapshot.Read();
 }
 
 } // namespace dummy::protocol

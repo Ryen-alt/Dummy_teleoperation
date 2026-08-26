@@ -8,7 +8,9 @@
 #include "can_feedback_monitor.hpp"
 #include "feedback_safety_supervisor.hpp"
 #include "feedback_poll_scheduler.hpp"
+#include "published_double_buffer.hpp"
 #include "robot_config_generated.hpp"
+#include "spsc_ring.hpp"
 
 #include <array>
 #include <cassert>
@@ -24,6 +26,57 @@ using namespace dummy::protocol;
 
 namespace
 {
+void TestSpscRingUsesAllSlotsAndWrapsWithoutOverwrite()
+{
+    SpscRing<uint32_t, 32U> ring;
+    assert(ring.capacity() == 32U);
+    for (uint32_t value = 0U; value < 32U; ++value)
+        assert(ring.Push(value));
+    assert(ring.Size() == 32U);
+    assert(!ring.Push(32U));
+
+    uint32_t value = 0U;
+    for (uint32_t expected = 0U; expected < 16U; ++expected)
+    {
+        assert(ring.Pop(value));
+        assert(value == expected);
+    }
+    for (uint32_t next = 32U; next < 48U; ++next)
+        assert(ring.Push(next));
+    assert(ring.Size() == 32U);
+    for (uint32_t expected = 16U; expected < 48U; ++expected)
+    {
+        assert(ring.Pop(value));
+        assert(value == expected);
+    }
+    assert(!ring.Pop(value));
+}
+
+void TestPublishedDoubleBufferReturnsWholeSnapshots()
+{
+    struct Snapshot
+    {
+        uint32_t generation = 0U;
+        std::array<uint32_t, 7U> values{};
+    };
+    PublishedDoubleBuffer<Snapshot> snapshots;
+    Snapshot first{};
+    first.generation = 1U;
+    first.values.fill(0x11111111U);
+    assert(snapshots.TryPublish(first));
+    const Snapshot first_read = snapshots.Read();
+    assert(first_read.generation == 1U);
+    assert(first_read.values == first.values);
+
+    Snapshot second{};
+    second.generation = 2U;
+    second.values.fill(0x22222222U);
+    assert(snapshots.TryPublish(second));
+    const Snapshot second_read = snapshots.Read();
+    assert(second_read.generation == 2U);
+    assert(second_read.values == second.values);
+}
+
 std::vector<uint8_t> FromHex(const std::string& hex)
 {
     assert(hex.size() % 2 == 0);
@@ -1462,6 +1515,8 @@ void TestLeaseTimeoutAndSessionIndependentEstop()
 
 int main()
 {
+    TestSpscRingUsesAllSlotsAndWrapsWithoutOverwrite();
+    TestPublishedDoubleBufferReturnsWholeSnapshots();
     TestCodecVectors();
     TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap();
     TestMeasuredVelocityUsesOnlyValidMonotonicIntervals();

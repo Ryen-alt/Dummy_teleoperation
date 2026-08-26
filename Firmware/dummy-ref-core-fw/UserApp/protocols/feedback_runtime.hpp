@@ -19,18 +19,20 @@ struct MotorTransportDiagnostics
     std::array<uint8_t, kActuatorNodeCount> busoff{};
 };
 
-// Firmware-only bridge around the pure C++ monitor. Request functions run in
-// task context; response functions are safe to call from the CAN RX interrupt.
+// Firmware-only bridge around the pure C++ monitor. The CAN dispatcher is the
+// sole writer; RX timestamps are captured in the ISR and parsed in task context.
 void RecordPositionFeedbackRequest(uint8_t node_id, uint32_t sweep_id = 0U);
-bool RecordPositionFeedbackResponse(uint8_t node_id);
+bool RecordPositionFeedbackResponse(uint8_t node_id, uint32_t received_us);
 void RecordPositionFeedbackTimeout(uint8_t node_id);
 void RecordTemperatureFeedbackRequest(uint8_t node_id);
-void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c);
+void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c,
+                                       uint32_t received_us);
 void RecordMotorTransportDiagnostics(uint8_t node_id, const uint8_t* data,
                                      uint32_t length);
 void RecordTemperatureFeedbackTimeout(uint8_t node_id);
 FeedbackResponseEvents ConsumeFeedbackResponseEvents();
 void CancelPendingFeedbackRequests();
+void PublishFeedbackSnapshot(uint32_t now_us);
 std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(uint32_t now_us);
 CoherentFeedbackStatus ReadCoherentFeedbackStatus();
 MotorTransportDiagnostics ReadMotorTransportDiagnostics();

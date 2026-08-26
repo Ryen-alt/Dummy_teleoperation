@@ -1,6 +1,7 @@
 #include "common_inc.h"
 #include "configurations.h"
 #include "Platform/Utils/st_hardware.h"
+#include <can.h>
 #include <tim.h>
 
 
@@ -56,6 +57,7 @@ void Main()
     boardConfig.enableTempWatch=false;
     //depends on 3 bits switch now
     boardConfig.canNodeId = defaultNodeID;
+    (void) CAN_ConfigureNodeFilters(boardConfig.canNodeId);
     motor.config.motionParams.encoderHomeOffset = boardConfig.encoderHomeOffset;
     motor.config.motionParams.ratedCurrent = boardConfig.currentLimit;
     motor.config.motionParams.ratedVelocity = boardConfig.velocityLimit;

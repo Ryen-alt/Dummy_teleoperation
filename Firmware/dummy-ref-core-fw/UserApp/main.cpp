@@ -281,7 +281,8 @@ void ThreadCanDispatch(void* argument)
         kCanTargetFanoutTimeoutUs);
     ScheduledActuatorRequest completion_target{};
     bool stream_fail_closed = false;
-    uint32_t observed_completion_overflow_count = 0U;
+    std::array<uint32_t, 2U> observed_completion_overflow_count{};
+    std::array<uint32_t, 2U> observed_rx_overflow_count{};
     std::array<uint32_t, dummy::protocol::kActuatorNodeCount>
         target_tx_complete_count{};
     const uint64_t can_diagnostics_window_start_us =
@@ -294,9 +295,12 @@ void ThreadCanDispatch(void* argument)
         // One iteration admits at most one frame; completion interrupts drive
         // a seven-node fan-out without turning the timer into a throughput cap.
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        CAN_context* can_context = get_can_ctx(&hcan1);
-        CanServiceTxDeadline(
-            can_context, micros(), kCanTxAbortTimeoutUs);
+        const std::array<CAN_context*, 2U> can_contexts{
+            get_can_ctx(&hcan1), get_can_ctx(&hcan2)};
+        CAN_context* can_context = can_contexts[0];
+        for (CAN_context* context : can_contexts)
+            CanServiceTxDeadline(
+                context, micros(), kCanTxAbortTimeoutUs);
 
         const ScheduledActuatorRequest scheduled =
             ReadScheduledActuatorRequest();
@@ -371,12 +375,29 @@ void ThreadCanDispatch(void* argument)
             dummy::protocol::RequestBinaryRuntimeHold();
         }
 
-        if (can_context != nullptr &&
-            can_context->tx_completion_overflow_count !=
-                observed_completion_overflow_count)
+        bool transport_overflow = false;
+        for (size_t index = 0U; index < can_contexts.size(); ++index)
         {
-            observed_completion_overflow_count =
-                can_context->tx_completion_overflow_count;
+            CAN_context* context = can_contexts[index];
+            if (context == nullptr)
+                continue;
+            if (context->tx_completion_overflow_count !=
+                observed_completion_overflow_count[index])
+            {
+                observed_completion_overflow_count[index] =
+                    context->tx_completion_overflow_count;
+                transport_overflow = true;
+            }
+            if (context->rx_overflow_count !=
+                observed_rx_overflow_count[index])
+            {
+                observed_rx_overflow_count[index] =
+                    context->rx_overflow_count;
+                transport_overflow = true;
+            }
+        }
+        if (transport_overflow)
+        {
             const uint32_t failed_sequence = completion_tracker.active()
                 ? completion_tracker.key().action_sequence
                 : target_fanout.sequence;
@@ -394,70 +415,85 @@ void ThreadCanDispatch(void* argument)
         }
 
         CanTxCompletion completion{};
-        while (CanTakeTxCompletion(can_context, completion))
+        for (CAN_context* completion_context : can_contexts)
         {
-            const uint64_t completed_us =
-                dummy::protocol::BinaryControlMonotonicMicros();
-            if (completion.metadata.channel == CanTxChannel::Safety &&
-                completion.status == CanTxCompletionStatus::Complete)
+            while (CanTakeTxCompletion(completion_context, completion))
             {
-                max_safety_wait_us = std::max(
-                    max_safety_wait_us,
-                    static_cast<uint32_t>(completed_us -
-                        completion.metadata.enqueued_time_us));
-            }
-            if (completion.metadata.channel == CanTxChannel::Configuration &&
-                completion.status != CanTxCompletionStatus::Complete)
-            {
-                stream_fail_closed = true;
-                dummy::protocol::RequestBinaryRuntimeHold();
-                continue;
-            }
-            if (completion.metadata.channel != CanTxChannel::Target ||
-                completion.metadata.action_sequence == 0U)
-                continue;
-            const dummy::protocol::TargetFanoutKey completion_key{
-                completion.metadata.session_epoch,
-                completion.metadata.action_sequence,
-                completion.metadata.fanout_generation};
-            const auto completion_result =
-                completion_tracker.RecordCompletion(
-                    completion_key, completion.metadata.node_id,
-                    completion.status == CanTxCompletionStatus::Complete,
-                    static_cast<uint32_t>(completed_us));
-            if (completion_result !=
-                    dummy::protocol::TargetCompletionResult::Ignored &&
-                completion.metadata.node_id >= 1U &&
-                completion.metadata.node_id <=
-                    dummy::protocol::kActuatorNodeCount &&
-                completion.status == CanTxCompletionStatus::Complete)
-            {
-                ++target_tx_complete_count[
-                    completion.metadata.node_id - 1U];
-            }
-            if (completion_result ==
-                dummy::protocol::TargetCompletionResult::CompleteExact)
-            {
-                dummy::protocol::RecordBinaryTargetCanTxCompleteExact(
-                    completion.metadata.action_sequence, completed_us);
-                completion_target = {};
-                completion_tracker.Cancel();
-            }
-            else if (completion_result ==
-                     dummy::protocol::TargetCompletionResult::Failed)
-            {
-                dummy::protocol::RecordBinaryTargetFailed(
-                    completion.metadata.action_sequence, completed_us);
-                target_fanout = {};
-                target_fanout_active = false;
-                completion_target = {};
-                application_tracker.Reset();
-                stream_fail_closed = true;
-                dummy::protocol::RequestBinaryRuntimeHold();
+                const uint64_t completed_us =
+                    dummy::protocol::BinaryControlMonotonicMicros();
+                if (completion.metadata.channel == CanTxChannel::Safety &&
+                    completion.status == CanTxCompletionStatus::Complete)
+                {
+                    max_safety_wait_us = std::max(
+                        max_safety_wait_us,
+                        static_cast<uint32_t>(completed_us -
+                            completion.metadata.enqueued_time_us));
+                }
+                if (completion.metadata.channel ==
+                        CanTxChannel::Configuration &&
+                    completion.status != CanTxCompletionStatus::Complete)
+                {
+                    stream_fail_closed = true;
+                    dummy::protocol::RequestBinaryRuntimeHold();
+                    continue;
+                }
+                if (completion.metadata.channel != CanTxChannel::Target ||
+                    completion.metadata.action_sequence == 0U)
+                    continue;
+                const dummy::protocol::TargetFanoutKey completion_key{
+                    completion.metadata.session_epoch,
+                    completion.metadata.action_sequence,
+                    completion.metadata.fanout_generation};
+                const auto completion_result =
+                    completion_tracker.RecordCompletion(
+                        completion_key, completion.metadata.node_id,
+                        completion.status == CanTxCompletionStatus::Complete,
+                        static_cast<uint32_t>(completed_us));
+                if (completion_result !=
+                        dummy::protocol::TargetCompletionResult::Ignored &&
+                    completion.metadata.node_id >= 1U &&
+                    completion.metadata.node_id <=
+                        dummy::protocol::kActuatorNodeCount &&
+                    completion.status == CanTxCompletionStatus::Complete)
+                {
+                    ++target_tx_complete_count[
+                        completion.metadata.node_id - 1U];
+                }
+                if (completion_result ==
+                    dummy::protocol::TargetCompletionResult::CompleteExact)
+                {
+                    dummy::protocol::RecordBinaryTargetCanTxCompleteExact(
+                        completion.metadata.action_sequence, completed_us);
+                    completion_target = {};
+                    completion_tracker.Cancel();
+                }
+                else if (completion_result ==
+                         dummy::protocol::TargetCompletionResult::Failed)
+                {
+                    dummy::protocol::RecordBinaryTargetFailed(
+                        completion.metadata.action_sequence, completed_us);
+                    target_fanout = {};
+                    target_fanout_active = false;
+                    completion_target = {};
+                    application_tracker.Reset();
+                    stream_fail_closed = true;
+                    dummy::protocol::RequestBinaryRuntimeHold();
+                }
             }
         }
 
+        CanRxFrame rx_frame{};
+        for (CAN_context* rx_context : can_contexts)
+        {
+            while (CanTakeRxFrame(rx_context, rx_frame))
+            {
+                OnCanMessage(
+                    rx_context, &rx_frame.header, rx_frame.data,
+                    rx_frame.received_us);
+            }
+        }
         const uint32_t now_us = micros();
+        dummy::protocol::PublishFeedbackSnapshot(now_us);
         if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream &&
             completion_tracker.CheckDeadline(now_us) ==
                 dummy::protocol::TargetCompletionResult::Failed)
@@ -764,10 +800,17 @@ void ThreadCanDispatch(void* argument)
             runtime_status |= dummy::protocol::kCanRuntimeQueryPending;
         if (dummy::protocol::ReadCanFeedbackReady())
             runtime_status |= dummy::protocol::kCanRuntimeFeedbackReady;
-        if (can_context != nullptr &&
-            (can_context->tx_recovery_count != 0U ||
-             can_context->tx_completion_overflow_count != 0U ||
-             can_context->busoff_count != 0U))
+        bool can_degraded = false;
+        for (const CAN_context* context : can_contexts)
+        {
+            can_degraded = can_degraded ||
+                (context != nullptr &&
+                 (context->tx_recovery_count != 0U ||
+                  context->tx_completion_overflow_count != 0U ||
+                  context->rx_overflow_count != 0U ||
+                  context->busoff_count != 0U));
+        }
+        if (can_degraded)
             runtime_status |= dummy::protocol::kCanRuntimeDegraded;
         dummy::protocol::PublishCanRuntimeStatus(runtime_status);
 
