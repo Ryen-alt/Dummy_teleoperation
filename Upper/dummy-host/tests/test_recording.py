@@ -21,7 +21,12 @@ from dummy_host.recording import (
     estimate_camera_archive_bytes,
 )
 from dummy_host.domain import ActionLifecycleUpdate, ActionStage
-from dummy_host.protocol import CanDiagnostics
+from dummy_host.protocol import (
+    CAN_DIAGNOSTICS_FORMAT_VERSION,
+    CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+    CAN_DIAGNOSTICS_WINDOW_VALID,
+    CanDiagnostics,
+)
 from dummy_host.time_sync import TimeSyncExchange, TimeSyncModel
 from dummy_host.schema import (
     AppliedAction,
@@ -142,7 +147,8 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
     assert manifest["clean_shutdown"] is True
     assert manifest["firmware_version"] == "fake-mcu-v1"
     assert manifest["robot_config_hash"] == config.config_hash
-    assert manifest["schema_version"] == 5
+    assert manifest["schema_version"] == 6
+    assert manifest["can_diagnostics_format_version"] == 2
     assert manifest["binary_protocol_version"] == 5
     assert manifest["state_telemetry_version"] == 4
     assert manifest["camera_rig_hash"] == config.camera_rig.config_hash
@@ -164,7 +170,7 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
     assert report.camera_frames_referenced == 2
 
 
-def test_v5_evidence_tables_store_exact_latency_clock_and_can_diagnostics(
+def test_v6_evidence_tables_store_exact_latency_clock_and_can_diagnostics(
     config: RobotConfig, tmp_path: Path
 ) -> None:
     profile = load_teleop_profile(
@@ -174,26 +180,51 @@ def test_v5_evidence_tables_store_exact_latency_clock_and_can_diagnostics(
         tmp_path, config, profile, source="test", session_name="v5_evidence"
     )
     recorder.update_runtime_metadata(
-        firmware_version="dummy-ref-v2.2", session_epoch=9
+        firmware_version="dummy-ref-v2.2.1", session_epoch=9
     )
     exchange = TimeSyncExchange(1_000_000, 1_000, 1_010, 1_020_000)
     model = TimeSyncModel(1, 1, 1000.0, 0.0, 10_000, 25.0, 3, 1_020_000)
     recorder.record_time_sync(exchange, model)
     recorder.record_can_diagnostics(
         CanDiagnostics(
-            100,
-            1_000,
-            (1,) * 7,
-            (2,) * 7,
-            (3,) * 7,
-            4,
-            5,
-            6,
-            7,
-            8,
-            9,
-            10,
-            11,
+            format_version=CAN_DIAGNOSTICS_FORMAT_VERSION,
+            payload_size=CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+            session_epoch=9,
+            motor_marker_mask=0x7F,
+            window_flags=CAN_DIAGNOSTICS_WINDOW_VALID,
+            window_reset_count=1,
+            window_start_us=100,
+            window_duration_us=1_000,
+            target_tx_complete=(1,) * 7,
+            position_request=(2,) * 7,
+            position_response=(2,) * 7,
+            position_timeout=(0,) * 7,
+            temperature_request=(3,) * 7,
+            temperature_response=(3,) * 7,
+            temperature_timeout=(0,) * 7,
+            motor_tx_drop=(0,) * 7,
+            motor_rx_error=(0,) * 7,
+            motor_busoff=(0,) * 7,
+            main_can_busoff=(0, 0),
+            main_can_rx_overflow=(0, 0),
+            main_can_rx_high_water=(4, 2),
+            unexpected_response_count=0,
+            maintenance_response_count=0,
+            query_target_overlap_count=6,
+            target_retry_count=0,
+            target_retry_exhausted_count=0,
+            target_deadline_failure_count=0,
+            main_can_tx_abort=(0, 0),
+            main_can_tx_error=(7, 0),
+            main_can_tx_recovery=(0, 0),
+            main_can_completion_overflow=(0, 0),
+            safety_preemption_count=9,
+            max_safety_wait_us=10,
+            max_fanout_us=11,
+            max_rx_dispatch_latency_us=12,
+            main_can_rx_frame=(13, 14),
+            main_can_tx_busy=(15, 16),
+            transition_failure_count=0,
         ),
         host_time_ns=2_000_000,
     )

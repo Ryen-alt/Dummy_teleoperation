@@ -389,7 +389,7 @@ ProcessResult ControlSession::Hello(const Packet& request)
         kCapabilityMultiChannelSequence | kCapabilityTargetKeepalive |
         kCapabilityCanTxCompleteExact |
         kCapabilityControlFreshnessToken | kCapabilityTimeSync |
-        kCapabilityCanDiagnostics;
+        kCapabilityCanDiagnostics | kCapabilityCanDiagnosticsV2;
     std::copy(firmware_version_.begin(), firmware_version_.end(), response.firmware_version);
     WritePayload(output.response, response);
     return output;

@@ -13,14 +13,14 @@ namespace dummy::generated_config
 {
 constexpr char kRobotId[] = "dummy_v2_001";
 constexpr char kRobotCalibrationId[] = "dummy_v2_001-arm-gripper-20260821-v2";
-constexpr uint32_t kConfigVersion = 7U;
+constexpr uint32_t kConfigVersion = 8U;
 constexpr bool kHardwareParametersVerified = true;
-constexpr bool kExternalTargetExecutionReady = true;
+constexpr bool kExternalTargetExecutionReady = false;
 constexpr std::array<uint8_t, 32> kConfigSha256 = {
-    0x66, 0x52, 0x5f, 0xc5, 0xf1, 0x34, 0x7f, 0x60,
-    0x42, 0xef, 0xe8, 0x4a, 0x87, 0xe2, 0xd5, 0xb5,
-    0x2b, 0x9a, 0x9f, 0xf0, 0xf1, 0x94, 0xf9, 0xc7,
-    0x82, 0xba, 0x21, 0x0e, 0xd4, 0x36, 0xcf, 0x64,
+    0xa5, 0xf9, 0x9d, 0x2d, 0xe3, 0x20, 0x13, 0x11,
+    0xe3, 0x4d, 0x9e, 0x0d, 0xde, 0xbf, 0xa6, 0x88,
+    0x61, 0x0c, 0x70, 0x3b, 0x2a, 0x4f, 0xb8, 0xa7,
+    0xa1, 0x07, 0x3a, 0x14, 0x80, 0xfe, 0x12, 0xfe,
 };
 
 constexpr std::array<float, 6> kJointZeroOffsetRad = {0.0F, -1.2740901F, 3.141593F, 0.0F, 0.0F, 0.0F};
@@ -50,6 +50,10 @@ constexpr uint32_t kCanTargetHzPerNode = 50U;
 constexpr uint32_t kCanPositionHzPerNode = 40U;
 constexpr uint32_t kCanTemperatureHzPerNode = 1U;
 constexpr uint32_t kCoherentMaxSkewUs = 30000U;
+constexpr uint32_t kCanNodeQuietUs = 5000U;
+constexpr uint32_t kCanResponseTimeoutUs = 4000U;
+constexpr uint32_t kCanTxAbortTimeoutUs = 5000U;
+constexpr uint32_t kCanTargetFanoutTimeoutUs = 15000U;
 constexpr uint32_t kMaxStateAgeMs = 200U;
 constexpr uint16_t kTargetTtlMs = 200U;
 constexpr uint32_t kLeaseTimeoutMs = 500U;
@@ -57,6 +61,8 @@ constexpr float kMaxTargetOvershootRad = 0.1F;
 
 static_assert(kFirmwareLoopHz == 200U, "firmware loop contract changed");
 static_assert(kCanSchedulerWatchdogHz >= 100U && kCanSchedulerWatchdogHz <= 5000U, "CAN scheduler watchdog rate is outside the reviewed range");
+static_assert(kCanResponseTimeoutUs <= kCanNodeQuietUs, "CAN response timeout must fit inside the node quiet interval");
+static_assert(kCanTargetFanoutTimeoutUs >= kCanTxAbortTimeoutUs, "CAN fanout deadline must cover one transport abort deadline");
 static_assert(kTargetTtlMs > 0U, "target TTL must be positive");
 static_assert(kLeaseTimeoutMs >= kTargetTtlMs, "lease must not expire before target TTL");
 static_assert(kFeedbackFaultMs > kFeedbackHoldMs, "feedback FAULT must persist beyond HOLD");

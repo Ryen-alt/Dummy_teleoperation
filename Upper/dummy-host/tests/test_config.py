@@ -19,7 +19,7 @@ def test_config_is_deterministic_and_calibrated(config) -> None:
     assert len(config.config_hash) == 64
     assert tuple(config.cameras) == ("wrist",)
     assert config.cameras["wrist"].model == "D435"
-    assert config.config_version == 7
+    assert config.config_version == 8
     assert config.can_scheduler_watchdog_hz == 1000
     assert config.can_target_hz_per_node == 50
     assert config.can_position_hz_per_node == 40
@@ -30,7 +30,11 @@ def test_config_is_deterministic_and_calibrated(config) -> None:
     assert config.robot_calibration_id == "dummy_v2_001-arm-gripper-20260821-v2"
     assert config.joint_reduction.tolist() == [50.0] * 6
     assert config.hardware_parameters_verified
-    assert config.external_target_execution_ready
+    assert not config.external_target_execution_ready
+    assert config.can_node_quiet_us == 5_000
+    assert config.can_response_timeout_us == 4_000
+    assert config.can_tx_abort_timeout_us == 5_000
+    assert config.can_target_fanout_timeout_us == 15_000
 
 
 def test_can_scheduler_watchdog_rate_outside_reviewed_range_is_rejected(tmp_path) -> None:

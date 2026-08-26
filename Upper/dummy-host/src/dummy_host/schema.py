@@ -85,6 +85,10 @@ class RobotConfig:
     can_position_hz_per_node: int
     can_temperature_hz_per_node: int
     coherent_max_skew_ms: int
+    can_node_quiet_us: int
+    can_response_timeout_us: int
+    can_tx_abort_timeout_us: int
+    can_target_fanout_timeout_us: int
     joint_zero_offset_rad: np.ndarray
     joint_sign: np.ndarray
     joint_reduction: np.ndarray
@@ -486,6 +490,12 @@ def load_robot_config(
     can_position_hz = _positive_int(raw, "can_position_hz_per_node")
     can_temperature_hz = _positive_int(raw, "can_temperature_hz_per_node")
     coherent_max_skew_ms = _positive_int(raw, "coherent_max_skew_ms")
+    can_node_quiet_us = _positive_int(raw, "can_node_quiet_us")
+    can_response_timeout_us = _positive_int(raw, "can_response_timeout_us")
+    can_tx_abort_timeout_us = _positive_int(raw, "can_tx_abort_timeout_us")
+    can_target_fanout_timeout_us = _positive_int(
+        raw, "can_target_fanout_timeout_us"
+    )
     if not 100 <= can_scheduler_watchdog_hz <= 5000:
         raise ConfigError(
             "can_scheduler_watchdog_hz must be between 100 and 5000 Hz"
@@ -493,6 +503,14 @@ def load_robot_config(
     if coherent_max_skew_ms * can_position_hz < 1000:
         raise ConfigError(
             "coherent_max_skew_ms is shorter than one configured position period"
+        )
+    if can_response_timeout_us > can_node_quiet_us:
+        raise ConfigError(
+            "can_response_timeout_us must not exceed can_node_quiet_us"
+        )
+    if can_target_fanout_timeout_us < can_tx_abort_timeout_us:
+        raise ConfigError(
+            "can_target_fanout_timeout_us must cover can_tx_abort_timeout_us"
         )
 
     return RobotConfig(
@@ -511,6 +529,10 @@ def load_robot_config(
         can_position_hz_per_node=can_position_hz,
         can_temperature_hz_per_node=can_temperature_hz,
         coherent_max_skew_ms=coherent_max_skew_ms,
+        can_node_quiet_us=can_node_quiet_us,
+        can_response_timeout_us=can_response_timeout_us,
+        can_tx_abort_timeout_us=can_tx_abort_timeout_us,
+        can_target_fanout_timeout_us=can_target_fanout_timeout_us,
         joint_zero_offset_rad=_array(raw, "joint_zero_offset_rad", 6),
         joint_sign=signs,
         joint_reduction=reduction,

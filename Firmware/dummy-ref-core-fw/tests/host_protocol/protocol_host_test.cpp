@@ -492,6 +492,7 @@ void TestSessionTargetAndTimeout()
     assert((hello_ack.capabilities & kCapabilityControlFreshnessToken) != 0U);
     assert((hello_ack.capabilities & kCapabilityTimeSync) != 0U);
     assert((hello_ack.capabilities & kCapabilityCanDiagnostics) != 0U);
+    assert((hello_ack.capabilities & kCapabilityCanDiagnosticsV2) != 0U);
 
     Packet acquire = MakePacket(MessageType::AcquireControl, hello.header.session_id,
                                 hello.header.sequence + 1);
@@ -1294,6 +1295,12 @@ void TestTargetCompletionRetriesOnlyTheExactFailedNode()
     assert(diagnostics.retry_exhausted_count == 0U);
     assert(diagnostics.deadline_failure_count == 0U);
     assert(diagnostics.max_fanout_us == 1100U);
+    tracker.ResetDiagnostics();
+    const TargetCompletionDiagnostics reset = tracker.diagnostics();
+    assert(reset.retry_count == 0U);
+    assert(reset.retry_exhausted_count == 0U);
+    assert(reset.deadline_failure_count == 0U);
+    assert(reset.max_fanout_us == 0U);
 }
 
 void TestTargetCompletionFailsOnSecondErrorOrFanoutDeadline()

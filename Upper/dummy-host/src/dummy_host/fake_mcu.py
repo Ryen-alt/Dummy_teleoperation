@@ -13,6 +13,13 @@ from .protocol import (
     CAPABILITY_CONTROL_FRESHNESS_TOKEN,
     CAPABILITY_TIME_SYNC,
     CAPABILITY_CAN_DIAGNOSTICS,
+    CAPABILITY_CAN_DIAGNOSTICS_V2,
+    CAN_DIAGNOSTICS_FORMAT_VERSION,
+    CAN_DIAGNOSTICS_MARKERS_COMPLETE,
+    CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC,
+    CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+    CAN_DIAGNOSTICS_EPOCH_STABLE,
+    CAN_DIAGNOSTICS_WINDOW_ACTIVE,
     ACQUIRE_CONTROL,
     CanDiagnostics,
     SET_MODE,
@@ -64,6 +71,7 @@ class FakeMcuTransport:
         | CAPABILITY_CONTROL_FRESHNESS_TOKEN
         | CAPABILITY_TIME_SYNC
         | CAPABILITY_CAN_DIAGNOSTICS
+        | CAPABILITY_CAN_DIAGNOSTICS_V2
     )
 
     def __init__(
@@ -220,19 +228,49 @@ class FakeMcuTransport:
                     MessageType.CAN_DIAGNOSTICS,
                     pack_can_diagnostics(
                         CanDiagnostics(
+                            format_version=CAN_DIAGNOSTICS_FORMAT_VERSION,
+                            payload_size=CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+                            session_epoch=1,
+                            motor_marker_mask=0x7F,
+                            window_flags=(
+                                CAN_DIAGNOSTICS_WINDOW_ACTIVE
+                                | CAN_DIAGNOSTICS_EPOCH_STABLE
+                                | CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC
+                                | CAN_DIAGNOSTICS_MARKERS_COMPLETE
+                            ),
+                            window_reset_count=1,
                             window_start_us=max(0, now_us - 1_000_000),
                             window_duration_us=min(now_us, 1_000_000),
                             target_tx_complete=(0,) * 7,
+                            position_request=(0,) * 7,
                             position_response=(0,) * 7,
+                            position_timeout=(0,) * 7,
+                            temperature_request=(0,) * 7,
                             temperature_response=(0,) * 7,
-                            position_timeout_count=0,
-                            temperature_timeout_count=0,
-                            tx_abort_count=0,
-                            tx_error_count=0,
-                            tx_recovery_count=0,
+                            temperature_timeout=(0,) * 7,
+                            motor_tx_drop=(0,) * 7,
+                            motor_rx_error=(0,) * 7,
+                            motor_busoff=(0,) * 7,
+                            main_can_busoff=(0,) * 2,
+                            main_can_rx_overflow=(0,) * 2,
+                            main_can_rx_high_water=(0,) * 2,
+                            unexpected_response_count=0,
+                            maintenance_response_count=0,
+                            query_target_overlap_count=0,
+                            target_retry_count=0,
+                            target_retry_exhausted_count=0,
+                            target_deadline_failure_count=0,
+                            main_can_tx_abort=(0,) * 2,
+                            main_can_tx_error=(0,) * 2,
+                            main_can_tx_recovery=(0,) * 2,
+                            main_can_completion_overflow=(0,) * 2,
                             safety_preemption_count=0,
                             max_safety_wait_us=0,
                             max_fanout_us=0,
+                            max_rx_dispatch_latency_us=0,
+                            main_can_rx_frame=(0,) * 2,
+                            main_can_tx_busy=(0,) * 2,
+                            transition_failure_count=0,
                         )
                     ),
                 )

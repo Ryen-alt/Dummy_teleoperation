@@ -16,6 +16,7 @@ enum class CanTxChannel : uint8_t
     Temperature = 5,
     Diagnostics = 6,
     Configuration = 7,
+    EnableTransition = 8,
 };
 
 enum class CanTxCompletionStatus : uint8_t

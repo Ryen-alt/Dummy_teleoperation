@@ -62,7 +62,13 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
     except (TypeError, ValueError):
         manifest_schema_version = 0
         errors.append("manifest schema_version is invalid")
-    expected_protocol = {4: 4, 5: PROTOCOL_VERSION}.get(manifest_schema_version)
+    if manifest_schema_version not in (2, 3, 4, 5, 6):
+        errors.append(
+            f"unsupported Raw Session schema v{manifest_schema_version}; expected v2 through v6"
+        )
+    expected_protocol = {4: 4, 5: PROTOCOL_VERSION, 6: PROTOCOL_VERSION}.get(
+        manifest_schema_version
+    )
     if expected_protocol is not None and manifest.get("binary_protocol_version") != expected_protocol:
         errors.append(
             f"Raw Session schema v{manifest_schema_version} requires binary protocol "
@@ -162,6 +168,41 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
                 "time_sync_exchanges": {"rtt_ns", "model_id"},
                 "can_diagnostics": {"max_fanout_us", "tx_error_count"},
             }
+            if schema_version >= 6:
+                required_columns["can_diagnostics"].update(
+                    {
+                        "format_version",
+                        "payload_size",
+                        "session_epoch",
+                        "motor_marker_mask",
+                        "window_flags",
+                        "window_reset_count",
+                        "position_request_json",
+                        "position_timeout_json",
+                        "temperature_request_json",
+                        "temperature_timeout_json",
+                        "motor_tx_drop_json",
+                        "motor_rx_error_json",
+                        "motor_busoff_json",
+                        "main_can_busoff_json",
+                        "main_can_rx_overflow_json",
+                        "main_can_rx_high_water_json",
+                        "unexpected_response_count",
+                        "maintenance_response_count",
+                        "query_target_overlap_count",
+                        "target_retry_count",
+                        "target_retry_exhausted_count",
+                        "target_deadline_failure_count",
+                        "main_can_tx_abort_json",
+                        "main_can_tx_error_json",
+                        "main_can_tx_recovery_json",
+                        "main_can_completion_overflow_json",
+                        "max_rx_dispatch_latency_us",
+                        "main_can_rx_frame_json",
+                        "main_can_tx_busy_json",
+                        "transition_failure_count",
+                    }
+                )
             table_names = {
                 str(row[0])
                 for row in connection.execute(
@@ -181,6 +222,21 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
                     errors.append(
                         f"Raw Session v5 table {table} is missing columns: "
                         + ", ".join(missing)
+                    )
+            if schema_version >= 6:
+                if manifest.get("can_diagnostics_format_version") != 2:
+                    errors.append(
+                        "Raw Session v6 requires can_diagnostics_format_version=2"
+                    )
+                invalid_diagnostics = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM can_diagnostics
+                    WHERE format_version != 2 OR payload_size != 380
+                    """
+                ).fetchone()
+                if invalid_diagnostics and int(invalid_diagnostics[0]) > 0:
+                    errors.append(
+                        "Raw Session v6 contains non-v2 CAN diagnostic payloads"
                     )
         if schema_version >= 3:
             sample_row = connection.execute(

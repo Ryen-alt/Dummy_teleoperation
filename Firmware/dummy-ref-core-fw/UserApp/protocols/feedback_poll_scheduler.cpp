@@ -868,4 +868,9 @@ void TargetCompletionTracker::Cancel()
     active_ = false;
 }
 
+void TargetCompletionTracker::ResetDiagnostics()
+{
+    diagnostics_ = {};
+}
+
 } // namespace dummy::protocol

@@ -25,7 +25,13 @@ ACTION_PROGRESS = struct.Struct("<IB3xQI")
 ACTION_PROGRESS_RECORD = struct.Struct("<IB3xIIII")
 TIME_SYNC = struct.Struct("<Q")
 TIME_SYNC_ACK = struct.Struct("<QQQ")
-CAN_DIAGNOSTICS = struct.Struct("<QQ7I7I7I8I")
+CAN_DIAGNOSTICS_FORMAT_VERSION = 2
+CAN_DIAGNOSTICS_PAYLOAD_SIZE = 380
+CAN_DIAGNOSTICS = struct.Struct(
+    "<HHIBBHIQQ" + "7I" * 7 + "7B7B7B3x" + "2I" * 3
+    + "6I" + "2I" * 4 + "4I" + "2I2I" + "I3I"
+)
+assert CAN_DIAGNOSTICS.size == CAN_DIAGNOSTICS_PAYLOAD_SIZE
 ACTION_PROGRESS_CAPACITY = 6
 STATE = struct.Struct(
     "<Q7f7fIBBHI32s7f7I7I7I7H7H7BBHH7Q7IIIQ4B"
@@ -93,6 +99,17 @@ CAPABILITY_CAN_TX_COMPLETE_EXACT = 1 << 2
 CAPABILITY_CONTROL_FRESHNESS_TOKEN = 1 << 3
 CAPABILITY_TIME_SYNC = 1 << 4
 CAPABILITY_CAN_DIAGNOSTICS = 1 << 5
+CAPABILITY_CAN_DIAGNOSTICS_V2 = 1 << 6
+CAN_DIAGNOSTICS_WINDOW_ACTIVE = 1 << 0
+CAN_DIAGNOSTICS_EPOCH_STABLE = 1 << 1
+CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC = 1 << 2
+CAN_DIAGNOSTICS_MARKERS_COMPLETE = 1 << 3
+CAN_DIAGNOSTICS_WINDOW_VALID = (
+    CAN_DIAGNOSTICS_WINDOW_ACTIVE
+    | CAN_DIAGNOSTICS_EPOCH_STABLE
+    | CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC
+    | CAN_DIAGNOSTICS_MARKERS_COMPLETE
+)
 
 
 @dataclass(frozen=True)
@@ -114,45 +131,132 @@ class AckPayload:
 
 @dataclass(frozen=True)
 class CanDiagnostics:
+    format_version: int
+    payload_size: int
+    session_epoch: int
+    motor_marker_mask: int
+    window_flags: int
+    window_reset_count: int
     window_start_us: int
     window_duration_us: int
     target_tx_complete: tuple[int, ...]
+    position_request: tuple[int, ...]
     position_response: tuple[int, ...]
+    position_timeout: tuple[int, ...]
+    temperature_request: tuple[int, ...]
     temperature_response: tuple[int, ...]
-    position_timeout_count: int
-    temperature_timeout_count: int
-    tx_abort_count: int
-    tx_error_count: int
-    tx_recovery_count: int
+    temperature_timeout: tuple[int, ...]
+    motor_tx_drop: tuple[int, ...]
+    motor_rx_error: tuple[int, ...]
+    motor_busoff: tuple[int, ...]
+    main_can_busoff: tuple[int, ...]
+    main_can_rx_overflow: tuple[int, ...]
+    main_can_rx_high_water: tuple[int, ...]
+    unexpected_response_count: int
+    maintenance_response_count: int
+    query_target_overlap_count: int
+    target_retry_count: int
+    target_retry_exhausted_count: int
+    target_deadline_failure_count: int
+    main_can_tx_abort: tuple[int, ...]
+    main_can_tx_error: tuple[int, ...]
+    main_can_tx_recovery: tuple[int, ...]
+    main_can_completion_overflow: tuple[int, ...]
     safety_preemption_count: int
     max_safety_wait_us: int
     max_fanout_us: int
+    max_rx_dispatch_latency_us: int
+    main_can_rx_frame: tuple[int, ...]
+    main_can_tx_busy: tuple[int, ...]
+    transition_failure_count: int
 
     def __post_init__(self) -> None:
         arrays = (
             self.target_tx_complete,
+            self.position_request,
             self.position_response,
+            self.position_timeout,
+            self.temperature_request,
             self.temperature_response,
+            self.temperature_timeout,
+            self.motor_tx_drop,
+            self.motor_rx_error,
+            self.motor_busoff,
         )
         if any(len(values) != 7 for values in arrays):
             raise ValueError("CAN diagnostic node counters must contain seven values")
+        can_arrays = (
+            self.main_can_busoff,
+            self.main_can_rx_overflow,
+            self.main_can_rx_high_water,
+            self.main_can_tx_abort,
+            self.main_can_tx_error,
+            self.main_can_tx_recovery,
+            self.main_can_completion_overflow,
+            self.main_can_rx_frame,
+            self.main_can_tx_busy,
+        )
+        if any(len(values) != 2 for values in can_arrays):
+            raise ValueError("main CAN diagnostic counters must contain two values")
+        if self.format_version != CAN_DIAGNOSTICS_FORMAT_VERSION:
+            raise ValueError("CAN diagnostics format version must be 2")
+        if self.payload_size != CAN_DIAGNOSTICS_PAYLOAD_SIZE:
+            raise ValueError("CAN diagnostics payload size must be 380")
+        if not 0 <= self.motor_marker_mask <= 0xFF or not 0 <= self.window_flags <= 0xFF:
+            raise ValueError("CAN diagnostic masks must be uint8")
+        if any(value > 0xFF for values in (
+            self.motor_tx_drop, self.motor_rx_error, self.motor_busoff
+        ) for value in values):
+            raise ValueError("motor CAN diagnostic counters must be uint8")
         scalars = (
+            self.format_version,
+            self.payload_size,
+            self.session_epoch,
+            self.motor_marker_mask,
+            self.window_flags,
+            self.window_reset_count,
             self.window_start_us,
             self.window_duration_us,
-            *self.target_tx_complete,
-            *self.position_response,
-            *self.temperature_response,
-            self.position_timeout_count,
-            self.temperature_timeout_count,
-            self.tx_abort_count,
-            self.tx_error_count,
-            self.tx_recovery_count,
+            *(value for values in arrays for value in values),
+            *(value for values in can_arrays for value in values),
+            self.unexpected_response_count,
+            self.maintenance_response_count,
+            self.query_target_overlap_count,
+            self.target_retry_count,
+            self.target_retry_exhausted_count,
+            self.target_deadline_failure_count,
             self.safety_preemption_count,
             self.max_safety_wait_us,
             self.max_fanout_us,
+            self.max_rx_dispatch_latency_us,
+            self.transition_failure_count,
         )
         if any(value < 0 for value in scalars):
             raise ValueError("CAN diagnostic counters must be non-negative")
+
+    @property
+    def window_valid(self) -> bool:
+        return self.window_flags & CAN_DIAGNOSTICS_WINDOW_VALID == CAN_DIAGNOSTICS_WINDOW_VALID
+
+    @property
+    def position_timeout_count(self) -> int:
+        return sum(self.position_timeout)
+
+    @property
+    def temperature_timeout_count(self) -> int:
+        return sum(self.temperature_timeout)
+
+    @property
+    def tx_abort_count(self) -> int:
+        return sum(self.main_can_tx_abort)
+
+    @property
+    def tx_error_count(self) -> int:
+        return sum(self.main_can_tx_error)
+
+    @property
+    def tx_recovery_count(self) -> int:
+        return sum(self.main_can_tx_recovery)
 
 
 def crc32c(data: bytes, initial: int = 0) -> int:
@@ -394,19 +498,48 @@ def unpack_time_sync_ack(payload: bytes) -> tuple[int, int, int]:
 
 def pack_can_diagnostics(value: CanDiagnostics) -> bytes:
     return CAN_DIAGNOSTICS.pack(
+        value.format_version,
+        value.payload_size,
+        value.session_epoch,
+        value.motor_marker_mask,
+        value.window_flags,
+        0,
+        value.window_reset_count,
         value.window_start_us,
         value.window_duration_us,
         *value.target_tx_complete,
+        *value.position_request,
         *value.position_response,
+        *value.position_timeout,
+        *value.temperature_request,
         *value.temperature_response,
-        value.position_timeout_count,
-        value.temperature_timeout_count,
-        value.tx_abort_count,
-        value.tx_error_count,
-        value.tx_recovery_count,
+        *value.temperature_timeout,
+        *value.motor_tx_drop,
+        *value.motor_rx_error,
+        *value.motor_busoff,
+        *value.main_can_busoff,
+        *value.main_can_rx_overflow,
+        *value.main_can_rx_high_water,
+        value.unexpected_response_count,
+        value.maintenance_response_count,
+        value.query_target_overlap_count,
+        value.target_retry_count,
+        value.target_retry_exhausted_count,
+        value.target_deadline_failure_count,
+        *value.main_can_tx_abort,
+        *value.main_can_tx_error,
+        *value.main_can_tx_recovery,
+        *value.main_can_completion_overflow,
         value.safety_preemption_count,
         value.max_safety_wait_us,
         value.max_fanout_us,
+        value.max_rx_dispatch_latency_us,
+        *value.main_can_rx_frame,
+        *value.main_can_tx_busy,
+        value.transition_failure_count,
+        0,
+        0,
+        0,
     )
 
 
@@ -414,20 +547,42 @@ def unpack_can_diagnostics(payload: bytes) -> CanDiagnostics:
     if len(payload) != CAN_DIAGNOSTICS.size:
         raise ProtocolError("invalid CAN_DIAGNOSTICS payload length")
     values = CAN_DIAGNOSTICS.unpack(payload)
+    if values[0] != CAN_DIAGNOSTICS_FORMAT_VERSION or values[1] != CAN_DIAGNOSTICS_PAYLOAD_SIZE:
+        raise ProtocolError("unsupported CAN_DIAGNOSTICS format")
     return CanDiagnostics(
-        window_start_us=values[0],
-        window_duration_us=values[1],
-        target_tx_complete=tuple(values[2:9]),
-        position_response=tuple(values[9:16]),
-        temperature_response=tuple(values[16:23]),
-        position_timeout_count=values[23],
-        temperature_timeout_count=values[24],
-        tx_abort_count=values[25],
-        tx_error_count=values[26],
-        tx_recovery_count=values[27],
-        safety_preemption_count=values[28],
-        max_safety_wait_us=values[29],
-        max_fanout_us=values[30],
+        format_version=values[0], payload_size=values[1],
+        session_epoch=values[2], motor_marker_mask=values[3],
+        window_flags=values[4], window_reset_count=values[6],
+        window_start_us=values[7], window_duration_us=values[8],
+        target_tx_complete=tuple(values[9:16]),
+        position_request=tuple(values[16:23]),
+        position_response=tuple(values[23:30]),
+        position_timeout=tuple(values[30:37]),
+        temperature_request=tuple(values[37:44]),
+        temperature_response=tuple(values[44:51]),
+        temperature_timeout=tuple(values[51:58]),
+        motor_tx_drop=tuple(values[58:65]),
+        motor_rx_error=tuple(values[65:72]),
+        motor_busoff=tuple(values[72:79]),
+        main_can_busoff=tuple(values[79:81]),
+        main_can_rx_overflow=tuple(values[81:83]),
+        main_can_rx_high_water=tuple(values[83:85]),
+        unexpected_response_count=values[85],
+        maintenance_response_count=values[86],
+        query_target_overlap_count=values[87],
+        target_retry_count=values[88],
+        target_retry_exhausted_count=values[89],
+        target_deadline_failure_count=values[90],
+        main_can_tx_abort=tuple(values[91:93]),
+        main_can_tx_error=tuple(values[93:95]),
+        main_can_tx_recovery=tuple(values[95:97]),
+        main_can_completion_overflow=tuple(values[97:99]),
+        safety_preemption_count=values[99],
+        max_safety_wait_us=values[100], max_fanout_us=values[101],
+        max_rx_dispatch_latency_us=values[102],
+        main_can_rx_frame=tuple(values[103:105]),
+        main_can_tx_busy=tuple(values[105:107]),
+        transition_failure_count=values[107],
     )
 
 

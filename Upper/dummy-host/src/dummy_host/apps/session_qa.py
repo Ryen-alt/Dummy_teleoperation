@@ -353,7 +353,7 @@ def analyze_session(session_dir: str | Path) -> tuple[SessionQaReport, tuple[np.
             "schema v4 export is legacy-only and does not provide exact CAN TX "
             "completion or affine clock evidence"
         )
-    elif schema_version == 5:
+    elif schema_version in (5, 6):
         if not time_sync_rtts_ms:
             warnings.append("no fitted time-sync model is available")
         if can_diagnostic_windows == 0:
@@ -369,7 +369,7 @@ def analyze_session(session_dir: str | Path) -> tuple[SessionQaReport, tuple[np.
     action_min, action_max = _range(actions)
     ok = integrity.ok and integrity.clean_shutdown and not errors
     export_ready = (
-        schema_version == 5
+        schema_version in (5, 6)
         and ok
         and outcomes["accepted"] > 0
         and action_samples > 0

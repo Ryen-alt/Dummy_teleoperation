@@ -280,8 +280,14 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* hcan)
         ++ctx->busoff_count;
         ctx->busoff_active = true;
     }
+    constexpr uint32_t kRetryableTxErrors =
+        HAL_CAN_ERROR_TX_ALST0 | HAL_CAN_ERROR_TX_TERR0 |
+        HAL_CAN_ERROR_TX_ALST1 | HAL_CAN_ERROR_TX_TERR1 |
+        HAL_CAN_ERROR_TX_ALST2 | HAL_CAN_ERROR_TX_TERR2;
+    if ((errors & kRetryableTxErrors) != 0U)
+        SaturatingIncrement(ctx->tx_recovery_count);
     if (errors != HAL_CAN_ERROR_NONE)
-        ++ctx->unexpected_errors;
+        SaturatingIncrement(ctx->unexpected_errors);
 }
 
 CanTxStatus CanTrySendMessage(CAN_context* canCtx, uint8_t* txData,

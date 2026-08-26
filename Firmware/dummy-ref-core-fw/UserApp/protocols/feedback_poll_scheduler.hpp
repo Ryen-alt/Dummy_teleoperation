@@ -227,6 +227,7 @@ public:
     TargetCompletionResult CheckDeadline(uint32_t now_us);
     bool MarkRetryQueued(const TargetRetryRequest& request);
     void Cancel();
+    void ResetDiagnostics();
 
     bool active() const { return active_; }
     TargetFanoutKey key() const { return key_; }

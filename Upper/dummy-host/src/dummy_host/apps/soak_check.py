@@ -8,7 +8,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ..domain import HoldReasonBits
+from ..domain import ControlMode, HoldReasonBits
+from ..protocol import (
+    CAN_DIAGNOSTICS_FORMAT_VERSION,
+    CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+    CAN_DIAGNOSTICS_WINDOW_VALID,
+)
 from .session_check import SessionCheckError, check_session
 
 
@@ -21,7 +26,11 @@ class SoakThresholds:
     minimum_duration_s: float = 3600.0
     minimum_coherent_ratio: float = 0.995
     maximum_feedback_skew_ms: float = 30.0
-    maximum_fanout_ms: float = 10.0
+    maximum_fanout_ms: float = 15.0
+    maximum_rx_dispatch_latency_ms: float = 0.2
+    maximum_rx_high_water: float = 16.0
+    maximum_target_retry_10_min: float = 1.0
+    maximum_target_retry_60_min: float = 9.0
     maximum_post_feedback_p99_ms: float = 100.0
     maximum_post_feedback_ms: float = 250.0
     maximum_serial_safety_wait_ms: float = 10.0
@@ -58,6 +67,7 @@ class SoakMetrics:
     samples: int
     invalid_samples: int
     fault_samples: int
+    hold_samples: int
     control_rate_hz: float
     coherent_ratio: float
     maximum_feedback_skew_ms: float
@@ -71,9 +81,25 @@ class SoakMetrics:
     target_ttl_hold_samples: int
     reliable_rx_overflow: int
     can_abort_error_count: int
+    can_recovery_count: int
+    can_busoff_count: int
+    can_rx_overflow_count: int
+    can_completion_overflow_count: int
+    motor_tx_drop_count: int
+    motor_rx_error_count: int
+    motor_busoff_count: int
+    can_unexpected_response_count: int
+    target_retry_count: int
+    target_retry_exhausted_count: int
+    target_deadline_failure_count: int
+    transition_failure_count: int
+    position_timeout_rate: float
+    diagnostic_window_valid: bool
     can_safety_preemption_count: int
     time_sync_models: int
     maximum_fanout_ms: float
+    maximum_rx_dispatch_latency_ms: float
+    maximum_rx_high_water: int
     post_feedback_p99_ms: float
     maximum_post_feedback_ms: float
     maximum_serial_safety_wait_ms: float
@@ -147,6 +173,7 @@ def evaluate_soak_metrics(
     zero_gates = {
         "invalid control sample": metrics.invalid_samples,
         "fault sample": metrics.fault_samples,
+        "HOLD sample": metrics.hold_samples,
         "incomplete action lifecycle": metrics.incomplete_action_sequences,
         "SUPERSEDED action": metrics.superseded_actions,
         "rejected action": metrics.rejected_actions,
@@ -156,6 +183,17 @@ def evaluate_soak_metrics(
         "target TTL HOLD sample": metrics.target_ttl_hold_samples,
         "reliable RX overflow": metrics.reliable_rx_overflow,
         "CAN abort/error": metrics.can_abort_error_count,
+        "CAN recovery": metrics.can_recovery_count,
+        "CAN bus-off": metrics.can_busoff_count,
+        "CAN RX overflow": metrics.can_rx_overflow_count,
+        "CAN completion overflow": metrics.can_completion_overflow_count,
+        "motor TX drop": metrics.motor_tx_drop_count,
+        "motor RX error": metrics.motor_rx_error_count,
+        "motor bus-off": metrics.motor_busoff_count,
+        "unexpected CAN response": metrics.can_unexpected_response_count,
+        "target retry exhausted": metrics.target_retry_exhausted_count,
+        "target deadline failure": metrics.target_deadline_failure_count,
+        "stream transition failure": metrics.transition_failure_count,
         "CAN safety preemption": metrics.can_safety_preemption_count,
     }
     if metrics.action_sequences <= 0:
@@ -165,10 +203,39 @@ def evaluate_soak_metrics(
             failures.append(f"{label} count is {count}, expected zero")
     if metrics.time_sync_models <= 0:
         failures.append("no affine time-sync model was recorded")
+    if not metrics.diagnostic_window_valid:
+        failures.append("CAN diagnostics window identity or validity changed")
+    if metrics.position_timeout_rate >= 0.001:
+        failures.append(
+            f"position timeout rate {metrics.position_timeout_rate:.6%} is not below 0.1%"
+        )
+    retry_limit = (
+        thresholds.maximum_target_retry_60_min
+        if metrics.duration_s >= 3600.0
+        else thresholds.maximum_target_retry_10_min
+    )
+    if metrics.target_retry_count > retry_limit:
+        failures.append(
+            f"target retry count {metrics.target_retry_count} exceeds {retry_limit:.0f}"
+        )
     if metrics.maximum_fanout_ms >= thresholds.maximum_fanout_ms:
         failures.append(
             f"CAN fan-out {metrics.maximum_fanout_ms:.3f} ms is not below "
             f"{thresholds.maximum_fanout_ms:.3f} ms"
+        )
+    if (
+        metrics.maximum_rx_dispatch_latency_ms
+        >= thresholds.maximum_rx_dispatch_latency_ms
+    ):
+        failures.append(
+            "CAN RX dispatch latency "
+            f"{metrics.maximum_rx_dispatch_latency_ms:.3f} ms is not below "
+            f"{thresholds.maximum_rx_dispatch_latency_ms:.3f} ms"
+        )
+    if metrics.maximum_rx_high_water > thresholds.maximum_rx_high_water:
+        failures.append(
+            f"CAN RX queue high-water {metrics.maximum_rx_high_water} exceeds "
+            f"{thresholds.maximum_rx_high_water:.0f}"
         )
     if metrics.post_feedback_p99_ms >= thresholds.maximum_post_feedback_p99_ms:
         failures.append(
@@ -250,20 +317,24 @@ def _event_evidence(
     return counts, tuple(collection_starts), tuple(collection_stops)
 
 
-def _decode_counter_array(value: object, *, field: str) -> tuple[int, ...]:
+def _decode_counter_array(
+    value: object, *, field: str, length: int = 7
+) -> tuple[int, ...]:
     try:
         decoded = json.loads(str(value))
     except json.JSONDecodeError as exc:
         raise SoakCheckError(f"invalid {field}: {exc}") from exc
     if (
         not isinstance(decoded, list)
-        or len(decoded) != 7
+        or len(decoded) != length
         or any(
             isinstance(item, bool) or not isinstance(item, int) or item < 0
             for item in decoded
         )
     ):
-        raise SoakCheckError(f"{field} must contain seven non-negative counters")
+        raise SoakCheckError(
+            f"{field} must contain {length} non-negative counters"
+        )
     return tuple(decoded)
 
 
@@ -277,8 +348,8 @@ def check_soak_session(
     except SessionCheckError as exc:
         raise SoakCheckError(str(exc)) from exc
     manifest = json.loads((session_dir / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 5:
-        raise SoakCheckError("soak acceptance requires Raw Session schema v5")
+    if manifest.get("schema_version") != 6:
+        raise SoakCheckError("v2.2.1 soak acceptance requires Raw Session schema v6")
     failures = list(integrity.errors)
     if manifest.get("control_rate_hz") != thresholds.control_rate_hz:
         failures.append(
@@ -304,10 +375,16 @@ def check_soak_session(
                        COALESCE(SUM(CASE WHEN (state_hold_reason_bits & ?) != 0
                                          THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN state_fault_bits != 0
+                                         THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN state_mode IN (?, ?)
                                          THEN 1 ELSE 0 END), 0)
                 FROM samples
                 """,
-                (int(HoldReasonBits.TARGET_TIMEOUT),),
+                (
+                    int(HoldReasonBits.TARGET_TIMEOUT),
+                    int(ControlMode.HOLD),
+                    int(ControlMode.FAULT),
+                ),
             ).fetchone()
             assert sample_row is not None
             (
@@ -318,6 +395,7 @@ def check_soak_session(
                 max_skew_us,
                 ttl_holds,
                 fault_samples,
+                hold_samples,
             ) = (int(value) for value in sample_row)
             lifecycle_row = connection.execute(
                 """
@@ -356,43 +434,148 @@ def check_soak_session(
                 "SELECT COUNT(*) FROM time_sync_models"
             ).fetchone()
             assert model_row is not None
-            diagnostics_row = connection.execute(
+            diagnostics_rows = connection.execute(
                 """
-                SELECT window_duration_us, target_tx_complete_json,
-                       position_response_json, temperature_response_json,
-                       tx_abort_count + tx_error_count,
-                       safety_preemption_count, max_safety_wait_us, max_fanout_us
+                SELECT host_time_ns, format_version, payload_size,
+                       session_epoch, motor_marker_mask, window_flags,
+                       window_reset_count, window_start_us, window_duration_us,
+                       target_tx_complete_json, position_request_json,
+                       position_response_json, position_timeout_json,
+                       temperature_request_json, temperature_response_json,
+                       temperature_timeout_json, motor_tx_drop_json,
+                       motor_rx_error_json, motor_busoff_json,
+                       main_can_busoff_json, main_can_rx_overflow_json,
+                       main_can_rx_high_water_json, unexpected_response_count,
+                       maintenance_response_count, query_target_overlap_count,
+                       target_retry_count, target_retry_exhausted_count,
+                       target_deadline_failure_count, main_can_tx_abort_json,
+                       main_can_tx_error_json, main_can_tx_recovery_json,
+                       main_can_completion_overflow_json,
+                       safety_preemption_count, max_safety_wait_us,
+                       max_fanout_us, max_rx_dispatch_latency_us,
+                       transition_failure_count
                 FROM can_diagnostics
-                ORDER BY host_time_ns DESC, diagnostic_index DESC
-                LIMIT 1
+                ORDER BY host_time_ns, diagnostic_index
                 """
-            ).fetchone()
+            ).fetchall()
             transport_rows = connection.execute(
                 "SELECT transport_diagnostics_json FROM samples"
             ).fetchall()
     except sqlite3.Error as exc:
         raise SoakCheckError(f"cannot read soak evidence: {exc}") from exc
 
-    if diagnostics_row is None:
-        diagnostic_duration_s = 0.0
-        target_counts = position_counts = temperature_counts = (0,) * 7
-        can_abort_error = can_preemption = can_safety_wait_us = max_fanout_us = 0
-        failures.append("no CAN diagnostic snapshot was recorded")
+    diagnostic_duration_s = 0.0
+    target_counts = position_counts = temperature_counts = (0,) * 7
+    position_request_counts = position_timeout_counts = (0,) * 7
+    can_abort_error = can_preemption = can_safety_wait_us = max_fanout_us = 0
+    can_recovery = can_busoff = can_rx_overflow = can_completion_overflow = 0
+    motor_tx_drop = motor_rx_error = motor_busoff = 0
+    can_unexpected = target_retry = target_retry_exhausted = 0
+    target_deadline_failure = transition_failure = 0
+    max_rx_dispatch_latency_us = max_rx_high_water = 0
+    diagnostic_window_valid = False
+    if len(diagnostics_rows) < 2:
+        failures.append(
+            "CAN soak evidence requires first and last diagnostic snapshots"
+        )
     else:
-        diagnostic_duration_s = int(diagnostics_row[0]) / 1e6
-        target_counts = _decode_counter_array(
-            diagnostics_row[1], field="target_tx_complete_json"
+        first = diagnostics_rows[0]
+        last = diagnostics_rows[-1]
+        identity_indices = (3, 6, 7)
+        diagnostic_window_valid = all(
+            first[index] == last[index] for index in identity_indices
         )
-        position_counts = _decode_counter_array(
-            diagnostics_row[2], field="position_response_json"
+        diagnostic_window_valid = diagnostic_window_valid and all(
+            int(row[1]) == CAN_DIAGNOSTICS_FORMAT_VERSION
+            and int(row[2]) == CAN_DIAGNOSTICS_PAYLOAD_SIZE
+            and int(row[4]) == 0x7F
+            and int(row[5]) & CAN_DIAGNOSTICS_WINDOW_VALID
+            == CAN_DIAGNOSTICS_WINDOW_VALID
+            for row in diagnostics_rows
         )
-        temperature_counts = _decode_counter_array(
-            diagnostics_row[3], field="temperature_response_json"
+        manifest_epoch = manifest.get("session_epoch")
+        diagnostic_window_valid = diagnostic_window_valid and (
+            isinstance(manifest_epoch, int)
+            and int(first[3]) == manifest_epoch
         )
-        can_abort_error = int(diagnostics_row[4])
-        can_preemption = int(diagnostics_row[5])
-        can_safety_wait_us = int(diagnostics_row[6])
-        max_fanout_us = int(diagnostics_row[7])
+        duration_delta_us = int(last[8]) - int(first[8])
+        if duration_delta_us <= 0:
+            diagnostic_window_valid = False
+            failures.append("CAN diagnostic window duration did not advance")
+        else:
+            diagnostic_duration_s = duration_delta_us / 1e6
+
+        counter_rollback = False
+
+        def counter_deltas(
+            first_values: tuple[int, ...],
+            last_values: tuple[int, ...],
+            *,
+            field: str,
+        ) -> tuple[int, ...]:
+            nonlocal counter_rollback
+            if any(end < start for start, end in zip(first_values, last_values)):
+                counter_rollback = True
+                failures.append(f"CAN diagnostic counter rolled back: {field}")
+                return (0,) * len(first_values)
+            return tuple(
+                end - start for start, end in zip(first_values, last_values)
+            )
+
+        def array_delta(index: int, field: str, length: int = 7) -> tuple[int, ...]:
+            return counter_deltas(
+                _decode_counter_array(first[index], field=field, length=length),
+                _decode_counter_array(last[index], field=field, length=length),
+                field=field,
+            )
+
+        def scalar_delta(index: int, field: str) -> int:
+            return counter_deltas(
+                (int(first[index]),), (int(last[index]),), field=field
+            )[0]
+
+        target_counts = array_delta(9, "target_tx_complete_json")
+        position_request_counts = array_delta(10, "position_request_json")
+        position_counts = array_delta(11, "position_response_json")
+        position_timeout_counts = array_delta(12, "position_timeout_json")
+        temperature_counts = array_delta(14, "temperature_response_json")
+        motor_tx_drop = sum(array_delta(16, "motor_tx_drop_json"))
+        motor_rx_error = sum(array_delta(17, "motor_rx_error_json"))
+        motor_busoff = sum(array_delta(18, "motor_busoff_json"))
+        can_busoff = sum(array_delta(19, "main_can_busoff_json", 2))
+        can_rx_overflow = sum(
+            array_delta(20, "main_can_rx_overflow_json", 2)
+        )
+        max_rx_high_water = max(
+            max(
+                _decode_counter_array(
+                    row[21], field="main_can_rx_high_water_json", length=2
+                )
+            )
+            for row in diagnostics_rows
+        )
+        can_unexpected = scalar_delta(22, "unexpected_response_count")
+        target_retry = scalar_delta(25, "target_retry_count")
+        target_retry_exhausted = scalar_delta(
+            26, "target_retry_exhausted_count"
+        )
+        target_deadline_failure = scalar_delta(
+            27, "target_deadline_failure_count"
+        )
+        can_abort_error = sum(array_delta(28, "main_can_tx_abort_json", 2))
+        can_abort_error += sum(array_delta(29, "main_can_tx_error_json", 2))
+        can_recovery = sum(array_delta(30, "main_can_tx_recovery_json", 2))
+        can_completion_overflow = sum(
+            array_delta(31, "main_can_completion_overflow_json", 2)
+        )
+        can_preemption = scalar_delta(32, "safety_preemption_count")
+        can_safety_wait_us = max(int(row[33]) for row in diagnostics_rows)
+        max_fanout_us = max(int(row[34]) for row in diagnostics_rows)
+        max_rx_dispatch_latency_us = max(
+            int(row[35]) for row in diagnostics_rows
+        )
+        transition_failure = scalar_delta(36, "transition_failure_count")
+        diagnostic_window_valid = diagnostic_window_valid and not counter_rollback
 
     def rates(counts: tuple[int, ...]) -> tuple[float, ...]:
         return tuple(
@@ -435,6 +618,7 @@ def check_soak_session(
         samples=samples,
         invalid_samples=integrity.invalid_samples,
         fault_samples=fault_samples,
+        hold_samples=hold_samples,
         control_rate_hz=0.0 if duration_s <= 0 else samples / duration_s,
         coherent_ratio=0.0 if samples == 0 else coherent / samples,
         maximum_feedback_skew_ms=max_skew_us / 1000.0,
@@ -448,9 +632,29 @@ def check_soak_session(
         target_ttl_hold_samples=ttl_holds,
         reliable_rx_overflow=reliable_rx_overflow,
         can_abort_error_count=can_abort_error,
+        can_recovery_count=can_recovery,
+        can_busoff_count=can_busoff,
+        can_rx_overflow_count=can_rx_overflow,
+        can_completion_overflow_count=can_completion_overflow,
+        motor_tx_drop_count=motor_tx_drop,
+        motor_rx_error_count=motor_rx_error,
+        motor_busoff_count=motor_busoff,
+        can_unexpected_response_count=can_unexpected,
+        target_retry_count=target_retry,
+        target_retry_exhausted_count=target_retry_exhausted,
+        target_deadline_failure_count=target_deadline_failure,
+        transition_failure_count=transition_failure,
+        position_timeout_rate=(
+            0.0
+            if sum(position_request_counts) == 0
+            else sum(position_timeout_counts) / sum(position_request_counts)
+        ),
+        diagnostic_window_valid=diagnostic_window_valid,
         can_safety_preemption_count=can_preemption,
         time_sync_models=int(model_row[0]),
         maximum_fanout_ms=max_fanout_us / 1000.0,
+        maximum_rx_dispatch_latency_ms=max_rx_dispatch_latency_us / 1000.0,
+        maximum_rx_high_water=max_rx_high_water,
         post_feedback_p99_ms=(
             0.0 if not latencies else float(np.percentile(latencies, 99))
         ),
@@ -474,7 +678,7 @@ def check_soak_session(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Apply dummy-ref-v2.2 strict integration/soak acceptance gates"
+        description="Apply dummy-ref-v2.2.1 strict integration/soak acceptance gates"
     )
     parser.add_argument("--session", required=True)
     parser.add_argument("--minimum-duration-s", type=float, default=3600.0)

@@ -1,11 +1,11 @@
 robot_id: dummy_v2_001
-config_version: 7
+config_version: 8
 # Operator-confirmed arm/gripper calibration baseline. Changing a robot-safety
 # value changes the robot hash and requires regenerating/reflashing firmware.
 # Camera fields have their own rig hash and may be overridden by --camera-rig.
 robot_calibration_id: dummy_v2_001-arm-gripper-20260821-v2
 hardware_parameters_verified: true
-external_target_execution_ready: true
+external_target_execution_ready: false
 
 joint_order: [joint1, joint2, joint3, joint4, joint5, joint6, gripper]
 joint_unit: rad
@@ -20,6 +20,12 @@ can_target_hz_per_node: 50
 can_position_hz_per_node: 40
 can_temperature_hz_per_node: 1
 coherent_max_skew_ms: 30
+# v2.2.1 offline-safe defaults. The first two values must be replaced by
+# bench-measured P99.9 margins before external execution is re-enabled.
+can_node_quiet_us: 5000
+can_response_timeout_us: 4000
+can_tx_abort_timeout_us: 5000
+can_target_fanout_timeout_us: 15000
 
 # 以下值已经过逐关节真机复核，并由上面的 calibration ID 冻结。
 # 2026-08-21 操作者真机复测确认 J1～J6 的正确减速比均为 50。

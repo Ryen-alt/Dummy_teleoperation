@@ -31,8 +31,62 @@ DummyRobot robot(&hcan1);
 
 namespace
 {
-constexpr uint32_t kCanTxAbortTimeoutUs = 5000U;
-constexpr uint32_t kCanTargetFanoutTimeoutUs = 15000U;
+constexpr uint32_t kCanTxAbortTimeoutUs =
+    dummy::generated_config::kCanTxAbortTimeoutUs;
+constexpr uint32_t kCanTargetFanoutTimeoutUs =
+    dummy::generated_config::kCanTargetFanoutTimeoutUs;
+
+struct CanContextWindowBaseline
+{
+    uint32_t busoff_count = 0U;
+    uint32_t rx_overflow_count = 0U;
+    uint32_t tx_abort_count = 0U;
+    uint32_t tx_error_count = 0U;
+    uint32_t tx_recovery_count = 0U;
+    uint32_t completion_overflow_count = 0U;
+    uint32_t rx_frame_count = 0U;
+    uint32_t tx_busy_count = 0U;
+};
+
+struct CanDiagnosticsWindow
+{
+    bool active = false;
+    bool epoch_stable = false;
+    bool counters_monotonic = false;
+    uint32_t session_epoch = 0U;
+    uint32_t reset_count = 0U;
+    uint64_t start_us = 0U;
+    uint8_t motor_marker_mask = 0U;
+    dummy::protocol::CanDispatchDiagnostics scheduler{};
+    dummy::protocol::MotorTransportDiagnostics motor{};
+    std::array<uint32_t, dummy::protocol::kActuatorNodeCount>
+        target_tx_complete{};
+    std::array<CanContextWindowBaseline, 2U> can{};
+    uint32_t safety_preemption_count = 0U;
+    uint32_t transition_failure_count = 0U;
+};
+
+uint32_t WindowCounterDelta(uint32_t current, uint32_t baseline,
+                            bool& monotonic)
+{
+    if (current < baseline)
+    {
+        monotonic = false;
+        return 0U;
+    }
+    return current - baseline;
+}
+
+uint8_t WindowMotorCounterDelta(uint8_t current, uint8_t baseline,
+                                bool& monotonic)
+{
+    if (current < baseline)
+    {
+        monotonic = false;
+        return 0U;
+    }
+    return static_cast<uint8_t>(current - baseline);
+}
 
 dummy::protocol::ExecutorConfig MakeExternalExecutorConfig()
 {
@@ -80,6 +134,9 @@ dummy::protocol::CanDispatchConfig MakeCanDispatchConfig()
     config.position_hz_per_node = dummy::generated_config::kCanPositionHzPerNode;
     config.temperature_hz_per_node =
         dummy::generated_config::kCanTemperatureHzPerNode;
+    config.response_timeout_us =
+        dummy::generated_config::kCanResponseTimeoutUs;
+    config.node_quiet_us = dummy::generated_config::kCanNodeQuietUs;
     return config;
 }
 
@@ -285,10 +342,11 @@ void ThreadCanDispatch(void* argument)
     std::array<uint32_t, 2U> observed_rx_overflow_count{};
     std::array<uint32_t, dummy::protocol::kActuatorNodeCount>
         target_tx_complete_count{};
-    const uint64_t can_diagnostics_window_start_us =
-        dummy::protocol::BinaryControlMonotonicMicros();
+    CanDiagnosticsWindow diagnostics_window{};
     uint32_t safety_preemption_count = 0U;
     uint32_t max_safety_wait_us = 0U;
+    uint32_t max_rx_dispatch_latency_us = 0U;
+    uint32_t transition_failure_count = 0U;
     for (;;)
     {
         // TX-complete, RX-response and the 1 kHz watchdog all wake this task.
@@ -344,7 +402,17 @@ void ThreadCanDispatch(void* argument)
             dummy::protocol::CancelPendingFeedbackRequests();
             if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
                 dummy::protocol::ResetMotorTransportDiagnostics();
+            else if (diagnostics_window.active)
+                diagnostics_window.active = false;
             can_dispatch_scheduler.SetMode(dispatch_mode);
+        }
+
+        if (diagnostics_window.active &&
+            control_snapshot.session_epoch != diagnostics_window.session_epoch)
+        {
+            diagnostics_window.epoch_stable = false;
+            stream_fail_closed = true;
+            dummy::protocol::RequestBinaryRuntimeHold();
         }
 
         const bool binary_stream_authorized =
@@ -421,7 +489,9 @@ void ThreadCanDispatch(void* argument)
             {
                 const uint64_t completed_us =
                     dummy::protocol::BinaryControlMonotonicMicros();
-                if (completion.metadata.channel == CanTxChannel::Safety &&
+                if ((completion.metadata.channel == CanTxChannel::Safety ||
+                     completion.metadata.channel ==
+                         CanTxChannel::EnableTransition) &&
                     completion.status == CanTxCompletionStatus::Complete)
                 {
                     max_safety_wait_us = std::max(
@@ -429,12 +499,99 @@ void ThreadCanDispatch(void* argument)
                         static_cast<uint32_t>(completed_us -
                             completion.metadata.enqueued_time_us));
                 }
+                if (completion.metadata.channel == CanTxChannel::Safety &&
+                    completion.status != CanTxCompletionStatus::Complete &&
+                    dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
+                {
+                    if (transition_failure_count != UINT32_MAX)
+                        ++transition_failure_count;
+                    stream_fail_closed = true;
+                    dummy::protocol::RequestBinaryRuntimeHold();
+                    continue;
+                }
                 if (completion.metadata.channel ==
                         CanTxChannel::Configuration &&
                     completion.status != CanTxCompletionStatus::Complete)
                 {
+                    if (transition_failure_count != UINT32_MAX)
+                        ++transition_failure_count;
                     stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
+                    continue;
+                }
+                if (completion.metadata.channel ==
+                    CanTxChannel::EnableTransition)
+                {
+                    const auto motor_diagnostics =
+                        dummy::protocol::ReadMotorTransportDiagnostics();
+                    constexpr uint8_t kAllMotorMarkers = static_cast<uint8_t>(
+                        (1U << dummy::protocol::kActuatorNodeCount) - 1U);
+                    if (completion.status != CanTxCompletionStatus::Complete ||
+                        dispatch_mode !=
+                            dummy::protocol::CanDispatchMode::Stream ||
+                        !binary_stream_authorized || stream_fail_closed ||
+                        control_snapshot.session_epoch == 0U ||
+                        completion.metadata.session_epoch !=
+                            control_snapshot.session_epoch ||
+                        motor_diagnostics.valid_mask != kAllMotorMarkers)
+                    {
+                        if (transition_failure_count != UINT32_MAX)
+                            ++transition_failure_count;
+                        stream_fail_closed = true;
+                        dummy::protocol::RequestBinaryRuntimeHold();
+                        continue;
+                    }
+
+                    if (diagnostics_window.reset_count != UINT32_MAX)
+                        ++diagnostics_window.reset_count;
+                    diagnostics_window.active = true;
+                    diagnostics_window.epoch_stable = true;
+                    diagnostics_window.counters_monotonic = true;
+                    diagnostics_window.session_epoch =
+                        control_snapshot.session_epoch;
+                    diagnostics_window.start_us = completed_us;
+                    diagnostics_window.motor_marker_mask =
+                        motor_diagnostics.valid_mask;
+                    diagnostics_window.scheduler =
+                        can_dispatch_scheduler.diagnostics();
+                    diagnostics_window.motor = motor_diagnostics;
+                    diagnostics_window.target_tx_complete =
+                        target_tx_complete_count;
+                    diagnostics_window.safety_preemption_count =
+                        safety_preemption_count;
+                    diagnostics_window.transition_failure_count =
+                        transition_failure_count;
+                    for (size_t index = 0U;
+                         index < can_contexts.size(); ++index)
+                    {
+                        CAN_context* context = can_contexts[index];
+                        if (context == nullptr)
+                            continue;
+                        auto& baseline = diagnostics_window.can[index];
+                        baseline.busoff_count = context->busoff_count;
+                        baseline.rx_overflow_count =
+                            context->rx_overflow_count;
+                        baseline.tx_abort_count =
+                            context->TxMailboxAbortCallbackCnt;
+                        baseline.tx_error_count =
+                            context->tx_enqueue_error_count;
+                        baseline.tx_recovery_count =
+                            context->tx_recovery_count;
+                        baseline.completion_overflow_count =
+                            context->tx_completion_overflow_count;
+                        baseline.rx_frame_count = context->received_msg_cnt;
+                        baseline.tx_busy_count = context->tx_busy_count;
+                    }
+                    taskENTER_CRITICAL();
+                    for (CAN_context* context : can_contexts)
+                    {
+                        if (context != nullptr)
+                            context->rx_high_water = 0U;
+                    }
+                    taskEXIT_CRITICAL();
+                    completion_tracker.ResetDiagnostics();
+                    max_safety_wait_us = 0U;
+                    max_rx_dispatch_latency_us = 0U;
                     continue;
                 }
                 if (completion.metadata.channel != CanTxChannel::Target ||
@@ -487,6 +644,10 @@ void ThreadCanDispatch(void* argument)
         {
             while (CanTakeRxFrame(rx_context, rx_frame))
             {
+                const uint32_t dispatch_latency_us =
+                    micros() - rx_frame.received_us;
+                max_rx_dispatch_latency_us = std::max(
+                    max_rx_dispatch_latency_us, dispatch_latency_us);
                 OnCanMessage(
                     rx_context, &rx_frame.header, rx_frame.data,
                     rx_frame.received_us);
@@ -548,6 +709,8 @@ void ThreadCanDispatch(void* argument)
             if (step.timed_out_action ==
                 dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
             {
+                if (transition_failure_count != UINT32_MAX)
+                    ++transition_failure_count;
                 stream_fail_closed = true;
                 dummy::protocol::RequestBinaryRuntimeHold();
             }
@@ -591,10 +754,11 @@ void ThreadCanDispatch(void* argument)
             tx_metadata.channel = CanTxChannel::Configuration;
         else if (step.action == dummy::protocol::CanDispatchAction::EnableBroadcast ||
                  step.action == dummy::protocol::CanDispatchAction::DisableBroadcast)
-            tx_metadata.channel =
-                step.action == dummy::protocol::CanDispatchAction::DisableBroadcast &&
-                dispatch_mode == dummy::protocol::CanDispatchMode::Fault
-                ? CanTxChannel::Emergency : CanTxChannel::Safety;
+            tx_metadata.channel = step.action ==
+                    dummy::protocol::CanDispatchAction::EnableBroadcast
+                ? CanTxChannel::EnableTransition
+                : (dispatch_mode == dummy::protocol::CanDispatchMode::Fault
+                    ? CanTxChannel::Emergency : CanTxChannel::Safety);
         if (dispatching_target_retry)
         {
             if (completion_target.mode == ScheduledActuatorMode::Stream &&
@@ -667,6 +831,8 @@ void ThreadCanDispatch(void* argument)
                     static_cast<uint8_t>(
                         (1U << dummy::protocol::kActuatorNodeCount) - 1U))
                 {
+                    if (transition_failure_count != UINT32_MAX)
+                        ++transition_failure_count;
                     stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
                 }
@@ -766,6 +932,8 @@ void ThreadCanDispatch(void* argument)
                     step.action ==
                         dummy::protocol::CanDispatchAction::EnableBroadcast)
                 {
+                    if (transition_failure_count != UINT32_MAX)
+                        ++transition_failure_count;
                     stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
                 }
@@ -815,38 +983,187 @@ void ThreadCanDispatch(void* argument)
         dummy::protocol::PublishCanRuntimeStatus(runtime_status);
 
         dummy::protocol::CanDiagnosticsPayload can_diagnostics{};
-        can_diagnostics.window_start_us = can_diagnostics_window_start_us;
-        can_diagnostics.window_duration_us =
-            dummy::protocol::BinaryControlMonotonicMicros() -
-            can_diagnostics_window_start_us;
-        for (size_t index = 0;
-             index < dummy::protocol::kActuatorNodeCount; ++index)
+        can_diagnostics.format_version =
+            dummy::protocol::kCanDiagnosticsFormatVersion;
+        can_diagnostics.payload_size =
+            dummy::protocol::kCanDiagnosticsPayloadSize;
+        can_diagnostics.session_epoch = diagnostics_window.session_epoch;
+        can_diagnostics.window_reset_count = diagnostics_window.reset_count;
+        can_diagnostics.window_start_us = diagnostics_window.start_us;
+        if (diagnostics_window.start_us != 0U)
         {
-            can_diagnostics.target_tx_complete[index] =
-                target_tx_complete_count[index];
-            can_diagnostics.position_response[index] =
-                diagnostics.position_responded[index];
-            can_diagnostics.temperature_response[index] =
-                diagnostics.temperature_responded[index];
-            can_diagnostics.position_timeout_count +=
-                diagnostics.position_timed_out[index];
-            can_diagnostics.temperature_timeout_count +=
-                diagnostics.temperature_timed_out[index];
+            can_diagnostics.window_duration_us =
+                dummy::protocol::BinaryControlMonotonicMicros() -
+                diagnostics_window.start_us;
         }
-        if (can_context != nullptr)
+
+        const auto motor_diagnostics =
+            dummy::protocol::ReadMotorTransportDiagnostics();
+        can_diagnostics.motor_marker_mask = motor_diagnostics.valid_mask;
+        bool counters_monotonic = diagnostics_window.counters_monotonic;
+        if (diagnostics_window.start_us != 0U)
         {
-            can_diagnostics.tx_abort_count =
-                can_context->TxMailboxAbortCallbackCnt;
-            can_diagnostics.tx_error_count =
-                can_context->tx_enqueue_error_count +
-                can_context->tx_completion_overflow_count;
-            can_diagnostics.tx_recovery_count =
-                can_context->tx_recovery_count;
+            for (size_t index = 0;
+                 index < dummy::protocol::kActuatorNodeCount; ++index)
+            {
+                can_diagnostics.target_tx_complete[index] =
+                    WindowCounterDelta(
+                        target_tx_complete_count[index],
+                        diagnostics_window.target_tx_complete[index],
+                        counters_monotonic);
+                can_diagnostics.position_request[index] =
+                    WindowCounterDelta(
+                        diagnostics.position_requested[index],
+                        diagnostics_window.scheduler.position_requested[index],
+                        counters_monotonic);
+                can_diagnostics.position_response[index] =
+                    WindowCounterDelta(
+                        diagnostics.position_responded[index],
+                        diagnostics_window.scheduler.position_responded[index],
+                        counters_monotonic);
+                can_diagnostics.position_timeout[index] =
+                    WindowCounterDelta(
+                        diagnostics.position_timed_out[index],
+                        diagnostics_window.scheduler.position_timed_out[index],
+                        counters_monotonic);
+                can_diagnostics.temperature_request[index] =
+                    WindowCounterDelta(
+                        diagnostics.temperature_requested[index],
+                        diagnostics_window.scheduler.temperature_requested[index],
+                        counters_monotonic);
+                can_diagnostics.temperature_response[index] =
+                    WindowCounterDelta(
+                        diagnostics.temperature_responded[index],
+                        diagnostics_window.scheduler.temperature_responded[index],
+                        counters_monotonic);
+                can_diagnostics.temperature_timeout[index] =
+                    WindowCounterDelta(
+                        diagnostics.temperature_timed_out[index],
+                        diagnostics_window.scheduler.temperature_timed_out[index],
+                        counters_monotonic);
+                can_diagnostics.motor_tx_drop[index] =
+                    WindowMotorCounterDelta(
+                        motor_diagnostics.tx_drop[index],
+                        diagnostics_window.motor.tx_drop[index],
+                        counters_monotonic);
+                can_diagnostics.motor_rx_error[index] =
+                    WindowMotorCounterDelta(
+                        motor_diagnostics.rx_error[index],
+                        diagnostics_window.motor.rx_error[index],
+                        counters_monotonic);
+                can_diagnostics.motor_busoff[index] =
+                    WindowMotorCounterDelta(
+                        motor_diagnostics.busoff[index],
+                        diagnostics_window.motor.busoff[index],
+                        counters_monotonic);
+            }
+            for (size_t index = 0U; index < can_contexts.size(); ++index)
+            {
+                CAN_context* context = can_contexts[index];
+                if (context == nullptr)
+                    continue;
+                const auto& baseline = diagnostics_window.can[index];
+                can_diagnostics.main_can_busoff[index] =
+                    WindowCounterDelta(
+                        context->busoff_count, baseline.busoff_count,
+                        counters_monotonic);
+                can_diagnostics.main_can_rx_overflow[index] =
+                    WindowCounterDelta(
+                        context->rx_overflow_count,
+                        baseline.rx_overflow_count, counters_monotonic);
+                can_diagnostics.main_can_rx_high_water[index] =
+                    context->rx_high_water;
+                can_diagnostics.main_can_tx_abort[index] =
+                    WindowCounterDelta(
+                        context->TxMailboxAbortCallbackCnt,
+                        baseline.tx_abort_count, counters_monotonic);
+                can_diagnostics.main_can_tx_error[index] =
+                    WindowCounterDelta(
+                        context->tx_enqueue_error_count,
+                        baseline.tx_error_count, counters_monotonic);
+                can_diagnostics.main_can_tx_recovery[index] =
+                    WindowCounterDelta(
+                        context->tx_recovery_count,
+                        baseline.tx_recovery_count, counters_monotonic);
+                can_diagnostics.main_can_completion_overflow[index] =
+                    WindowCounterDelta(
+                        context->tx_completion_overflow_count,
+                        baseline.completion_overflow_count,
+                        counters_monotonic);
+                can_diagnostics.main_can_rx_frame[index] =
+                    WindowCounterDelta(
+                        context->received_msg_cnt,
+                        baseline.rx_frame_count, counters_monotonic);
+                can_diagnostics.main_can_tx_busy[index] =
+                    WindowCounterDelta(
+                        context->tx_busy_count, baseline.tx_busy_count,
+                        counters_monotonic);
+            }
+            can_diagnostics.unexpected_response_count =
+                WindowCounterDelta(
+                    diagnostics.unexpected_response_count,
+                    diagnostics_window.scheduler.unexpected_response_count,
+                    counters_monotonic);
+            can_diagnostics.maintenance_response_count =
+                WindowCounterDelta(
+                    diagnostics.maintenance_response_count,
+                    diagnostics_window.scheduler.maintenance_response_count,
+                    counters_monotonic);
+            can_diagnostics.query_target_overlap_count =
+                WindowCounterDelta(
+                    diagnostics.query_target_overlap_count,
+                    diagnostics_window.scheduler.query_target_overlap_count,
+                    counters_monotonic);
+            const auto target_diagnostics =
+                completion_tracker.diagnostics();
+            can_diagnostics.target_retry_count =
+                target_diagnostics.retry_count;
+            can_diagnostics.target_retry_exhausted_count =
+                target_diagnostics.retry_exhausted_count;
+            can_diagnostics.target_deadline_failure_count =
+                target_diagnostics.deadline_failure_count;
+            can_diagnostics.max_fanout_us =
+                target_diagnostics.max_fanout_us;
+            can_diagnostics.safety_preemption_count =
+                WindowCounterDelta(
+                    safety_preemption_count,
+                    diagnostics_window.safety_preemption_count,
+                    counters_monotonic);
+            can_diagnostics.transition_failure_count =
+                WindowCounterDelta(
+                    transition_failure_count,
+                    diagnostics_window.transition_failure_count,
+                    counters_monotonic);
         }
-        can_diagnostics.safety_preemption_count = safety_preemption_count;
         can_diagnostics.max_safety_wait_us = max_safety_wait_us;
-        can_diagnostics.max_fanout_us =
-            completion_tracker.diagnostics().max_fanout_us;
+        can_diagnostics.max_rx_dispatch_latency_us =
+            max_rx_dispatch_latency_us;
+
+        constexpr uint8_t kAllMotorMarkers = static_cast<uint8_t>(
+            (1U << dummy::protocol::kActuatorNodeCount) - 1U);
+        if (diagnostics_window.active)
+            can_diagnostics.window_flags |=
+                dummy::protocol::kCanDiagnosticsWindowActive;
+        if (diagnostics_window.epoch_stable)
+            can_diagnostics.window_flags |=
+                dummy::protocol::kCanDiagnosticsEpochStable;
+        if (counters_monotonic)
+            can_diagnostics.window_flags |=
+                dummy::protocol::kCanDiagnosticsMotorCountersMonotonic;
+        if (motor_diagnostics.valid_mask == kAllMotorMarkers)
+            can_diagnostics.window_flags |=
+                dummy::protocol::kCanDiagnosticsMarkersComplete;
+        else if (diagnostics_window.active)
+        {
+            stream_fail_closed = true;
+            dummy::protocol::RequestBinaryRuntimeHold();
+        }
+        if (diagnostics_window.counters_monotonic && !counters_monotonic)
+        {
+            diagnostics_window.counters_monotonic = false;
+            stream_fail_closed = true;
+            dummy::protocol::RequestBinaryRuntimeHold();
+        }
         dummy::protocol::PublishCanDiagnostics(can_diagnostics);
     }
 }

@@ -8,6 +8,7 @@ import pytest
 from dummy_host.fake_mcu import FakeMcuTransport
 from dummy_host.protocol import (
     ACTION_PROGRESS,
+    CAPABILITY_CAN_DIAGNOSTICS_V2,
     ActionProgressStage,
     MessageType,
     Packet,
@@ -88,6 +89,20 @@ class OldV21WithoutMultiChannelSequence(FakeMcuTransport):
     is_simulated = False
     firmware_version = "dummy-ref-v2.1"
     firmware_capabilities = 0
+
+
+class OldV22WithProtocolV5(FakeMcuTransport):
+    is_simulated = False
+    firmware_version = "dummy-ref-v2.2"
+
+
+class V221WithoutCanDiagnosticsV2(FakeMcuTransport):
+    is_simulated = False
+    firmware_version = "dummy-ref-v2.2.1"
+    firmware_capabilities = (
+        FakeMcuTransport.firmware_capabilities
+        & ~CAPABILITY_CAN_DIAGNOSTICS_V2
+    )
 
 
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
@@ -218,6 +233,20 @@ def test_rejected_candidate_consumes_neither_sequence_nor_credit(config) -> None
 def test_protocol_v4_firmware_is_rejected_by_v5_host(config) -> None:
     robot = DummyRobot(config, OldV21WithoutMultiChannelSequence(config))
     with pytest.raises(ConfigError, match="protocol v5"):
+        robot.connect()
+    assert not robot.is_connected
+
+
+def test_v22_firmware_is_rejected_by_v221_host(config) -> None:
+    robot = DummyRobot(config, OldV22WithProtocolV5(config))
+    with pytest.raises(ConfigError, match="dummy-ref-v2.2.1 exactly"):
+        robot.connect()
+    assert not robot.is_connected
+
+
+def test_v221_firmware_without_diagnostics_v2_is_rejected(config) -> None:
+    robot = DummyRobot(config, V221WithoutCanDiagnosticsV2(config))
+    with pytest.raises(ConfigError, match="missing required protocol-v5"):
         robot.connect()
     assert not robot.is_connected
 

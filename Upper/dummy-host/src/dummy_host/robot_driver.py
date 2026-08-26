@@ -27,6 +27,7 @@ from .protocol import (
     CAPABILITY_CONTROL_FRESHNESS_TOKEN,
     CAPABILITY_TIME_SYNC,
     CAPABILITY_CAN_DIAGNOSTICS,
+    CAPABILITY_CAN_DIAGNOSTICS_V2,
     ACK_DETAIL_FEEDBACK_NOT_READY,
     ACQUIRE_CONTROL,
     ActionProgressStage,
@@ -204,10 +205,10 @@ class DummyRobot:
                 )
             if (
                 not self.transport.is_simulated
-                and self.firmware_version != "dummy-ref-v2.2"
+                and self.firmware_version != "dummy-ref-v2.2.1"
             ):
                 raise ConfigError(
-                    "protocol v5 host requires firmware dummy-ref-v2.2 exactly; "
+                    "protocol v5 host requires firmware dummy-ref-v2.2.1 exactly; "
                     f"received {self.firmware_version!r}"
                 )
             if (
@@ -220,6 +221,7 @@ class DummyRobot:
                     | CAPABILITY_CONTROL_FRESHNESS_TOKEN
                     | CAPABILITY_TIME_SYNC
                     | CAPABILITY_CAN_DIAGNOSTICS
+                    | CAPABILITY_CAN_DIAGNOSTICS_V2
                 )
                 != (
                     CAPABILITY_MULTI_CHANNEL_SEQUENCE
@@ -228,11 +230,12 @@ class DummyRobot:
                     | CAPABILITY_CONTROL_FRESHNESS_TOKEN
                     | CAPABILITY_TIME_SYNC
                     | CAPABILITY_CAN_DIAGNOSTICS
+                    | CAPABILITY_CAN_DIAGNOSTICS_V2
                 )
             ):
                 raise ConfigError(
-                    "dummy-ref-v2.2 firmware is missing required protocol-v5 "
-                    "execution-evidence capabilities; rebuild and reflash v2.2"
+                    "dummy-ref-v2.2.1 firmware is missing required protocol-v5 "
+                    "execution-evidence capabilities; rebuild and reflash v2.2.1"
                 )
             self._wait_for_first_state(deadline)
             self._connected = True
@@ -565,8 +568,9 @@ class DummyRobot:
 
     def read_can_diagnostics(self) -> CanDiagnostics:
         self._require_connected()
-        if not self.firmware_capabilities & CAPABILITY_CAN_DIAGNOSTICS:
-            raise RobotError("firmware does not advertise CAN diagnostics")
+        required = CAPABILITY_CAN_DIAGNOSTICS | CAPABILITY_CAN_DIAGNOSTICS_V2
+        if self.firmware_capabilities & required != required:
+            raise RobotError("firmware does not advertise CAN diagnostics v2")
         response = self._request(MessageType.GET_CAN_DIAGNOSTICS)
         if response.message_type != MessageType.CAN_DIAGNOSTICS:
             raise RobotError(
@@ -701,7 +705,8 @@ class DummyRobot:
             | CAPABILITY_CAN_TX_COMPLETE_EXACT
             | CAPABILITY_CONTROL_FRESHNESS_TOKEN
             | CAPABILITY_TIME_SYNC
-            | CAPABILITY_CAN_DIAGNOSTICS,
+            | CAPABILITY_CAN_DIAGNOSTICS
+            | CAPABILITY_CAN_DIAGNOSTICS_V2,
         )
         last_timeout: RobotError | None = None
         while True:

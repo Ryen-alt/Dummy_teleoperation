@@ -189,7 +189,7 @@ dummy-host-session-qa --session /path/to/session_dir \
   --html-output /tmp/session_qa.html
 ```
 
-v2.2 的 10 分钟基础验收和 60 分钟 soak 使用同一个严格检查器；短测显式覆盖默认
+v2.2.1 的 10 分钟基础验收和 60 分钟 soak 使用同一个严格检查器；短测显式覆盖默认
 3600 秒时长，其余阈值完全相同：
 
 ```bash
@@ -201,20 +201,20 @@ dummy-host-soak-check --session /path/to/session_dir \
   --json-output /tmp/soak_60m.json
 ```
 
-检查器只接受 clean Raw Session v5，并同时核对 20 Hz 控制率、invalid/fault 为零、
+检查器只接受 clean Raw Session v6 / CAN diagnostics-v2，并同时核对 20 Hz 控制率、invalid/fault/HOLD 为零、
 coherent sweep、动作 ACK/TX-complete/post-feedback 闭合、TTL/BAD_MODE/action-credit/
-串口可靠队列、CAN 诊断、七节点发送率和安全抢占延迟。CAN 固件提供累计最大 fan-out，
-因此这里执行比“p99 < 10 ms”更严格的 `max < 10 ms` 门禁；命令返回非零即不得导出
+串口可靠队列、同一 epoch/window 的首末诊断差分、七节点发送率和安全抢占延迟。
+CAN 固件提供窗口累计最大 fan-out，因此执行严格的 `max < 15 ms` 门禁；命令返回非零即不得导出
 该 session。
 
-Raw Session v2～v5 也可通过 `ReplayCamera` 走相同的 Camera/CameraManager 接口。回放 rig
+Raw Session v2～v6 也可通过 `ReplayCamera` 走相同的 Camera/CameraManager 接口。回放 rig
 将 `driver` 设为 `replay`，`device_serial` 填 clean session 目录，并保持角色、分辨率和
 `calibration_version` 与源记录一致；回放时间戳会重基到当前单调时钟，因此过期帧和
 同步门禁仍然生效。
-LeRobot 严格导出只接受 schema v5，并固定按 20 Hz 真实控制时间重采样；observation 使用
+LeRobot 严格导出接受 schema v5/v6，并固定按 20 Hz 真实控制时间重采样；observation 使用
 coherent reference 的仿射主机时间，camera 使用硬件曝光或显式 arrival 时间，action 只取
 实际通过 SafetyFilter 且具备 ACK、TX-complete exact、post-feedback 证据的目标。schema v4
-必须在 recipe 中显式设置 `legacy_mode: true`，导出侧车会标为 legacy 证据，不能与 v5 合并。
+必须在 recipe 中显式设置 `legacy_mode: true`，导出侧车会标为 legacy 证据，不能与 v5/v6 合并。
 真实 `--execute` 还必须显式指定 `--allow-joint` 或 `--allow-gripper`，并继续受
 硬件参数和固件执行门禁约束。详细验收步骤见真机指南第 17 节。
 

@@ -3,7 +3,8 @@
 All multi-byte values are little-endian. A wire frame is
 `COBS(header || payload || crc32c) || 0x00`; CRC32C covers the decoded header
 and payload. The maximum decoded frame is 576 bytes. A real peer must report
-firmware `dummy-ref-v2.2`; v4/v5 peers never share a control session.
+firmware `dummy-ref-v2.2.1`; v4/v5 peers never share a control session, and a
+v2.2 peer is rejected even though it also speaks protocol v5.
 
 ## Header and epoch
 
@@ -50,6 +51,7 @@ CAN_TX_COMPLETE_EXACT      0x00000004
 CONTROL_FRESHNESS_TOKEN    0x00000008
 TIME_SYNC                  0x00000010
 CAN_DIAGNOSTICS            0x00000020
+CAN_DIAGNOSTICS_V2         0x00000040
 ```
 
 ## Control payloads
@@ -133,25 +135,49 @@ node sample times.
 
 ## CAN diagnostics and scheduling
 
-`CAN_DIAGNOSTICS` is 132 bytes:
+`CAN_DIAGNOSTICS` is fixed at 380 bytes and starts with
+`format_version=2`, `payload_size=380`. The host rejects the legacy 132-byte
+payload and requires both diagnostics capability bits.
 
 ```c
+uint16_t format_version;
+uint16_t payload_size;
+uint32_t session_epoch;
+uint8_t motor_marker_mask;
+uint8_t window_flags;       // active, epoch-stable, counters-monotonic, markers-complete
+uint16_t reserved0;
+uint32_t window_reset_count;
 uint64_t window_start_us;
 uint64_t window_duration_us;
 uint32_t target_tx_complete[7];
+uint32_t position_request[7];
 uint32_t position_response[7];
+uint32_t position_timeout[7];
+uint32_t temperature_request[7];
 uint32_t temperature_response[7];
-uint32_t position_timeout_count;
-uint32_t temperature_timeout_count;
-uint32_t tx_abort_count;
-uint32_t tx_error_count;
-uint32_t tx_recovery_count;
+uint32_t temperature_timeout[7];
+uint8_t motor_tx_drop[7], motor_rx_error[7], motor_busoff[7];
+uint8_t reserved_motor[3];
+uint32_t main_can_busoff[2], main_can_rx_overflow[2], main_can_rx_high_water[2];
+uint32_t unexpected_response_count, maintenance_response_count;
+uint32_t query_target_overlap_count, target_retry_count;
+uint32_t target_retry_exhausted_count, target_deadline_failure_count;
+uint32_t main_can_tx_abort[2], main_can_tx_error[2];
+uint32_t main_can_tx_recovery[2], main_can_completion_overflow[2];
 uint32_t safety_preemption_count;
 uint32_t max_safety_wait_us;
 uint32_t max_fanout_us;
+uint32_t max_rx_dispatch_latency_us;
+uint32_t main_can_rx_frame[2], main_can_tx_busy[2];
+uint32_t transition_failure_count;
+uint32_t reserved1[3];
 ```
 
-The host records diagnostics at 1 Hz. Firmware keeps a single CAN frame in
+The window opens only after the Stream enable frame completes successfully.
+Motor counters are reported relative to the seven-node preflight baseline.
+Epoch changes, window resets, missing markers, or counter rollback invalidate
+the soak evidence and cause a fail-closed HOLD. The host records diagnostics at
+1 Hz and evaluates the first/last snapshots from one unchanged window. Firmware keeps a single CAN frame in
 flight and advances on TX-complete/RX/deadline events. Priority is ESTOP/FAULT,
 then HOLD/RELEASE/mode, normal target/position traffic, then temperature and
 diagnostics. The 1 kHz timer is only a watchdog; it does not rate-limit normal
@@ -170,7 +196,7 @@ host_monotonic_ns = slope_ns_per_us * mcu_time_us + intercept_ns
 Every accepted update receives a new model ID. MCU/host rollback or a model jump
 starts a new segment, across which strict export never interpolates.
 
-Raw Session schema v5 stores session epoch/control tick, all lifecycle stages,
+Raw Session schema v6 maps to binary protocol v5 and stores session epoch/control tick, all lifecycle stages,
 three action-latency components, time models/exchanges, CAN diagnostics, coherent
 reference time and camera timestamp source. Strict LeRobot export is fixed at
 20 Hz, interpolates observations by mapped coherent reference time, chooses
@@ -181,7 +207,8 @@ control gaps, and clock segment changes split exported episodes.
 
 Raw v2/v3 remain integrity-inspectable only. Raw v4 export requires an explicit
 `legacy_mode: true` recipe and is labeled `v4_legacy_can_queued_only`; it cannot
-be merged into the v5 evidence tier.
+be merged into the exact-completion evidence tier. Raw v5 remains read-only
+compatible; new recordings are always v6 and are not rewritten into old sessions.
 
 ## Safety boundary
 

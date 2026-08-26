@@ -8,6 +8,9 @@ import pytest
 
 from dummy_host.protocol import (
     CanDiagnostics,
+    CAN_DIAGNOSTICS_FORMAT_VERSION,
+    CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+    CAN_DIAGNOSTICS_WINDOW_VALID,
     MessageType,
     Packet,
     ProtocolError,
@@ -94,23 +97,54 @@ def test_time_sync_payload_round_trip() -> None:
 
 def test_can_diagnostics_payload_round_trip() -> None:
     diagnostics = CanDiagnostics(
+        format_version=CAN_DIAGNOSTICS_FORMAT_VERSION,
+        payload_size=CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+        session_epoch=3,
+        motor_marker_mask=0x7F,
+        window_flags=CAN_DIAGNOSTICS_WINDOW_VALID,
+        window_reset_count=4,
         window_start_us=10,
         window_duration_us=20,
         target_tx_complete=tuple(range(1, 8)),
-        position_response=tuple(range(8, 15)),
-        temperature_response=tuple(range(15, 22)),
-        position_timeout_count=22,
-        temperature_timeout_count=23,
-        tx_abort_count=24,
-        tx_error_count=25,
-        tx_recovery_count=26,
-        safety_preemption_count=27,
-        max_safety_wait_us=28,
-        max_fanout_us=29,
+        position_request=tuple(range(8, 15)),
+        position_response=tuple(range(15, 22)),
+        position_timeout=tuple(range(22, 29)),
+        temperature_request=tuple(range(29, 36)),
+        temperature_response=tuple(range(36, 43)),
+        temperature_timeout=tuple(range(43, 50)),
+        motor_tx_drop=tuple(range(1, 8)),
+        motor_rx_error=tuple(range(8, 15)),
+        motor_busoff=tuple(range(15, 22)),
+        main_can_busoff=(50, 51),
+        main_can_rx_overflow=(52, 53),
+        main_can_rx_high_water=(16, 15),
+        unexpected_response_count=54,
+        maintenance_response_count=55,
+        query_target_overlap_count=56,
+        target_retry_count=57,
+        target_retry_exhausted_count=58,
+        target_deadline_failure_count=59,
+        main_can_tx_abort=(60, 61),
+        main_can_tx_error=(62, 63),
+        main_can_tx_recovery=(64, 65),
+        main_can_completion_overflow=(66, 67),
+        safety_preemption_count=68,
+        max_safety_wait_us=69,
+        max_fanout_us=70,
+        max_rx_dispatch_latency_us=71,
+        main_can_rx_frame=(72, 73),
+        main_can_tx_busy=(74, 75),
+        transition_failure_count=76,
     )
-    assert unpack_can_diagnostics(pack_can_diagnostics(diagnostics)) == diagnostics
+    payload = pack_can_diagnostics(diagnostics)
+    assert len(payload) == 380
+    assert unpack_can_diagnostics(payload) == diagnostics
     with pytest.raises(ProtocolError, match="payload length"):
         unpack_can_diagnostics(b"short")
+    with pytest.raises(ProtocolError, match="payload length"):
+        unpack_can_diagnostics(bytes(132))
+    with pytest.raises(ProtocolError, match="unsupported"):
+        unpack_can_diagnostics(b"\x01\x00" + payload[2:])
 
 
 def test_shared_wire_vectors() -> None:

@@ -19,6 +19,17 @@ constexpr uint32_t kCapabilityCanTxCompleteExact = 1U << 2U;
 constexpr uint32_t kCapabilityControlFreshnessToken = 1U << 3U;
 constexpr uint32_t kCapabilityTimeSync = 1U << 4U;
 constexpr uint32_t kCapabilityCanDiagnostics = 1U << 5U;
+constexpr uint32_t kCapabilityCanDiagnosticsV2 = 1U << 6U;
+constexpr uint16_t kCanDiagnosticsFormatVersion = 2U;
+constexpr uint16_t kCanDiagnosticsPayloadSize = 380U;
+constexpr uint8_t kCanDiagnosticsWindowActive = 1U << 0U;
+constexpr uint8_t kCanDiagnosticsEpochStable = 1U << 1U;
+constexpr uint8_t kCanDiagnosticsMotorCountersMonotonic = 1U << 2U;
+constexpr uint8_t kCanDiagnosticsMarkersComplete = 1U << 3U;
+constexpr uint8_t kCanDiagnosticsWindowValid =
+    kCanDiagnosticsWindowActive | kCanDiagnosticsEpochStable |
+    kCanDiagnosticsMotorCountersMonotonic |
+    kCanDiagnosticsMarkersComplete;
 
 enum class MessageType : uint8_t
 {
@@ -198,19 +209,47 @@ struct ActionProgressRecord
 
 struct CanDiagnosticsPayload
 {
+    uint16_t format_version;
+    uint16_t payload_size;
+    uint32_t session_epoch;
+    uint8_t motor_marker_mask;
+    uint8_t window_flags;
+    uint16_t reserved0;
+    uint32_t window_reset_count;
     uint64_t window_start_us;
     uint64_t window_duration_us;
     uint32_t target_tx_complete[7];
+    uint32_t position_request[7];
     uint32_t position_response[7];
+    uint32_t position_timeout[7];
+    uint32_t temperature_request[7];
     uint32_t temperature_response[7];
-    uint32_t position_timeout_count;
-    uint32_t temperature_timeout_count;
-    uint32_t tx_abort_count;
-    uint32_t tx_error_count;
-    uint32_t tx_recovery_count;
+    uint32_t temperature_timeout[7];
+    uint8_t motor_tx_drop[7];
+    uint8_t motor_rx_error[7];
+    uint8_t motor_busoff[7];
+    uint8_t reserved_motor[3];
+    uint32_t main_can_busoff[2];
+    uint32_t main_can_rx_overflow[2];
+    uint32_t main_can_rx_high_water[2];
+    uint32_t unexpected_response_count;
+    uint32_t maintenance_response_count;
+    uint32_t query_target_overlap_count;
+    uint32_t target_retry_count;
+    uint32_t target_retry_exhausted_count;
+    uint32_t target_deadline_failure_count;
+    uint32_t main_can_tx_abort[2];
+    uint32_t main_can_tx_error[2];
+    uint32_t main_can_tx_recovery[2];
+    uint32_t main_can_completion_overflow[2];
     uint32_t safety_preemption_count;
     uint32_t max_safety_wait_us;
     uint32_t max_fanout_us;
+    uint32_t max_rx_dispatch_latency_us;
+    uint32_t main_can_rx_frame[2];
+    uint32_t main_can_tx_busy[2];
+    uint32_t transition_failure_count;
+    uint32_t reserved1[3];
 };
 
 struct StatePayload
@@ -255,7 +294,8 @@ static_assert(sizeof(TimeSyncPayload) == 8, "TimeSyncPayload layout changed");
 static_assert(sizeof(TimeSyncAckPayload) == 24, "TimeSyncAckPayload layout changed");
 static_assert(sizeof(ActionProgressPayload) == 20, "ActionProgressPayload layout changed");
 static_assert(sizeof(ActionProgressRecord) == 24, "ActionProgressRecord layout changed");
-static_assert(sizeof(CanDiagnosticsPayload) == 132, "CanDiagnosticsPayload layout changed");
+static_assert(sizeof(CanDiagnosticsPayload) == kCanDiagnosticsPayloadSize,
+              "CanDiagnosticsPayload layout changed");
 static_assert(sizeof(StatePayload) == 508, "StatePayload layout changed");
 
 constexpr size_t kMaxPayload = kMaxDecodedFrame - sizeof(PacketHeader) - kCrcSize;

@@ -38,9 +38,9 @@ class RawSession:
         self.manifest = json.loads(
             (self.session_dir / "manifest.json").read_text(encoding="utf-8")
         )
-        if self.manifest.get("schema_version") not in (2, 3, 4, 5):
+        if self.manifest.get("schema_version") not in (2, 3, 4, 5, 6):
             raise RawSessionError(
-                "session inspection supports Raw Session schema versions 2 through 5"
+                "session inspection supports Raw Session schema versions 2 through 6"
             )
         if self.manifest.get("clean_shutdown") is not True:
             raise RawSessionError("dataset export requires a cleanly finalized raw session")
@@ -77,11 +77,15 @@ class RawSession:
 
     def validate_export_recipe(self, recipe: ExportRecipe) -> None:
         schema_version = self.manifest.get("schema_version")
-        if schema_version == 5:
+        if schema_version in (5, 6):
             if recipe.legacy_mode:
-                raise RawSessionError("Raw Session v5 cannot use the v4 legacy exporter")
+                raise RawSessionError(
+                    f"Raw Session v{schema_version} cannot use the v4 legacy exporter"
+                )
             if recipe.control_hz != 20:
-                raise RawSessionError("Raw Session v5 strict export is fixed at 20 Hz")
+                raise RawSessionError(
+                    f"Raw Session v{schema_version} strict export is fixed at 20 Hz"
+                )
         elif schema_version == 4 and not recipe.legacy_mode:
             raise RawSessionError(
                 "Raw Session v4 export is legacy-only; set legacy_mode=True"
@@ -184,9 +188,11 @@ class RawSession:
         recipe: ExportRecipe,
     ) -> Iterator[DatasetFrame]:
         schema_version = self.manifest.get("schema_version")
-        if schema_version == 5:
+        if schema_version in (5, 6):
             if recipe.legacy_mode:
-                raise RawSessionError("Raw Session v5 cannot use the v4 legacy exporter")
+                raise RawSessionError(
+                    f"Raw Session v{schema_version} cannot use the v4 legacy exporter"
+                )
             yield from self._iter_frames_v5(episode, recipe)
             return
         if schema_version == 4:
@@ -389,7 +395,7 @@ class RawSession:
         db_path = self.session_dir / "samples.sqlite"
         manifest_epoch = self.manifest.get("session_epoch")
         if not isinstance(manifest_epoch, int) or manifest_epoch <= 0:
-            raise RawSessionError("Raw Session v5 manifest has no valid session_epoch")
+            raise RawSessionError("strict Raw Session manifest has no valid session_epoch")
         period_ns = max(1, round(1e9 / recipe.control_hz))
         gap_limit_ns = round(period_ns * 1.5)
         latency_limit_us = round(recipe.max_action_observation_latency_ms * 1_000)

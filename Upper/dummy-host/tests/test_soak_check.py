@@ -12,7 +12,12 @@ from dummy_host.apps.soak_check import (
     evaluate_soak_metrics,
 )
 from dummy_host.domain import ActionLifecycleUpdate, ActionStage
-from dummy_host.protocol import CanDiagnostics
+from dummy_host.protocol import (
+    CAN_DIAGNOSTICS_FORMAT_VERSION,
+    CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+    CAN_DIAGNOSTICS_WINDOW_VALID,
+    CanDiagnostics,
+)
 from dummy_host.recording import ControlTickTiming, SessionRecorder
 from dummy_host.schema import AppliedAction, ControlMode, RobotState
 from dummy_host.teleop import KeyboardMapper, load_teleop_profile
@@ -25,6 +30,7 @@ def _passing_metrics() -> SoakMetrics:
         samples=72_000,
         invalid_samples=0,
         fault_samples=0,
+        hold_samples=0,
         control_rate_hz=20.0,
         coherent_ratio=0.999,
         maximum_feedback_skew_ms=29.0,
@@ -38,9 +44,25 @@ def _passing_metrics() -> SoakMetrics:
         target_ttl_hold_samples=0,
         reliable_rx_overflow=0,
         can_abort_error_count=0,
+        can_recovery_count=0,
+        can_busoff_count=0,
+        can_rx_overflow_count=0,
+        can_completion_overflow_count=0,
+        motor_tx_drop_count=0,
+        motor_rx_error_count=0,
+        motor_busoff_count=0,
+        can_unexpected_response_count=0,
+        target_retry_count=9,
+        target_retry_exhausted_count=0,
+        target_deadline_failure_count=0,
+        transition_failure_count=0,
+        position_timeout_rate=0.0,
+        diagnostic_window_valid=True,
         can_safety_preemption_count=0,
         time_sync_models=7_000,
         maximum_fanout_ms=9.9,
+        maximum_rx_dispatch_latency_ms=0.199,
+        maximum_rx_high_water=16,
         post_feedback_p99_ms=99.9,
         maximum_post_feedback_ms=249.9,
         maximum_serial_safety_wait_ms=9.9,
@@ -62,7 +84,7 @@ def test_v22_soak_metrics_reject_boundary_and_fault_evidence() -> None:
         invalid_samples=1,
         incomplete_action_sequences=1,
         can_abort_error_count=1,
-        maximum_fanout_ms=10.0,
+        maximum_fanout_ms=15.0,
         post_feedback_p99_ms=100.0,
         maximum_serial_safety_wait_ms=10.0,
         target_rate_hz_per_node=(40.0,) * 7,
@@ -80,7 +102,58 @@ def test_v22_soak_metrics_reject_boundary_and_fault_evidence() -> None:
     assert sum("target node" in failure for failure in failures) == 7
 
 
-def test_soak_checker_reads_a_complete_v5_evidence_session(config, tmp_path: Path) -> None:
+def _can_diagnostics(
+    *,
+    epoch: int,
+    start_us: int,
+    duration_us: int,
+    target: int,
+    position: int,
+    temperature: int,
+) -> CanDiagnostics:
+    return CanDiagnostics(
+        format_version=CAN_DIAGNOSTICS_FORMAT_VERSION,
+        payload_size=CAN_DIAGNOSTICS_PAYLOAD_SIZE,
+        session_epoch=epoch,
+        motor_marker_mask=0x7F,
+        window_flags=CAN_DIAGNOSTICS_WINDOW_VALID,
+        window_reset_count=1,
+        window_start_us=start_us,
+        window_duration_us=duration_us,
+        target_tx_complete=(target,) * 7,
+        position_request=(position,) * 7,
+        position_response=(position,) * 7,
+        position_timeout=(0,) * 7,
+        temperature_request=(temperature,) * 7,
+        temperature_response=(temperature,) * 7,
+        temperature_timeout=(0,) * 7,
+        motor_tx_drop=(0,) * 7,
+        motor_rx_error=(0,) * 7,
+        motor_busoff=(0,) * 7,
+        main_can_busoff=(0, 0),
+        main_can_rx_overflow=(0, 0),
+        main_can_rx_high_water=(8, 0),
+        unexpected_response_count=0,
+        maintenance_response_count=0,
+        query_target_overlap_count=0,
+        target_retry_count=0,
+        target_retry_exhausted_count=0,
+        target_deadline_failure_count=0,
+        main_can_tx_abort=(0, 0),
+        main_can_tx_error=(0, 0),
+        main_can_tx_recovery=(0, 0),
+        main_can_completion_overflow=(0, 0),
+        safety_preemption_count=0,
+        max_safety_wait_us=4_000,
+        max_fanout_us=9_000,
+        max_rx_dispatch_latency_us=100,
+        main_can_rx_frame=(position + temperature, 0),
+        main_can_tx_busy=(0, 0),
+        transition_failure_count=0,
+    )
+
+
+def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Path) -> None:
     profile = load_teleop_profile(
         Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
     )
@@ -95,27 +168,20 @@ def test_soak_checker_reads_a_complete_v5_evidence_session(config, tmp_path: Pat
     epoch = 77
     start_ns = 10_000_000_000
     recorder.update_runtime_metadata(
-        firmware_version="dummy-ref-v2.2", session_epoch=epoch
+        firmware_version="dummy-ref-v2.2.1", session_epoch=epoch
     )
     recorder.record_time_sync(
         TimeSyncExchange(start_ns, start_ns // 1000, start_ns // 1000, start_ns),
         TimeSyncModel(1, 1, 1000.0, 0.0, 0, 0.0, 3, start_ns),
     )
     recorder.record_can_diagnostics(
-        CanDiagnostics(
-            start_ns // 1000,
-            1_000_000,
-            (50,) * 7,
-            (40,) * 7,
-            (1,) * 7,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            4_000,
-            9_000,
+        _can_diagnostics(
+            epoch=epoch,
+            start_us=start_ns // 1_000,
+            duration_us=0,
+            target=0,
+            position=0,
+            temperature=0,
         ),
         host_time_ns=start_ns,
     )
@@ -178,6 +244,17 @@ def test_soak_checker_reads_a_complete_v5_evidence_session(config, tmp_path: Pat
                     control_tick_id=index,
                 )
             )
+    recorder.record_can_diagnostics(
+        _can_diagnostics(
+            epoch=epoch,
+            start_us=start_ns // 1_000,
+            duration_us=1_000_000,
+            target=50,
+            position=40,
+            temperature=1,
+        ),
+        host_time_ns=start_ns + 1_000_000_000,
+    )
     recorder.record_event(
         "collection_stopped", monotonic_ns=start_ns + 1_000_000_000
     )

@@ -20,7 +20,11 @@ def test_render_firmware_header_contains_safety_critical_values(config: RobotCon
     assert f'constexpr char kRobotCalibrationId[] = "{config.robot_calibration_id}";' in header
     assert f"constexpr uint32_t kConfigVersion = {config.config_version}U;" in header
     assert "constexpr bool kHardwareParametersVerified = true;" in header
-    assert "constexpr bool kExternalTargetExecutionReady = true;" in header
+    assert "constexpr bool kExternalTargetExecutionReady = false;" in header
+    assert "constexpr uint32_t kCanNodeQuietUs = 5000U;" in header
+    assert "constexpr uint32_t kCanResponseTimeoutUs = 4000U;" in header
+    assert "constexpr uint32_t kCanTxAbortTimeoutUs = 5000U;" in header
+    assert "constexpr uint32_t kCanTargetFanoutTimeoutUs = 15000U;" in header
     assert "constexpr float kGripperVelocityLimitPerS = 0.2F;" in header
     assert "constexpr uint32_t kFeedbackHoldMs = 100U;" in header
     assert "constexpr uint32_t kFeedbackFaultMs = 500U;" in header
@@ -41,7 +45,7 @@ def test_urdf_coordinate_mapping_contract(config: RobotConfig) -> None:
     firmware_rest_rad = np.deg2rad(np.asarray([0.0, -70.0, 180.0, 0.0, 0.0, 0.0]))
     urdf_rest_rad = config.joint_sign * (firmware_rest_rad - config.joint_zero_offset_rad)
 
-    assert config.config_version == 7
+    assert config.config_version == 8
     np.testing.assert_array_equal(config.joint_reduction, np.full(6, 50.0))
     np.testing.assert_allclose(urdf_rest_rad, config.initial_pose_rad, atol=1e-6)
     np.testing.assert_allclose(
