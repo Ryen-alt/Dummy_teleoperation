@@ -9,6 +9,12 @@
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 
+#ifndef MOTOR_DEBUG_UART
+#define MOTOR_DEBUG_UART 0
+#endif
+
+#define MOTOR_DEBUG_UART_TIMEOUT_MS 20U
+
 UART_HandleTypeDef *gHuart;
 
 void RetargetInit(UART_HandleTypeDef *huart)
@@ -33,8 +39,22 @@ int _write(int fd, char *ptr, int len)
 {
     if (fd == STDOUT_FILENO || fd == STDERR_FILENO)
     {
-        // ToDo: Change this to DMA version
-        HAL_UART_Transmit(gHuart, (uint8_t *) ptr, len, HAL_MAX_DELAY);
+#if MOTOR_DEBUG_UART
+        if (__get_IPSR() != 0U || gHuart == NULL || ptr == NULL || len < 0)
+        {
+            errno = EWOULDBLOCK;
+            return -1;
+        }
+        if (HAL_UART_Transmit(gHuart, (uint8_t *) ptr, (uint16_t) len,
+                             MOTOR_DEBUG_UART_TIMEOUT_MS) != HAL_OK)
+        {
+            errno = EIO;
+            return -1;
+        }
+#else
+        (void) ptr;
+        (void) len;
+#endif
         return len;
     } else
         return -1;

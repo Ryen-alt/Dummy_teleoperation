@@ -55,7 +55,6 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             }
             motor.controller->SetPositionSetPoint(
                 (int32_t) (*(float*) RxData * (float) motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS));
-            printf("SET MOTOR[0x05] POSITION[]\r\n");
             if (_data[4]) // Need Position & Finished ACK
             {
                 tmpF = motor.controller->GetPosition();
@@ -214,7 +213,6 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             _data[4] = motor.controller->state == Motor::STATE_FINISH ? 1 : 0;
             txHeader.StdId = (boardConfig.canNodeId << 7) | 0x23;
             CAN_Send(&txHeader, _data);
-//            printf("CAN SEND BACK to NODE[%d]\n", boardConfig.canNodeId );
         }
             break;
         case 0x24: // Get Offset
@@ -256,4 +254,3 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
     }
 
 }
-
