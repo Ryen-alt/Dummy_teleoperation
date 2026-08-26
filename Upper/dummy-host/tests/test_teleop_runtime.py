@@ -312,6 +312,15 @@ def test_idle_fake_mcu_collection_keeps_state_fresh(
     assert result.final_mode == "HOLD"
     assert source.closed
     assert not robot.is_connected
+    with sqlite3.connect(recorder.db_path) as connection:
+        exchanges = connection.execute(
+            "SELECT COUNT(*) FROM time_sync_exchanges"
+        ).fetchone()
+        diagnostics = connection.execute(
+            "SELECT COUNT(*) FROM can_diagnostics"
+        ).fetchone()
+    assert exchanges is not None and exchanges[0] >= 1
+    assert diagnostics is not None and diagnostics[0] >= 1
 
 
 def test_stray_episode_failure_while_idle_does_not_abort_teleoperation(

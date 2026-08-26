@@ -14,8 +14,10 @@ from dummy_host.domain import (
     ActionStage,
 )
 from dummy_host.recording import ControlTickTiming, SessionRecorder
+from dummy_host.protocol import CanDiagnostics
 from dummy_host.schema import AppliedAction, ControlMode, RobotState, load_robot_config
 from dummy_host.teleop import TeleopCommand, load_teleop_profile
+from dummy_host.time_sync import TimeSyncExchange, TimeSyncModel
 
 from .act_smoke import TEMP_CLASSIFICATION
 
@@ -56,7 +58,7 @@ def create_temp_raw_session(
         config,
         profile,
         source="synthetic_temp_pipeline_fixture",
-        firmware_version="dummy-ref-v2.1-fixture-not-hardware",
+        firmware_version="dummy-ref-v2.2-fixture-not-hardware",
         session_name=session_name,
         queue_size=max(256, episodes * frames_per_episode * 10 + 16),
         extra_manifest={
@@ -69,6 +71,33 @@ def create_temp_raw_session(
         },
     )
     base_ns = 20_000_000_000
+    session_epoch = 0x54454D50
+    recorder.update_runtime_metadata(
+        firmware_version="dummy-ref-v2.2-fixture-not-hardware",
+        session_epoch=session_epoch,
+    )
+    recorder.record_time_sync(
+        TimeSyncExchange(base_ns, base_ns // 1000, base_ns // 1000, base_ns),
+        TimeSyncModel(1, 1, 1000.0, 0.0, 0, 0.0, 3, base_ns),
+    )
+    recorder.record_can_diagnostics(
+        CanDiagnostics(
+            base_ns // 1000,
+            1_000_000,
+            (50,) * 7,
+            (40,) * 7,
+            (1,) * 7,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2_000,
+        ),
+        host_time_ns=base_ns,
+    )
     episode_stride_ns = frames_per_episode * 50_000_000 + 2_000_000
     sequence = 0
     for episode_index in range(episodes):
@@ -131,9 +160,11 @@ def create_temp_raw_session(
                     ActionProgressRecord(
                         sequence=sequence,
                         flags=int(ActionProgressFlags.CAN_QUEUED_EXACT)
+                        | int(ActionProgressFlags.CAN_TX_COMPLETE_EXACT)
                         | int(ActionProgressFlags.POST_COMMAND_FEEDBACK),
                         can_queued_mcu_us=tick_ns // 1000 + 2_000,
-                        post_feedback_mcu_us=tick_ns // 1000 + 3_000,
+                        can_tx_complete_mcu_us=tick_ns // 1000 + 3_000,
+                        post_feedback_mcu_us=tick_ns // 1000 + 4_000,
                         feedback_sweep_id=frame_index + 1,
                     ),
                 ),
@@ -146,6 +177,8 @@ def create_temp_raw_session(
                 clipped=False,
                 reasons=(),
                 source="synthetic_temp_pipeline_fixture",
+                session_epoch=session_epoch,
+                control_tick_id=sequence,
             )
             frames = {}
             for role, is_global in (("wrist", False), ("global", True)):
@@ -158,7 +191,7 @@ def create_temp_raw_session(
                 frames[role] = CameraFrame(
                     color=rgb,
                     depth=None,
-                    capture_time_ns=tick_ns,
+                    capture_time_ns=tick_ns + 1_000_000,
                     arrival_time_ns=tick_ns + 1_000_000,
                     device_timestamp_ms=sequence * 50.0,
                     frame_number=sequence,
@@ -167,6 +200,7 @@ def create_temp_raw_session(
                     color_depth_skew_ms=0.0,
                     role=role,
                     calibration_version="uncalibrated-v0",
+                    timestamp_source="arrival",
                 )
             recorder.record_sample(
                 command,
@@ -191,6 +225,7 @@ def create_temp_raw_session(
                     ActionStage.SERIAL_SEND_FINISHED,
                     ActionStage.ACKNOWLEDGED,
                     ActionStage.CAN_QUEUED_EXACT,
+                    ActionStage.CAN_TX_COMPLETE_EXACT,
                     ActionStage.POST_COMMAND_FEEDBACK,
                 )
             ):
@@ -200,6 +235,8 @@ def create_temp_raw_session(
                         stage,
                         tick_ns + offset_ns * 400_000,
                         mcu_time_us=tick_ns // 1000 + offset_ns * 400,
+                        session_epoch=session_epoch,
+                        control_tick_id=sequence,
                     )
                 )
         recorder.record_event(
@@ -213,7 +250,7 @@ def create_temp_raw_session(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create a synthetic v2.0-shaped TEMP Raw Session for offline pipeline tests"
+        description="Create a synthetic Raw Session v5 TEMP fixture for offline pipeline tests"
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--input-config", required=True)

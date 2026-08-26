@@ -14,12 +14,14 @@ from .protocol import (
     CAPABILITY_TIME_SYNC,
     CAPABILITY_CAN_DIAGNOSTICS,
     ACQUIRE_CONTROL,
+    CanDiagnostics,
     SET_MODE,
     MessageType,
     Packet,
     ResultCode,
     StreamDecoder,
     pack_ack,
+    pack_can_diagnostics,
     pack_hello_ack,
     pack_state,
     pack_time_sync_ack,
@@ -207,6 +209,32 @@ class FakeMcuTransport:
                     packet,
                     MessageType.TIME_SYNC_ACK,
                     pack_time_sync_ack(host_t0_ns, mcu_us, mcu_us),
+                )
+            )
+            return
+        if packet.message_type == MessageType.GET_CAN_DIAGNOSTICS:
+            now_us = self.clock_ns() // 1_000
+            self._rx.put(
+                self._response(
+                    packet,
+                    MessageType.CAN_DIAGNOSTICS,
+                    pack_can_diagnostics(
+                        CanDiagnostics(
+                            window_start_us=max(0, now_us - 1_000_000),
+                            window_duration_us=min(now_us, 1_000_000),
+                            target_tx_complete=(0,) * 7,
+                            position_response=(0,) * 7,
+                            temperature_response=(0,) * 7,
+                            position_timeout_count=0,
+                            temperature_timeout_count=0,
+                            tx_abort_count=0,
+                            tx_error_count=0,
+                            tx_recovery_count=0,
+                            safety_preemption_count=0,
+                            max_safety_wait_us=0,
+                            max_fanout_us=0,
+                        )
+                    ),
                 )
             )
             return

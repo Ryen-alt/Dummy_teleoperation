@@ -62,6 +62,12 @@ def export_raw_session(
             (session.session_dir / "checksums.json").read_bytes()
         ).hexdigest(),
         "raw_session_schema_version": session.manifest.get("schema_version"),
+        "evidence_level": (
+            "v4_legacy_can_queued_only"
+            if session.manifest.get("schema_version") == 4
+            else "v5_exact_tx_affine_clock"
+        ),
+        "legacy_export": recipe.legacy_mode,
         "robot_config_hash": session.manifest.get("robot_config_hash"),
         "robot_calibration_id": session.manifest.get("robot_calibration_id"),
         "camera_rig_id": session.manifest.get("camera_rig_id"),

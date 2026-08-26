@@ -20,6 +20,7 @@ class ExportRecipe:
     include_depth: bool = False
     allow_uncalibrated_cameras: bool = False
     require_temporary_source: bool = False
+    legacy_mode: bool = False
     max_action_observation_latency_ms: float = 250.0
     metadata: Mapping[str, object] = field(default_factory=dict)
 
@@ -57,6 +58,7 @@ class ExportRecipe:
                 self.include_depth,
                 self.allow_uncalibrated_cameras,
                 self.require_temporary_source,
+                self.legacy_mode,
             )
         ):
             raise ValueError("recipe camera and source gates must be boolean")
@@ -80,6 +82,7 @@ class ExportRecipe:
             "include_depth": self.include_depth,
             "allow_uncalibrated_cameras": self.allow_uncalibrated_cameras,
             "require_temporary_source": self.require_temporary_source,
+            "legacy_mode": self.legacy_mode,
             "max_action_observation_latency_ms": self.max_action_observation_latency_ms,
             "metadata": dict(self.metadata),
         }

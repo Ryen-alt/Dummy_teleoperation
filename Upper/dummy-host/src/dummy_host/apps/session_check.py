@@ -62,12 +62,11 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
     except (TypeError, ValueError):
         manifest_schema_version = 0
         errors.append("manifest schema_version is invalid")
-    if (
-        manifest_schema_version >= 4
-        and manifest.get("binary_protocol_version") != PROTOCOL_VERSION
-    ):
+    expected_protocol = {4: 4, 5: PROTOCOL_VERSION}.get(manifest_schema_version)
+    if expected_protocol is not None and manifest.get("binary_protocol_version") != expected_protocol:
         errors.append(
-            "Raw Session schema v4 requires binary protocol v4 evidence; "
+            f"Raw Session schema v{manifest_schema_version} requires binary protocol "
+            f"v{expected_protocol} evidence; "
             f"found {manifest.get('binary_protocol_version')!r}"
         )
     for relative, expected in expected_files.items():
@@ -134,6 +133,55 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
         integrity_row = connection.execute("PRAGMA integrity_check").fetchone()
         integrity = "missing" if integrity_row is None else str(integrity_row[0])
         schema_version = manifest_schema_version
+        if schema_version >= 5:
+            required_columns = {
+                "samples": {
+                    "session_epoch",
+                    "control_tick_id",
+                    "time_sync_model_id",
+                    "coherent_reference_mcu_us",
+                },
+                "camera_samples": {"timestamp_source"},
+                "action_lifecycle": {
+                    "session_epoch",
+                    "control_tick_id",
+                    "can_tx_complete_exact_host_ns",
+                    "can_tx_complete_exact_mcu_us",
+                    "accepted_to_ack_host_ns",
+                    "ack_to_can_tx_complete_us",
+                    "can_tx_complete_to_post_feedback_us",
+                },
+                "time_sync_models": {
+                    "model_id",
+                    "segment_id",
+                    "slope_ns_per_us",
+                    "intercept_ns",
+                    "rtt_ns",
+                    "residual_ns",
+                },
+                "time_sync_exchanges": {"rtt_ns", "model_id"},
+                "can_diagnostics": {"max_fanout_us", "tx_error_count"},
+            }
+            table_names = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            for table, expected_columns in required_columns.items():
+                if table not in table_names:
+                    errors.append(f"Raw Session v5 is missing table {table}")
+                    continue
+                actual_columns = {
+                    str(row[1])
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                missing = sorted(expected_columns - actual_columns)
+                if missing:
+                    errors.append(
+                        f"Raw Session v5 table {table} is missing columns: "
+                        + ", ".join(missing)
+                    )
         if schema_version >= 3:
             sample_row = connection.execute(
                 """
@@ -180,6 +228,33 @@ def check_session(session_dir: str | Path) -> SessionCheckReport:
             ).fetchone()
             referenced_paths = set()
             referenced = 0 if legacy is None else int(legacy[0])
+        if schema_version >= 5:
+            invalid_camera_sources = connection.execute(
+                """
+                SELECT COUNT(*) FROM camera_samples
+                WHERE timestamp_source NOT IN ('hardware_exposure', 'arrival')
+                """
+            ).fetchone()
+            missing_epoch = connection.execute(
+                """
+                SELECT COUNT(*) FROM samples
+                WHERE action_sequence IS NOT NULL
+                  AND (session_epoch = 0 OR control_tick_id = 0)
+                """
+            ).fetchone()
+            model_count = connection.execute(
+                "SELECT COUNT(*) FROM time_sync_models"
+            ).fetchone()
+            if invalid_camera_sources and int(invalid_camera_sources[0]) > 0:
+                errors.append(
+                    "Raw Session v5 contains camera frames without an explicit timestamp source"
+                )
+            if missing_epoch and int(missing_epoch[0]) > 0:
+                errors.append(
+                    "Raw Session v5 action samples are missing session epoch/control tick identity"
+                )
+            if model_count and int(model_count[0]) == 0:
+                warnings.append("Raw Session v5 contains no fitted time-sync model")
         connection.close()
     except sqlite3.Error as exc:
         raise SessionCheckError(f"cannot validate samples.sqlite: {exc}") from exc

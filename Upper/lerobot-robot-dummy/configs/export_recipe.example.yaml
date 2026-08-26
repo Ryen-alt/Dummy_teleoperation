@@ -7,6 +7,7 @@ accepted_outcomes: [accepted]
 include_depth: false
 allow_uncalibrated_cameras: false
 require_temporary_source: false
+legacy_mode: false
 metadata:
   description: Accepted dual-camera teleoperation episodes with applied actions as labels
   image_color_space: RGB

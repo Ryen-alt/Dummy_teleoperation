@@ -73,6 +73,8 @@ def test_applied_action_retains_source_and_canonical_value(config) -> None:
         )
         result = robot.submit_action(proposal)
         assert result.source == "contract-test"
+        assert result.session_epoch == robot.session_id
+        assert result.control_tick_id > 0
         np.testing.assert_array_equal(result.canonical, result.applied)
         assert not result.applied.flags.writeable
     finally:

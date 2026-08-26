@@ -24,6 +24,7 @@ from .teleop import (
     TeleopError,
     TeleopProfile,
 )
+from .time_sync import AffineTimeSyncEstimator
 from .transport_serial import TransportError
 
 
@@ -106,6 +107,66 @@ class _InputWorker:
             self.error = exc
             with self.condition:
                 self.condition.notify_all()
+
+
+class _EvidenceTelemetryWorker:
+    """Collect protocol-v5 clock and CAN evidence away from the 20 Hz loop."""
+
+    def __init__(
+        self,
+        robot: DummyRobot,
+        recorder: SessionRecorder,
+        *,
+        clock_ns: Callable[[], int],
+    ) -> None:
+        self.robot = robot
+        self.recorder = recorder
+        self.clock_ns = clock_ns
+        self.estimator = AffineTimeSyncEstimator()
+        self.stop = Event()
+        self.lock = Lock()
+        self.error: BaseException | None = None
+        self.thread = Thread(
+            target=self._run, name="dummy-evidence-telemetry", daemon=True
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def snapshot_error(self) -> BaseException | None:
+        with self.lock:
+            return self.error
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        next_sync = 0.0
+        next_diagnostics = 0.0
+        try:
+            while not self.stop.is_set():
+                now = time.monotonic()
+                if now >= next_sync:
+                    exchange = self.robot.time_sync()
+                    self.recorder.record_time_sync(
+                        exchange, self.estimator.observe(exchange)
+                    )
+                    next_sync = now + 0.5
+                if now >= next_diagnostics:
+                    self.recorder.record_can_diagnostics(
+                        self.robot.read_can_diagnostics(),
+                        host_time_ns=self.clock_ns(),
+                    )
+                    next_diagnostics = now + 1.0
+                wait_s = max(
+                    0.001,
+                    min(next_sync, next_diagnostics) - time.monotonic(),
+                )
+                self.stop.wait(wait_s)
+        except BaseException as exc:
+            with self.lock:
+                self.error = exc
 
 
 class _LeaseCoordinator:
@@ -511,6 +572,7 @@ def run_teleop_collection(
     scheduler_stats = SchedulerStats(0, 0, 0.0, 0.0, 0.0)
     deadline_ns = None if duration_s is None else clock_ns() + int(duration_s * 1e9)
     lease: _LeaseCoordinator | None = None
+    evidence_telemetry: _EvidenceTelemetryWorker | None = None
     control_had_lease = False
     hold_latched = False
     last_control_start_ns: int | None = None
@@ -610,8 +672,15 @@ def run_teleop_collection(
 
     try:
         robot.connect()
-        recorder.update_runtime_metadata(firmware_version=robot.firmware_version or "unknown")
+        recorder.update_runtime_metadata(
+            firmware_version=robot.firmware_version or "unknown",
+            session_epoch=robot.session_id,
+        )
         robot.set_action_lifecycle_listener(lifecycle)
+        evidence_telemetry = _EvidenceTelemetryWorker(
+            robot, recorder, clock_ns=clock_ns
+        )
+        evidence_telemetry.start()
         robot.hold()
         final_state = robot.read_state()
         if teleop_mode == "cartesian" and not robot.transport.is_simulated:
@@ -677,6 +746,15 @@ def run_teleop_collection(
                 stop.set()
                 return
             assert lease is not None
+            assert evidence_telemetry is not None
+            telemetry_error = evidence_telemetry.snapshot_error()
+            if telemetry_error is not None:
+                fail_active_episode(
+                    f"evidence_telemetry_failed: {telemetry_error}", now_ns
+                )
+                raise TeleopError(
+                    f"time-sync/CAN evidence thread failed: {telemetry_error}"
+                ) from telemetry_error
             acquired, lease_error = lease.snapshot()
             if lease_error is not None:
                 fail_active_episode(f"lease_thread_failed: {lease_error}", now_ns)
@@ -1381,6 +1459,8 @@ def run_teleop_collection(
                 )
             if lease is not None:
                 lease.close()
+            if evidence_telemetry is not None:
+                evidence_telemetry.close()
             robot.set_action_lifecycle_listener(None)
             if robot.is_connected:
                 try:

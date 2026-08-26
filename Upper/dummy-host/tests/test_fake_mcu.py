@@ -97,6 +97,18 @@ def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
         assert robot.read_state().mode == ControlMode.HOLD
 
 
+def test_protocol_v5_time_sync_and_can_diagnostics(config) -> None:
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    with robot:
+        exchange = robot.time_sync()
+        assert exchange.host_t3_ns >= exchange.host_t0_ns
+        assert exchange.mcu_tx_us >= exchange.mcu_rx_us
+        assert exchange.rtt_ns >= 0
+        diagnostics = robot.read_can_diagnostics()
+        assert len(diagnostics.target_tx_complete) == 7
+        assert diagnostics.window_duration_us >= 0
+
+
 def test_target_keepalive_is_exact_and_heartbeat_does_not_refresh_target(config) -> None:
     robot = DummyRobot(config, FakeMcuTransport(config))
     with robot:

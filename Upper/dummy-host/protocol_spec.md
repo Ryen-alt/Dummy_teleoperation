@@ -1,174 +1,192 @@
-# Dummy Host ↔ MCU Binary Protocol v4
+# Dummy Host ↔ MCU Binary Protocol v5
 
 All multi-byte values are little-endian. A wire frame is
-`COBS(header || payload || crc32c) || 0x00`. CRC32C covers the unencoded header
-and payload. The maximum decoded frame is 512 bytes. Protocol v4 production
-peers must report firmware version `dummy-ref-v2.1`; the host rejects every
-other real-firmware version even when the configuration hash matches.
+`COBS(header || payload || crc32c) || 0x00`; CRC32C covers the decoded header
+and payload. The maximum decoded frame is 576 bytes. A real peer must report
+firmware `dummy-ref-v2.2`; v4/v5 peers never share a control session.
 
-## Header
+## Header and epoch
 
 ```c
 struct PacketHeader {       // 24 bytes, packed
     uint16_t magic;         // 0x4459
-    uint8_t  version;       // 4
+    uint8_t  version;       // 5
     uint8_t  message_type;
     uint16_t payload_length;
     uint16_t flags;
-    uint32_t session_id;
+    uint32_t session_id;    // non-zero session_epoch
     uint32_t sequence;
     uint64_t sender_time_us;
 };
 ```
 
-Message values: `HELLO=0x01`, `ACQUIRE_CONTROL=0x02`, `RELEASE_CONTROL=0x03`,
-`SET_MODE=0x04`, `HEARTBEAT=0x05`, `SET_JOINT_TARGET=0x06`, `HOLD=0x07`,
-`ESTOP=0x08`, `CLEAR_FAULT=0x09`, `TARGET_KEEPALIVE=0x0a`,
-`HELLO_ACK=0x81`, `STATE=0x82`,
-`ACK=0x83`, `NACK=0x84`, `FAULT=0x85`, `EVENT=0x86`.
+Every connection creates a random non-zero `session_id`, used end-to-end as the
+`session_epoch`. HELLO clears stale firmware progress and sequence replay state.
+ACQUIRE activates the epoch but does not reset sequence when repeated within the
+same epoch. Sequence comparison is uint32 modular ordering and skips zero.
 
-Modes: `DISABLED=1`, `HOLD=2`, `TELEOP=3`, `POLICY=4`, `GRAVITY=5`,
-`FAULT=6`. Training/policy code cannot send messages directly; it must pass
-through the host safety layer.
+Message values are:
 
-## Payloads
+- Requests: `HELLO=0x01`, `ACQUIRE_CONTROL=0x02`, `RELEASE_CONTROL=0x03`,
+  `SET_MODE=0x04`, `HEARTBEAT=0x05`, `SET_JOINT_TARGET=0x06`, `HOLD=0x07`,
+  `ESTOP=0x08`, `CLEAR_FAULT=0x09`, `TARGET_KEEPALIVE=0x0a`,
+  `TIME_SYNC=0x0b`, `GET_CAN_DIAGNOSTICS=0x0c`.
+- Responses/telemetry: `HELLO_ACK=0x81`, `STATE=0x82`, `ACK=0x83`,
+  `NACK=0x84`, `FAULT=0x85`, `EVENT=0x86`, `TIME_SYNC_ACK=0x87`,
+  `CAN_DIAGNOSTICS=0x88`.
+
+Modes are `DISABLED=1`, `HOLD=2`, `TELEOP=3`, `POLICY=4`, `GRAVITY=5`,
+`FAULT=6`. Policy code cannot write protocol packets directly; all actions pass
+through the host ActionGateway and SafetyFilter.
+
+## Capabilities
+
+HELLO and HELLO_ACK carry a uint32 capability mask. The v5 host requires:
+
+```text
+MULTI_CHANNEL_SEQUENCE     0x00000001
+TARGET_KEEPALIVE           0x00000002
+CAN_TX_COMPLETE_EXACT      0x00000004
+CONTROL_FRESHNESS_TOKEN    0x00000008
+TIME_SYNC                  0x00000010
+CAN_DIAGNOSTICS            0x00000020
+```
+
+## Control payloads
 
 - `HELLO`: `uint8 config_sha256[32]; uint32 capabilities`
 - `HELLO_ACK`: `uint8 config_sha256[32]; uint32 capabilities; char firmware_version[32]`
 - `ACQUIRE_CONTROL`: `uint32 lease_ms`
 - `SET_MODE`: `uint8 mode`
-- `SET_JOINT_TARGET`: `float target[7]; float max_velocity[6]; uint16 valid_for_ms; uint16 target_flags`
-- `TARGET_KEEPALIVE`: `uint32 action_sequence`
+- `SET_JOINT_TARGET` (58 bytes): `float target[7]; float max_velocity[6];`
+  `uint16 valid_for_ms; uint16 target_flags; uint32 control_tick_id`
+- `TARGET_KEEPALIVE`: `uint32 action_sequence; uint32 control_tick_id`
 - `ACK/NACK`: `uint8 request_type; uint8 result; uint16 detail`
-- `ACTION_PROGRESS EVENT`（20 bytes）: `uint32 action_sequence; uint8 stage;`
-  `uint8 reserved[3]; uint64 stage_time_us; uint32 feedback_sweep_id`
-- `STATE`（484 bytes）: `uint64 mcu_time_us; float position[7]; float velocity[7];`
-  `uint32 last_received_sequence; uint8 mode;`
-  `uint8 validity; uint16 fault_bits; uint32 target_age_ms; uint8 config_sha256[32];`
-  `float following_error[7]; uint32 following_error_duration_ms[7];`
-  `uint32 feedback_age_ms[7]; uint32 feedback_loss_count[7];`
-  `uint16 consecutive_feedback_loss[7]; uint16 node_fault_bits[7];`
-  `uint8 node_validity[7]; uint8 can_transport_status; uint16 hold_reason_bits;`
-  `uint16 telemetry_validity; uint64 feedback_sample_mcu_us[7];`
-  `uint32 feedback_sweep_id[7]; uint32 coherent_sweep_id;`
-  `uint32 feedback_max_skew_us; uint64 coherent_reference_mcu_us;`
-  `uint8 state_flags; uint8 action_progress_count; uint8 action_progress_head;`
-  `uint8 progress_reserved; ActionProgressRecord action_progress[6]`
+- `TIME_SYNC`: `uint64 host_t0_ns`
+- `TIME_SYNC_ACK`: `uint64 host_t0_ns; uint64 mcu_rx_us; uint64 mcu_tx_us`
 
-`ActionProgressRecord` is a compact 20-byte replay entry containing sequence,
-flags, the low 32 bits of CAN/post-feedback MCU times and the feedback sweep ID.
-The host extends those low timestamps against `STATE.mcu_time_us`. Flags are
-`CAN_QUEUED_EXACT=0x01`, `POST_COMMAND_FEEDBACK=0x02` and
-`SUPERSEDED=0x04`. `state_flags & 0x01` means this 50 Hz STATE repeats the
-previous coherent sweep and therefore reuses its velocity estimate.
-
-`STATE.validity`: bit 0 joint position, bit 1 velocity, bit 2 gripper feedback.
-`ACK.result=0` means accepted. NACK result codes are defined in the source enum.
-`target_age_ms` is the age of the latest accepted target or exact-sequence target
-keepalive, not the age of the lease heartbeat.
-`HELLO/HELLO_ACK capabilities & 0x00000001` declares the v2.1 multi-channel
-sequence model. A real host requires the bit so an earlier v2.1 image with the
-single global sequence watermark cannot be mixed into this transport.
-`capabilities & 0x00000002` declares exact-sequence target keepalive support;
-the current real host requires both bits.
-
-`hold_reason_bits`: target TTL `0x0001`, lease `0x0002`, following error `0x0004`,
-CAN feedback stale `0x0008`, operator HOLD `0x0010`, runtime limiter `0x0020`.
-`fault_bits`: ESTOP `0x0001`, persistent feedback loss `0x0002`, over-temperature
-`0x0004`; encoder/stall/over-current reserve `0x0008/0x0010/0x0020`.
-
-`node_validity` makes source availability explicit: bit 0 position and bit 1
-temperature. Bits 2/3/4 are encoder-fault/stall/current source availability. The
-current CtrlStep CAN response does not expose those three sources, so firmware must
-leave both their validity and fault bits clear rather than infer them from following
-error. `feedback_age_ms=0xffffffff` means that node has never supplied position.
-
-The firmware computes following error against the 200 Hz acceleration-limited
-command, not the farther-away Linux input target. A persisted following error or
-short feedback outage requests HOLD. Feedback loss beyond the configured severe
-threshold and persisted measured over-temperature request a latched FAULT.
-
-The response packet repeats the request sequence. A new control acquisition uses
-a new non-zero `session_id`. Targets are absolute `[joint1..joint6, gripper]`,
-joint units are radians in the URDF joint convention, and the gripper is normalized
-to `[0,1]`. Both `SET_JOINT_TARGET` and `STATE` use this same convention; the CAD/
-URDF zero pose is therefore six joint zeros. The MCU keeps the historical firmware
-angles internal and converts only at the binary boundary:
+Targets are absolute `[joint1..joint6, gripper]`. Joint values use URDF radians;
+the gripper is normalized to `[0,1]`. The firmware keeps historical motor angles
+internal and converts only at the binary boundary:
 
 ```text
 q_urdf     = joint_sign * (q_firmware - joint_zero_offset_rad)
 q_firmware = joint_zero_offset_rad + joint_sign * q_urdf
 ```
 
-For configuration version 7 the firmware-zero vector is
-`[0, -73°, 180°, 0, 0, 0]` and the sign vector is `[+1,+1,+1,-1,+1,-1]`.
-ASCII maintenance commands remain historical firmware coordinates in degrees and
-must not be mixed with binary/URDF values. Older recordings must not be replayed
-as version-7 targets; the configuration hash makes this mismatch explicit.
-Until physical limit calibration is complete, the controller soft limits are the
-intersection of the URDF limits and the historical firmware-safe range, expressed
-in URDF coordinates. They may therefore be narrower than the mechanical URDF limits.
+`HEARTBEAT` extends only the 500 ms lease. Each healthy 20 Hz host control tick
+creates a new non-zero `control_tick_id`. A new target consumes that token;
+TARGET_KEEPALIVE may consume a later token exactly once for the named active
+action. Duplicate, backward, stale-epoch or wrong-action tokens are rejected.
+The 200 ms target TTL therefore still enters HOLD if the control loop stalls,
+even when the independent lease heartbeat remains healthy.
 
-Protocol v4 and older protocol versions must not share a control session. Reliable
-control and latest-value motion targets each use independent uint32 serial-number
-ordering across wrap. This is required because a newer heartbeat may legitimately
-overtake an older target at the priority writer. The MCU must reject wrong
-version/hash/session/mode, non-increasing sequence within either channel, expired
-TTL, non-finite or out-of-limit values. Target
-timeout and lease timeout transition to HOLD locally; Linux is not a hard-real-time
-safety boundary.
+## State and action progress
 
-`HEARTBEAT` extends only the control lease and never the active target deadline.
-`TARGET_KEEPALIVE` is generated from a fresh control-thread tick, names the exact
-currently active action sequence, and extends that target by its original TTL.
-The keepalive worker does not repeat stale requests autonomously: if the control
-thread stalls, target expiry still enters HOLD even while lease heartbeats remain
-healthy. While an action has not reached `CAN_QUEUED_EXACT`, the host advances
-only its integration time anchor, refreshes that action when necessary, and does
-not enqueue a newer motion target.
+`STATE` is 508 bytes and the complete decoded frame is 536 bytes. Its fixed
+fields contain MCU time, seven positions and velocities, mode/fault/validity,
+configuration hash, following-error and per-node feedback diagnostics, coherent
+sweep identity/reference time, repeated-state flag, and six progress records.
 
-The v2.1 production CAN plan runs a 700 Hz dispatcher: target writes are
-50 Hz/node, position queries 40 Hz/node and temperature queries 1 Hz/node. This
-is 637 MCU-scheduled frames/s and about 924 total frames/s including responses.
-Only one query may be outstanding, missed deadlines are rebased without burst
-replay, and coherent sweeps are valid only when seven-node skew is at most 30 ms.
+Each 24-byte `ActionProgressRecord` contains:
 
-An action advances only through exact evidence:
-`RECEIVED → SAFETY_ACCEPTED → SEND_ENQUEUED → SERIAL_SEND_STARTED →`
-`SERIAL_SEND_FINISHED → ACKNOWLEDGED → CAN_QUEUED_EXACT →`
-`POST_COMMAND_FEEDBACK`. `CAN_QUEUED_EXACT` means that exact sequence was queued
-for all seven actuator nodes. `POST_COMMAND_FEEDBACK` means a later complete
-coherent sweep was received; it does not mean the target was reached. Firmware
-emits fast EVENT notifications and repeats the latest six consolidated progress
-records in STATE. Host and exporter de-duplicate strictly by equal sequence—newer
-sequences never imply completion of older ones.
+```c
+uint32_t action_sequence;
+uint8_t  flags;
+uint8_t  reserved[3];
+uint32_t can_queued_mcu_us_low;
+uint32_t can_tx_complete_mcu_us_low;
+uint32_t post_feedback_mcu_us_low;
+uint32_t feedback_sweep_id;
+```
 
-## Keyboard/gamepad application boundary
+The host extends low timestamps against `STATE.mcu_time_us`. Flags are
+`CAN_QUEUED_EXACT=0x01`, `CAN_TX_COMPLETE_EXACT=0x02`,
+`POST_COMMAND_FEEDBACK=0x04`, `SUPERSEDED=0x08`,
+`PREEMPTED_BY_SAFETY=0x10`, and `FAILED=0x20`.
 
-Keyboard key codes, gamepad axes, button names, dead-man state and Episode keys
-are Linux application data. They are never sent to the MCU as device-specific
-messages. The host performs the following conversion at the configured 20 Hz:
+EVENT uses the full 20-byte action-progress payload:
+`uint32 sequence; uint8 stage; uint8 reserved[3]; uint64 stage_time_us;`
+`uint32 feedback_sweep_id`. EVENT is the fast path; STATE replay is the loss
+recovery path. The host de-duplicates by equal `(session_epoch, sequence)`.
 
-1. evdev snapshot -> timestamped `TeleopCommand` containing six joint velocities,
-   gripper velocity, dead-man, HOLD/ESTOP and source;
-2. per-run joint/gripper allow-list -> acceleration-limited integration from the
-   latest valid measured state;
-3. common `DummyRobot` safety filter -> absolute float32 target and a velocity
-   ceiling no greater than `robot_config.yaml`;
-4. `SET_JOINT_TARGET` -> firmware latest-wins buffer -> 200 Hz executor;
-5. ACK, exact CAN progress and post-command coherent feedback close the link back
-   to the recorded action sequence.
+The monotonic action lifecycle is:
 
-Dead-man release does not send a zero velocity and assume the robot will stop. The
-host sends priority HOLD, releases the lease and resets the integrator; USB/process failure
-is independently covered by target TTL and lease timeout in firmware. Raw input,
-requested action, applied action and exact lifecycle timestamps are stored in Raw
-Session schema v4 and associated by sequence. Schema v3 remains inspectable, but
-strict v2.1 export refuses it because it cannot reconstruct missing exact-sequence
-CAN and post-feedback evidence.
+```text
+RECEIVED → SAFETY_ACCEPTED → SEND_ENQUEUED → SERIAL_SEND_STARTED →
+SERIAL_SEND_FINISHED → ACKNOWLEDGED → CAN_QUEUED_EXACT →
+CAN_TX_COMPLETE_EXACT → POST_COMMAND_FEEDBACK
+```
 
-The host serial writer uses separate safety and reliable-control FIFOs plus a
-single latest-target mailbox. ESTOP is first, then HOLD/RELEASE/SET_MODE,
-reliable session traffic, and finally the current target. HOLD/ESTOP atomically
-clear the motion mailbox. On receive, ACK/NACK/EVENT/FAULT remain reliable while
-STATE uses a replaceable latest-value slot; reliable-queue overflow is fatal.
+`CAN_QUEUED_EXACT` means all seven frozen-generation frames entered the hardware
+send path. `CAN_TX_COMPLETE_EXACT` means all seven completed transmission.
+`POST_COMMAND_FEEDBACK` requires a complete coherent seven-node sweep whose node
+sample times are all later than the last TX completion; it is execution-latency
+evidence, not proof that the target pose was reached. Exact completion forbids a
+later SUPERSEDED result. Abort/error, ACK timeout, or feedback timeout produces
+FAILED and a safety HOLD.
+
+`state_flags & 0x01` marks a repeated STATE that reuses the last coherent velocity.
+A coherent sweep is published only when all seven nodes responded and skew is at
+most 30 ms. The coherent reference time is the midpoint of the earliest/latest
+node sample times.
+
+## CAN diagnostics and scheduling
+
+`CAN_DIAGNOSTICS` is 132 bytes:
+
+```c
+uint64_t window_start_us;
+uint64_t window_duration_us;
+uint32_t target_tx_complete[7];
+uint32_t position_response[7];
+uint32_t temperature_response[7];
+uint32_t position_timeout_count;
+uint32_t temperature_timeout_count;
+uint32_t tx_abort_count;
+uint32_t tx_error_count;
+uint32_t tx_recovery_count;
+uint32_t safety_preemption_count;
+uint32_t max_safety_wait_us;
+uint32_t max_fanout_us;
+```
+
+The host records diagnostics at 1 Hz. Firmware keeps a single CAN frame in
+flight and advances on TX-complete/RX/deadline events. Priority is ESTOP/FAULT,
+then HOLD/RELEASE/mode, normal target/position traffic, then temperature and
+diagnostics. The 1 kHz timer is only a watchdog; it does not rate-limit normal
+dispatch or replay missed bursts. Nominal per-node rates remain target 50 Hz,
+position 40 Hz and temperature 1 Hz.
+
+## Time mapping and Raw Session evidence
+
+The host performs the four-timestamp exchange at 2 Hz, rejects high-RTT samples,
+and fits an affine mapping:
+
+```text
+host_monotonic_ns = slope_ns_per_us * mcu_time_us + intercept_ns
+```
+
+Every accepted update receives a new model ID. MCU/host rollback or a model jump
+starts a new segment, across which strict export never interpolates.
+
+Raw Session schema v5 stores session epoch/control tick, all lifecycle stages,
+three action-latency components, time models/exchanges, CAN diagnostics, coherent
+reference time and camera timestamp source. Strict LeRobot export is fixed at
+20 Hz, interpolates observations by mapped coherent reference time, chooses
+camera frames by hardware exposure time or explicit host arrival time, and keeps
+only actions with ACK + exact TX completion + latency-qualified post feedback.
+Actions themselves are never interpolated. HOLD, invalid sweep, over-budget
+control gaps, and clock segment changes split exported episodes.
+
+Raw v2/v3 remain integrity-inspectable only. Raw v4 export requires an explicit
+`legacy_mode: true` recipe and is labeled `v4_legacy_can_queued_only`; it cannot
+be merged into the v5 evidence tier.
+
+## Safety boundary
+
+The MCU rejects wrong version/hash/session/mode, non-increasing channel sequence,
+expired TTL, non-finite targets and out-of-limit values. Target or lease timeout
+enters HOLD locally. Persistent feedback loss, over-temperature and ESTOP enter
+FAULT according to configuration. Linux, USB and dataset tooling are not the
+hard-real-time safety boundary.

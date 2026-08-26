@@ -9,6 +9,7 @@ accepted_outcomes: [accepted]
 include_depth: false
 allow_uncalibrated_cameras: true
 require_temporary_source: true
+legacy_mode: false
 metadata:
   description: TEMP uncalibrated end-to-end pipeline smoke test
   data_classification: temporary_uncalibrated_pipeline_test

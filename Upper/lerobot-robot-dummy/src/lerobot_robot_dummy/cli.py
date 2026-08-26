@@ -27,9 +27,15 @@ def _load_recipe(path: str | Path) -> ExportRecipe:
     include_depth = raw.get("include_depth", False)
     allow_uncalibrated = raw.get("allow_uncalibrated_cameras", False)
     require_temporary = raw.get("require_temporary_source", False)
+    legacy_mode = raw.get("legacy_mode", False)
     if not all(
         isinstance(value, bool)
-        for value in (include_depth, allow_uncalibrated, require_temporary)
+        for value in (
+            include_depth,
+            allow_uncalibrated,
+            require_temporary,
+            legacy_mode,
+        )
     ):
         raise ValueError("recipe camera and source gates must be boolean")
     return ExportRecipe(
@@ -42,6 +48,7 @@ def _load_recipe(path: str | Path) -> ExportRecipe:
         include_depth=include_depth,
         allow_uncalibrated_cameras=allow_uncalibrated,
         require_temporary_source=require_temporary,
+        legacy_mode=legacy_mode,
         max_action_observation_latency_ms=float(
             raw.get("max_action_observation_latency_ms", 250.0)
         ),
@@ -50,7 +57,9 @@ def _load_recipe(path: str | Path) -> ExportRecipe:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export a verified Raw Session v3 to LeRobotDataset v3")
+    parser = argparse.ArgumentParser(
+        description="Export a verified Raw Session v5 (or explicit v4 legacy) to LeRobotDataset v3"
+    )
     parser.add_argument("--session", required=True)
     parser.add_argument("--recipe", required=True)
     parser.add_argument("--repo-id", required=True)

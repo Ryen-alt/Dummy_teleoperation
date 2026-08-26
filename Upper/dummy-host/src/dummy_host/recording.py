@@ -19,9 +19,10 @@ from .cameras import CameraFrame
 from .frame_archive import DEFAULT_MINIMUM_FREE_BYTES, FrameArchive, NpzFrameArchive
 from .domain import ActionLifecycleUpdate, ActionStage
 from .kinematics.calibration import CartesianCalibration
-from .protocol import PROTOCOL_VERSION
+from .protocol import PROTOCOL_VERSION, CanDiagnostics
 from .schema import AppliedAction, RobotConfig, RobotState
 from .teleop import TeleopCommand, TeleopProfile
+from .time_sync import TimeSyncExchange, TimeSyncModel
 
 
 class RecorderError(RuntimeError):
@@ -98,6 +99,9 @@ class _SampleRecord:
     valid: bool
     invalid_reason: str | None
     timing: ControlTickTiming
+    session_epoch: int
+    control_tick_id: int
+    time_sync_model_id: int | None
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,18 @@ class _EventRecord:
     monotonic_ns: int
     event: str
     payload: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class _TimeSyncRecord:
+    exchange: TimeSyncExchange
+    model: TimeSyncModel | None
+
+
+@dataclass(frozen=True)
+class _CanDiagnosticsRecord:
+    host_time_ns: int
+    diagnostics: CanDiagnostics
 
 
 def _utc_now() -> str:
@@ -210,8 +226,11 @@ class SessionRecorder:
         self._camera_frames = 0
         self._queue_high_watermark = 0
         self._stats_lock = threading.Lock()
+        self._time_sync_lock = threading.Lock()
+        self._latest_time_sync_model_id: int | None = None
+        self._session_epoch = 0
         self._manifest: dict[str, object] = {
-            "schema_version": 4,
+            "schema_version": 5,
             "state_telemetry_version": 4,
             "binary_protocol_version": PROTOCOL_VERSION,
             "created_utc": _utc_now(),
@@ -232,11 +251,12 @@ class SessionRecorder:
             "teleop_config_hash": teleop_profile.config_hash,
             "action_source": source,
             "firmware_version": firmware_version,
+            "session_epoch": None,
             "control_rate_hz": robot_config.control_rate_hz,
             "joint_order": list(robot_config.joint_order),
             "joint_unit": robot_config.joint_unit,
             "array_encoding": "little-endian float32 blobs",
-            "timestamp_chain_version": 1,
+            "timestamp_chain_version": 2,
             "timestamp_chain": [
                 "input_event_ns",
                 "input_snapshot_ns",
@@ -251,6 +271,8 @@ class SessionRecorder:
                 "acknowledged_mcu_us",
                 "can_queued_exact_host_ns",
                 "can_queued_exact_mcu_us",
+                "can_tx_complete_exact_host_ns",
+                "can_tx_complete_exact_mcu_us",
                 "post_command_feedback_host_ns",
                 "post_command_feedback_mcu_us",
                 "state_host_ns",
@@ -266,6 +288,7 @@ class SessionRecorder:
                 "serial_send_finished",
                 "acknowledged",
                 "can_queued_exact",
+                "can_tx_complete_exact",
                 "post_command_feedback",
                 "superseded",
                 "preempted_by_safety",
@@ -281,6 +304,9 @@ class SessionRecorder:
             "camera_archive_minimum_free_bytes": minimum_camera_free_bytes,
             "recorder_queue_capacity": queue_size,
             "recorder_critical_event_reserve": self._critical_event_reserve,
+            "time_sync_rate_hz": 2,
+            "time_sync_model": "filtered four-timestamp affine MCU-us to host-monotonic-ns",
+            "can_diagnostics_rate_hz": 1,
         }
         if extra_manifest:
             self._manifest["extra"] = dict(extra_manifest)
@@ -297,11 +323,18 @@ class SessionRecorder:
                 self._queue_high_watermark,
             )
 
-    def update_runtime_metadata(self, *, firmware_version: str) -> None:
+    def update_runtime_metadata(
+        self, *, firmware_version: str, session_epoch: int | None = None
+    ) -> None:
         self._require_open()
         if not firmware_version:
             raise ValueError("firmware_version must be non-empty")
         self._manifest["firmware_version"] = firmware_version
+        if session_epoch is not None:
+            if not 0 < session_epoch <= 0xFFFFFFFF:
+                raise ValueError("session_epoch must be a non-zero uint32")
+            self._session_epoch = session_epoch
+            self._manifest["session_epoch"] = session_epoch
         self._write_json_atomic(self.manifest_path, self._manifest)
 
     def archive_cartesian_calibration(
@@ -400,6 +433,13 @@ class SessionRecorder:
             valid=valid,
             invalid_reason=invalid_reason,
             timing=timing,
+            session_epoch=(
+                action.session_epoch
+                if action is not None and action.session_epoch > 0
+                else self._session_epoch
+            ),
+            control_tick_id=0 if action is None else action.control_tick_id,
+            time_sync_model_id=self._current_time_sync_model_id(),
         )
         self._enqueue(("sample", record), sample=True)
 
@@ -423,6 +463,32 @@ class SessionRecorder:
     def record_action_lifecycle(self, update: ActionLifecycleUpdate) -> None:
         self._require_open()
         self._enqueue(("action_lifecycle", update))
+
+    def record_time_sync(
+        self, exchange: TimeSyncExchange, model: TimeSyncModel | None
+    ) -> None:
+        self._require_open()
+        # Publish the model to sample producers only after its writer item is
+        # ahead of every sample that may reference it.
+        self._enqueue(("time_sync", _TimeSyncRecord(exchange, model)))
+        if model is not None:
+            with self._time_sync_lock:
+                self._latest_time_sync_model_id = model.model_id
+
+    def record_can_diagnostics(
+        self, diagnostics: CanDiagnostics, *, host_time_ns: int | None = None
+    ) -> None:
+        self._require_open()
+        timestamp = time.monotonic_ns() if host_time_ns is None else host_time_ns
+        if timestamp < 0:
+            raise ValueError("CAN diagnostics host timestamp must be non-negative")
+        self._enqueue(
+            ("can_diagnostics", _CanDiagnosticsRecord(timestamp, diagnostics))
+        )
+
+    def _current_time_sync_model_id(self) -> int | None:
+        with self._time_sync_lock:
+            return self._latest_time_sync_model_id
 
     def close(self, *, clean_shutdown: bool = True) -> RecorderStats:
         if self._closed:
@@ -505,6 +571,14 @@ class SessionRecorder:
                     assert isinstance(payload, ActionLifecycleUpdate)
                     self._write_action_lifecycle(connection, payload)
                     uncommitted += 1
+                elif kind == "time_sync":
+                    assert isinstance(payload, _TimeSyncRecord)
+                    self._write_time_sync(connection, payload)
+                    uncommitted += 1
+                elif kind == "can_diagnostics":
+                    assert isinstance(payload, _CanDiagnosticsRecord)
+                    self._write_can_diagnostics(connection, payload)
+                    uncommitted += 1
                 else:
                     raise RecorderError(f"unknown recorder item {kind}")
                 if uncommitted >= 20:
@@ -529,6 +603,9 @@ class SessionRecorder:
                 sample_index INTEGER PRIMARY KEY AUTOINCREMENT,
                 tick_ns INTEGER NOT NULL,
                 raw_tick_index INTEGER NOT NULL,
+                session_epoch INTEGER NOT NULL,
+                control_tick_id INTEGER NOT NULL,
+                time_sync_model_id INTEGER,
                 input_event_ns INTEGER NOT NULL,
                 input_snapshot_ns INTEGER NOT NULL,
                 control_planned_ns INTEGER NOT NULL,
@@ -600,6 +677,7 @@ class SessionRecorder:
                 frame_number INTEGER NOT NULL,
                 capture_ns INTEGER NOT NULL,
                 arrival_ns INTEGER NOT NULL,
+                timestamp_source TEXT NOT NULL,
                 color_depth_skew_ms REAL NOT NULL,
                 calibration_version TEXT NOT NULL,
                 frame_path TEXT NOT NULL,
@@ -612,6 +690,8 @@ class SessionRecorder:
             """
             CREATE TABLE IF NOT EXISTS action_lifecycle (
                 action_sequence INTEGER PRIMARY KEY,
+                session_epoch INTEGER NOT NULL DEFAULT 0,
+                control_tick_id INTEGER NOT NULL DEFAULT 0,
                 received_host_ns INTEGER,
                 safety_accepted_host_ns INTEGER,
                 send_enqueued_host_ns INTEGER,
@@ -621,10 +701,63 @@ class SessionRecorder:
                 acknowledged_mcu_us INTEGER,
                 can_queued_exact_host_ns INTEGER,
                 can_queued_exact_mcu_us INTEGER,
+                can_tx_complete_exact_host_ns INTEGER,
+                can_tx_complete_exact_mcu_us INTEGER,
                 post_command_feedback_host_ns INTEGER,
                 post_command_feedback_mcu_us INTEGER,
+                accepted_to_ack_host_ns INTEGER,
+                ack_to_can_tx_complete_us INTEGER,
+                can_tx_complete_to_post_feedback_us INTEGER,
                 terminal_stage TEXT,
                 detail TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS time_sync_exchanges (
+                exchange_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_t0_ns INTEGER NOT NULL,
+                mcu_rx_us INTEGER NOT NULL,
+                mcu_tx_us INTEGER NOT NULL,
+                host_t3_ns INTEGER NOT NULL,
+                rtt_ns INTEGER NOT NULL,
+                model_id INTEGER
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS time_sync_models (
+                model_id INTEGER PRIMARY KEY,
+                segment_id INTEGER NOT NULL,
+                slope_ns_per_us REAL NOT NULL,
+                intercept_ns REAL NOT NULL,
+                rtt_ns INTEGER NOT NULL,
+                residual_ns REAL NOT NULL,
+                sample_count INTEGER NOT NULL,
+                created_host_ns INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS can_diagnostics (
+                diagnostic_index INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_time_ns INTEGER NOT NULL,
+                window_start_us INTEGER NOT NULL,
+                window_duration_us INTEGER NOT NULL,
+                target_tx_complete_json TEXT NOT NULL,
+                position_response_json TEXT NOT NULL,
+                temperature_response_json TEXT NOT NULL,
+                position_timeout_count INTEGER NOT NULL,
+                temperature_timeout_count INTEGER NOT NULL,
+                tx_abort_count INTEGER NOT NULL,
+                tx_error_count INTEGER NOT NULL,
+                tx_recovery_count INTEGER NOT NULL,
+                safety_preemption_count INTEGER NOT NULL,
+                max_safety_wait_us INTEGER NOT NULL,
+                max_fanout_us INTEGER NOT NULL
             )
             """
         )
@@ -641,7 +774,8 @@ class SessionRecorder:
         cursor = connection.execute(
             """
             INSERT INTO samples (
-                tick_ns, raw_tick_index, input_event_ns, input_snapshot_ns,
+                tick_ns, raw_tick_index, session_epoch, control_tick_id,
+                time_sync_model_id, input_event_ns, input_snapshot_ns,
                 control_planned_ns, control_actual_start_ns, control_actual_end_ns,
                 control_missed_periods, next_rebase_deadline_ns,
                 transport_diagnostics_json, target_generated_ns,
@@ -662,11 +796,14 @@ class SessionRecorder:
                 state_repeated, action_progress_json,
                 camera_frame_number, camera_capture_ns, camera_arrival_ns,
                 camera_color_depth_skew_ms, sample_valid, invalid_reason
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 command.monotonic_ns,
                 record.timing.raw_tick_index,
+                record.session_epoch,
+                record.control_tick_id,
+                record.time_sync_model_id,
                 command.event_ns if command.event_ns is not None else command.monotonic_ns,
                 command.monotonic_ns,
                 record.timing.planned_ns,
@@ -744,8 +881,9 @@ class SessionRecorder:
                 """
                 INSERT INTO camera_samples (
                     sample_index, role, frame_number, capture_ns, arrival_ns,
-                    color_depth_skew_ms, calibration_version, frame_path
-                ) VALUES (?,?,?,?,?,?,?,?)
+                    color_depth_skew_ms, calibration_version, frame_path,
+                    timestamp_source
+                ) VALUES (?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     sample_index,
@@ -756,6 +894,7 @@ class SessionRecorder:
                     camera_frame.color_depth_skew_ms,
                     camera_frame.calibration_version,
                     frame_path,
+                    camera_frame.timestamp_source,
                 ),
             )
             if frame_archive.unique_frames > before:
@@ -767,8 +906,19 @@ class SessionRecorder:
         connection: sqlite3.Connection, update: ActionLifecycleUpdate
     ) -> None:
         connection.execute(
-            "INSERT OR IGNORE INTO action_lifecycle (action_sequence) VALUES (?)",
-            (update.sequence,),
+            """
+            INSERT INTO action_lifecycle (
+                action_sequence, session_epoch, control_tick_id
+            ) VALUES (?,?,?)
+            ON CONFLICT(action_sequence) DO UPDATE SET
+                session_epoch = CASE
+                    WHEN excluded.session_epoch != 0 THEN excluded.session_epoch
+                    ELSE action_lifecycle.session_epoch END,
+                control_tick_id = CASE
+                    WHEN excluded.control_tick_id != 0 THEN excluded.control_tick_id
+                    ELSE action_lifecycle.control_tick_id END
+            """,
+            (update.sequence, update.session_epoch, update.control_tick_id),
         )
         columns = {
             ActionStage.RECEIVED: ("received_host_ns",),
@@ -780,6 +930,10 @@ class SessionRecorder:
             ActionStage.CAN_QUEUED_EXACT: (
                 "can_queued_exact_host_ns",
                 "can_queued_exact_mcu_us",
+            ),
+            ActionStage.CAN_TX_COMPLETE_EXACT: (
+                "can_tx_complete_exact_host_ns",
+                "can_tx_complete_exact_mcu_us",
             ),
             ActionStage.POST_COMMAND_FEEDBACK: (
                 "post_command_feedback_host_ns",
@@ -796,6 +950,22 @@ class SessionRecorder:
                 f"UPDATE action_lifecycle SET {assignments} WHERE action_sequence = ?",
                 (*values, update.sequence),
             )
+        connection.execute(
+            """
+            UPDATE action_lifecycle SET
+                accepted_to_ack_host_ns = CASE
+                    WHEN acknowledged_host_ns >= safety_accepted_host_ns
+                    THEN acknowledged_host_ns - safety_accepted_host_ns END,
+                ack_to_can_tx_complete_us = CASE
+                    WHEN can_tx_complete_exact_mcu_us >= acknowledged_mcu_us
+                    THEN can_tx_complete_exact_mcu_us - acknowledged_mcu_us END,
+                can_tx_complete_to_post_feedback_us = CASE
+                    WHEN post_command_feedback_mcu_us >= can_tx_complete_exact_mcu_us
+                    THEN post_command_feedback_mcu_us - can_tx_complete_exact_mcu_us END
+            WHERE action_sequence = ?
+            """,
+            (update.sequence,),
+        )
         if update.stage in (
             ActionStage.SUPERSEDED,
             ActionStage.PREEMPTED_BY_SAFETY,
@@ -807,6 +977,81 @@ class SessionRecorder:
                 "WHERE action_sequence = ?",
                 (update.stage.value, update.detail, update.sequence),
             )
+
+    @staticmethod
+    def _write_time_sync(
+        connection: sqlite3.Connection, record: _TimeSyncRecord
+    ) -> None:
+        exchange = record.exchange
+        model = record.model
+        if model is not None:
+            connection.execute(
+                """
+                INSERT INTO time_sync_models (
+                    model_id, segment_id, slope_ns_per_us, intercept_ns,
+                    rtt_ns, residual_ns, sample_count, created_host_ns
+                ) VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    model.model_id,
+                    model.segment_id,
+                    model.slope_ns_per_us,
+                    model.intercept_ns,
+                    model.rtt_ns,
+                    model.residual_ns,
+                    model.sample_count,
+                    model.created_host_ns,
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO time_sync_exchanges (
+                host_t0_ns, mcu_rx_us, mcu_tx_us, host_t3_ns, rtt_ns, model_id
+            ) VALUES (?,?,?,?,?,?)
+            """,
+            (
+                exchange.host_t0_ns,
+                exchange.mcu_rx_us,
+                exchange.mcu_tx_us,
+                exchange.host_t3_ns,
+                exchange.rtt_ns,
+                None if model is None else model.model_id,
+            ),
+        )
+
+    @staticmethod
+    def _write_can_diagnostics(
+        connection: sqlite3.Connection, record: _CanDiagnosticsRecord
+    ) -> None:
+        value = record.diagnostics
+        connection.execute(
+            """
+            INSERT INTO can_diagnostics (
+                host_time_ns, window_start_us, window_duration_us,
+                target_tx_complete_json, position_response_json,
+                temperature_response_json, position_timeout_count,
+                temperature_timeout_count, tx_abort_count, tx_error_count,
+                tx_recovery_count, safety_preemption_count, max_safety_wait_us,
+                max_fanout_us
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                record.host_time_ns,
+                value.window_start_us,
+                value.window_duration_us,
+                json.dumps(value.target_tx_complete, separators=(",", ":")),
+                json.dumps(value.position_response, separators=(",", ":")),
+                json.dumps(value.temperature_response, separators=(",", ":")),
+                value.position_timeout_count,
+                value.temperature_timeout_count,
+                value.tx_abort_count,
+                value.tx_error_count,
+                value.tx_recovery_count,
+                value.safety_preemption_count,
+                value.max_safety_wait_us,
+                value.max_fanout_us,
+            ),
+        )
 
     def _build_checksums(self) -> dict[str, object]:
         files: dict[str, str] = {}

@@ -30,6 +30,7 @@ from .protocol import (
     ACK_DETAIL_FEEDBACK_NOT_READY,
     ACQUIRE_CONTROL,
     ActionProgressStage,
+    CanDiagnostics,
     SET_MODE,
     MessageType,
     Packet,
@@ -38,10 +39,13 @@ from .protocol import (
     pack_hello,
     pack_joint_target,
     pack_target_keepalive,
+    pack_time_sync,
     unpack_ack,
     unpack_action_progress,
+    unpack_can_diagnostics,
     unpack_hello_ack,
     unpack_state,
+    unpack_time_sync_ack,
 )
 from .safety import SafetyError, SafetyFilter
 from .schema import AppliedAction, ConfigError, ControlMode, RobotConfig, RobotState
@@ -52,6 +56,7 @@ from .transport_serial import (
     TransportTxUpdate,
     TxOutcome,
 )
+from .time_sync import TimeSyncExchange
 
 
 class RobotError(RuntimeError):
@@ -137,6 +142,7 @@ class DummyRobot:
         self._completion_deadlines: dict[int, int] = {}
         self._deadline_heap: list[tuple[int, int, int]] = []
         self._action_stages: dict[int, set[ActionStage]] = {}
+        self._action_control_ticks: dict[int, int] = {}
         self._active_action_sequence: int | None = None
         self._action_credit_generation = 0
         self._action_credit: ActionCredit | None = None
@@ -484,6 +490,8 @@ class DummyRobot:
             result.reasons,
             canonical=result.applied,
             source=proposal.source,
+            session_epoch=self.session_id,
+            control_tick_id=owned_credit.control_tick_id,
         )
 
     def submit_action(
@@ -533,7 +541,38 @@ class DummyRobot:
             result.reasons,
             canonical=result.applied,
             source=proposal.source,
+            session_epoch=self.session_id,
+            control_tick_id=control_tick_id,
         )
+
+    def time_sync(self) -> TimeSyncExchange:
+        """Perform one protocol-v5 four-timestamp clock exchange."""
+
+        self._require_connected()
+        if not self.firmware_capabilities & CAPABILITY_TIME_SYNC:
+            raise RobotError("firmware does not advertise TIME_SYNC")
+        host_t0_ns = self.clock_ns()
+        response = self._request(MessageType.TIME_SYNC, pack_time_sync(host_t0_ns))
+        host_t3_ns = self.clock_ns()
+        if response.message_type != MessageType.TIME_SYNC_ACK:
+            raise RobotError(
+                f"expected TIME_SYNC_ACK, received {response.message_type.name}"
+            )
+        echoed_t0_ns, mcu_rx_us, mcu_tx_us = unpack_time_sync_ack(response.payload)
+        if echoed_t0_ns != host_t0_ns:
+            raise RobotError("TIME_SYNC_ACK does not echo this exchange")
+        return TimeSyncExchange(host_t0_ns, mcu_rx_us, mcu_tx_us, host_t3_ns)
+
+    def read_can_diagnostics(self) -> CanDiagnostics:
+        self._require_connected()
+        if not self.firmware_capabilities & CAPABILITY_CAN_DIAGNOSTICS:
+            raise RobotError("firmware does not advertise CAN diagnostics")
+        response = self._request(MessageType.GET_CAN_DIAGNOSTICS)
+        if response.message_type != MessageType.CAN_DIAGNOSTICS:
+            raise RobotError(
+                f"expected CAN_DIAGNOSTICS, received {response.message_type.name}"
+            )
+        return unpack_can_diagnostics(response.payload)
 
     def heartbeat(self) -> None:
         self._require_control()
@@ -1014,6 +1053,7 @@ class DummyRobot:
                 return False
             stages.add(stage)
             listener = self._action_listener
+            control_tick_id = self._action_control_ticks.get(sequence, 0)
             completed = {
                 ActionStage.ACKNOWLEDGED,
                 ActionStage.CAN_QUEUED_EXACT,
@@ -1036,6 +1076,7 @@ class DummyRobot:
                     oldest = next(iter(self._action_stages))
                     if oldest != sequence:
                         self._action_stages.pop(oldest, None)
+                        self._action_control_ticks.pop(oldest, None)
             if stage is ActionStage.CAN_TX_COMPLETE_EXACT or terminal:
                 self._release_action_credit_locked(sequence)
             if (
@@ -1057,6 +1098,8 @@ class DummyRobot:
                     host_time_ns,
                     mcu_time_us=mcu_time_us,
                     detail=detail,
+                    session_epoch=self.session_id,
+                    control_tick_id=control_tick_id,
                 )
             )
         return True
@@ -1115,6 +1158,7 @@ class DummyRobot:
 
         with self._watchdog_condition:
             self._action_stages.pop(sequence, None)
+            self._action_control_ticks.pop(sequence, None)
             self._ack_deadlines.pop(sequence, None)
             self._completion_deadlines.pop(sequence, None)
 
@@ -1164,6 +1208,7 @@ class DummyRobot:
             if self._action_credit != credit or self._action_credit_sequence is not None:
                 raise ActionCreditUnavailable("action credit is stale or already consumed")
             self._action_credit_sequence = sequence
+            self._action_control_ticks[sequence] = credit.control_tick_id
 
     def _release_action_credit_locked(self, sequence: int) -> None:
         if self._action_credit_sequence == sequence:

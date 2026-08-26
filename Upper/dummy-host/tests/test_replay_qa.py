@@ -27,6 +27,9 @@ def _record_replay_source(config: RobotConfig, root: Path) -> Path:
             "camera_roles": ["wrist"],
         },
     )
+    recorder.update_runtime_metadata(
+        firmware_version="fake-mcu-v2.2", session_epoch=99
+    )
     recorder.record_event(
         "episode_start",
         monotonic_ns=start_ns,
@@ -53,7 +56,8 @@ def _record_replay_source(config: RobotConfig, root: Path) -> Path:
         )
         command = mapper.map({"KEY_SPACE"}, tick_ns)
         action = AppliedAction(
-            state_position.copy(), state_position.copy(), index + 1, tick_ns, False, ()
+            state_position.copy(), state_position.copy(), index + 1, tick_ns, False, (),
+            session_epoch=99, control_tick_id=index + 1,
         )
         frame = CameraFrame(
             color=np.full((2, 3, 3), index, dtype=np.uint8),
@@ -68,6 +72,7 @@ def _record_replay_source(config: RobotConfig, root: Path) -> Path:
             role="wrist",
             calibration_version="uncalibrated-v0",
             depth_scale=0.001,
+            timestamp_source="hardware_exposure",
         )
         recorder.record_sample(command, state, action=action, camera_frames={"wrist": frame})
     recorder.record_event(
@@ -114,7 +119,9 @@ def test_session_qa_reports_export_gate_and_renders_svg(
     session = _record_replay_source(config, tmp_path)
     report, states = analyze_session(session)
     assert report.ok
-    assert report.export_ready
+    assert not report.export_ready
+    assert report.qualified_action_samples == 0
+    assert report.time_sync_models == 0
     assert report.data_classification == "legacy_unspecified"
     assert not report.offline_training_only
     assert not report.real_policy_execution_allowed

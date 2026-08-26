@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from dummy_host.protocol import (
+    CanDiagnostics,
     MessageType,
     Packet,
     ProtocolError,
@@ -17,10 +18,12 @@ from dummy_host.protocol import (
     decode_packet,
     encode_packet,
     pack_joint_target,
+    pack_can_diagnostics,
     pack_target_keepalive,
     pack_time_sync,
     pack_time_sync_ack,
     unpack_joint_target,
+    unpack_can_diagnostics,
     unpack_target_keepalive,
     unpack_time_sync,
     unpack_time_sync_ack,
@@ -87,6 +90,27 @@ def test_target_keepalive_references_one_exact_action_sequence() -> None:
 def test_time_sync_payload_round_trip() -> None:
     assert unpack_time_sync(pack_time_sync(123456789)) == 123456789
     assert unpack_time_sync_ack(pack_time_sync_ack(11, 22, 33)) == (11, 22, 33)
+
+
+def test_can_diagnostics_payload_round_trip() -> None:
+    diagnostics = CanDiagnostics(
+        window_start_us=10,
+        window_duration_us=20,
+        target_tx_complete=tuple(range(1, 8)),
+        position_response=tuple(range(8, 15)),
+        temperature_response=tuple(range(15, 22)),
+        position_timeout_count=22,
+        temperature_timeout_count=23,
+        tx_abort_count=24,
+        tx_error_count=25,
+        tx_recovery_count=26,
+        safety_preemption_count=27,
+        max_safety_wait_us=28,
+        max_fanout_us=29,
+    )
+    assert unpack_can_diagnostics(pack_can_diagnostics(diagnostics)) == diagnostics
+    with pytest.raises(ProtocolError, match="payload length"):
+        unpack_can_diagnostics(b"short")
 
 
 def test_shared_wire_vectors() -> None:

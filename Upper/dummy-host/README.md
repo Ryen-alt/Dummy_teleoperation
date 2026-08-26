@@ -2,7 +2,7 @@
 
 这是当前工作区的第一版安全闭环。范围是配置与固件代码生成、二进制协议、
 USB CDC 串口、`DummyRobot`、动作安全过滤、20 Hz 调度、单关节 bring-up，
-键盘/手柄遥操作采集、按逻辑角色管理的多相机同步、Raw Session v4 和离线数据集导出契约。
+键盘/手柄遥操作采集、按逻辑角色管理的多相机同步、Raw Session v5 和离线数据集导出契约。
 训练与推理运行时没有接入；LeRobot v3 依赖被隔离在相邻的 `lerobot-robot-dummy` 包。
 
 ## 安全状态
@@ -168,7 +168,8 @@ dummy-host-cartesian-ik-benchmark \
 每次运行生成独立目录，包含：
 
 - `manifest.json`：机器人/输入配置哈希、固件版本、来源、放行轴和 Cartesian 标定身份；
-- `samples.sqlite`：WAL 模式下的原始输入、requested/applied action、机器人状态和序号；
+- `samples.sqlite`：WAL 模式下的原始输入、requested/applied action、机器人状态、
+  session epoch/control tick、完整动作生命周期、2 Hz 仿射时钟模型和 1 Hz CAN 诊断；
 - `events.jsonl`：dead-man、HOLD、ESTOP、Episode 和错误事件；
 - `frames/<camera-role>/`：每个已启用逻辑相机角色的分段原始彩色/深度 NPZ；
 - `checksums.json`：所有已完成文件的 SHA-256。
@@ -177,9 +178,10 @@ dummy-host-cartesian-ik-benchmark \
 启用 `--with-cameras --require-camera` 后，必需相机缺帧或同步超限同样会停止采集并进入 HOLD。
 完成后使用 `dummy-host-session-check --session /path/to/session_dir` 实际复算校验和、
 运行 SQLite 完整性检查并汇总 received/ACK/CAN_QUEUED_EXACT/
-POST_COMMAND_FEEDBACK 序号。
+CAN_TX_COMPLETE_EXACT/POST_COMMAND_FEEDBACK 序号。
 进一步的自动 QA 会统计采样频率、调度间隔、Episode 结果、故障/裁剪样本、每个相机
-角色的帧号缺口、捕获延迟和同步偏差，并生成不依赖 GUI 的 HTML 轨迹报告：
+角色的帧号缺口、时间戳来源、捕获延迟和同步偏差，以及时钟 RTT/残差、严格合格动作、
+CAN timeout/error/fan-out，并生成不依赖 GUI 的 HTML 轨迹报告：
 
 ```bash
 dummy-host-session-qa --session /path/to/session_dir \
@@ -187,10 +189,14 @@ dummy-host-session-qa --session /path/to/session_dir \
   --html-output /tmp/session_qa.html
 ```
 
-Raw Session v2/v3/v4 也可通过 `ReplayCamera` 走相同的 Camera/CameraManager 接口。回放 rig
+Raw Session v2～v5 也可通过 `ReplayCamera` 走相同的 Camera/CameraManager 接口。回放 rig
 将 `driver` 设为 `replay`，`device_serial` 填 clean session 目录，并保持角色、分辨率和
 `calibration_version` 与源记录一致；回放时间戳会重基到当前单调时钟，因此过期帧和
 同步门禁仍然生效。
+LeRobot 严格导出只接受 schema v5，并固定按 20 Hz 真实控制时间重采样；observation 使用
+coherent reference 的仿射主机时间，camera 使用硬件曝光或显式 arrival 时间，action 只取
+实际通过 SafetyFilter 且具备 ACK、TX-complete exact、post-feedback 证据的目标。schema v4
+必须在 recipe 中显式设置 `legacy_mode: true`，导出侧车会标为 legacy 证据，不能与 v5 合并。
 真实 `--execute` 还必须显式指定 `--allow-joint` 或 `--allow-gripper`，并继续受
 硬件参数和固件执行门禁约束。详细验收步骤见真机指南第 17 节。
 

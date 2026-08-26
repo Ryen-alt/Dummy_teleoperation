@@ -102,9 +102,19 @@ class ActionLifecycleUpdate:
     host_time_ns: int
     mcu_time_us: int = 0
     detail: str | None = None
+    session_epoch: int = 0
+    control_tick_id: int = 0
 
     def __post_init__(self) -> None:
-        if self.sequence <= 0 or self.host_time_ns < 0 or self.mcu_time_us < 0:
+        if (
+            self.sequence <= 0
+            or self.host_time_ns < 0
+            or self.mcu_time_us < 0
+            or self.session_epoch < 0
+            or self.control_tick_id < 0
+            or self.session_epoch > 0xFFFFFFFF
+            or self.control_tick_id > 0xFFFFFFFF
+        ):
             raise ValueError("action lifecycle identifiers and timestamps are invalid")
 
 
@@ -368,13 +378,22 @@ class AppliedAction:
     reasons: tuple[str, ...]
     canonical: np.ndarray | None = None
     source: str = "direct"
+    session_epoch: int = 0
+    control_tick_id: int = 0
 
     def __post_init__(self) -> None:
         requested = _frozen_array(self.requested, shape=(7,), name="requested action")
         applied = _frozen_array(self.applied, shape=(7,), name="applied action")
         canonical_value = applied if self.canonical is None else self.canonical
         canonical = _frozen_array(canonical_value, shape=(7,), name="canonical action")
-        if self.sequence < 0 or self.monotonic_ns < 0:
+        if (
+            self.sequence < 0
+            or self.monotonic_ns < 0
+            or self.session_epoch < 0
+            or self.control_tick_id < 0
+            or self.session_epoch > 0xFFFFFFFF
+            or self.control_tick_id > 0xFFFFFFFF
+        ):
             raise ValueError("action sequence and timestamp must be non-negative")
         if not self.source:
             raise ValueError("applied action source must be non-empty")

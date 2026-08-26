@@ -20,6 +20,9 @@ from dummy_host.recording import (
     SessionRecorder,
     estimate_camera_archive_bytes,
 )
+from dummy_host.domain import ActionLifecycleUpdate, ActionStage
+from dummy_host.protocol import CanDiagnostics
+from dummy_host.time_sync import TimeSyncExchange, TimeSyncModel
 from dummy_host.schema import (
     AppliedAction,
     ControlMode,
@@ -69,6 +72,8 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
         monotonic_ns=now_ns,
         clipped=False,
         reasons=(),
+        session_epoch=123,
+        control_tick_id=77,
     )
     frame = CameraFrame(
         color=np.zeros((2, 3, 3), dtype=np.uint8),
@@ -80,6 +85,7 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
         depth_device_timestamp_ms=12.1,
         depth_frame_number=43,
         color_depth_skew_ms=0.1,
+        timestamp_source="hardware_exposure",
     )
     global_frame = CameraFrame(
         color=np.zeros((2, 3, 3), dtype=np.uint8),
@@ -93,6 +99,7 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
         color_depth_skew_ms=0.0,
         role="global",
         calibration_version="global-test-v1",
+        timestamp_source="arrival",
     )
     recorder = SessionRecorder(
         tmp_path,
@@ -102,7 +109,9 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
         session_name="session_test",
         queue_size=8,
     )
-    recorder.update_runtime_metadata(firmware_version="fake-mcu-v1")
+    recorder.update_runtime_metadata(
+        firmware_version="fake-mcu-v1", session_epoch=123
+    )
     recorder.record_event("episode_start", monotonic_ns=now_ns)
     frames = {"wrist": frame, "global": global_frame}
     recorder.record_sample(command, state, action=action, camera_frames=frames)
@@ -121,16 +130,19 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
             "FROM samples"
         ).fetchone()
         camera_rows = connection.execute(
-            "SELECT role, COUNT(*), COUNT(DISTINCT frame_path) "
+            "SELECT role, COUNT(*), COUNT(DISTINCT frame_path), timestamp_source "
             "FROM camera_samples GROUP BY role ORDER BY role"
         ).fetchall()
     assert row == (2, 7, 28, 28, 28, 14, 0, 0x6F, 1)
-    assert camera_rows == [("global", 2, 1), ("wrist", 2, 1)]
+    assert camera_rows == [
+        ("global", 2, 1, "arrival"),
+        ("wrist", 2, 1, "hardware_exposure"),
+    ]
     manifest = json.loads(recorder.manifest_path.read_text(encoding="utf-8"))
     assert manifest["clean_shutdown"] is True
     assert manifest["firmware_version"] == "fake-mcu-v1"
     assert manifest["robot_config_hash"] == config.config_hash
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert manifest["binary_protocol_version"] == 5
     assert manifest["state_telemetry_version"] == 4
     assert manifest["camera_rig_hash"] == config.camera_rig.config_hash
@@ -150,6 +162,81 @@ def test_session_recorder_writes_recoverable_control_and_camera_data(
     assert report.samples == 2
     assert report.camera_files == 2
     assert report.camera_frames_referenced == 2
+
+
+def test_v5_evidence_tables_store_exact_latency_clock_and_can_diagnostics(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    recorder = SessionRecorder(
+        tmp_path, config, profile, source="test", session_name="v5_evidence"
+    )
+    recorder.update_runtime_metadata(
+        firmware_version="dummy-ref-v2.2", session_epoch=9
+    )
+    exchange = TimeSyncExchange(1_000_000, 1_000, 1_010, 1_020_000)
+    model = TimeSyncModel(1, 1, 1000.0, 0.0, 10_000, 25.0, 3, 1_020_000)
+    recorder.record_time_sync(exchange, model)
+    recorder.record_can_diagnostics(
+        CanDiagnostics(
+            100,
+            1_000,
+            (1,) * 7,
+            (2,) * 7,
+            (3,) * 7,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+        ),
+        host_time_ns=2_000_000,
+    )
+    stages = (
+        (ActionStage.SAFETY_ACCEPTED, 100_000, 0),
+        (ActionStage.ACKNOWLEDGED, 120_000, 120),
+        (ActionStage.CAN_TX_COMPLETE_EXACT, 150_000, 150),
+        (ActionStage.POST_COMMAND_FEEDBACK, 170_000, 170),
+    )
+    for stage, host_ns, mcu_us in stages:
+        recorder.record_action_lifecycle(
+            ActionLifecycleUpdate(
+                3,
+                stage,
+                host_ns,
+                mcu_time_us=mcu_us,
+                session_epoch=9,
+                control_tick_id=12,
+            )
+        )
+    recorder.close()
+
+    with sqlite3.connect(recorder.db_path) as connection:
+        lifecycle = connection.execute(
+            """
+            SELECT session_epoch, control_tick_id,
+                   can_tx_complete_exact_host_ns,
+                   can_tx_complete_exact_mcu_us,
+                   accepted_to_ack_host_ns,
+                   ack_to_can_tx_complete_us,
+                   can_tx_complete_to_post_feedback_us
+            FROM action_lifecycle WHERE action_sequence = 3
+            """
+        ).fetchone()
+        time_model = connection.execute(
+            "SELECT segment_id, slope_ns_per_us, residual_ns FROM time_sync_models"
+        ).fetchone()
+        diagnostics = connection.execute(
+            "SELECT tx_error_count, max_fanout_us FROM can_diagnostics"
+        ).fetchone()
+    assert lifecycle == (9, 12, 150_000, 150, 20_000, 30, 20)
+    assert time_model == (1, 1000.0, 25.0)
+    assert diagnostics == (7, 11)
 
 
 def test_camera_archive_estimate_covers_uncompressed_arrays(config: RobotConfig) -> None:
@@ -202,6 +289,7 @@ def test_frame_archive_removes_partial_file_after_failed_atomic_write(
         depth_device_timestamp_ms=3.1,
         depth_frame_number=5,
         color_depth_skew_ms=0.1,
+        timestamp_source="hardware_exposure",
     )
     archive = NpzFrameArchive(tmp_path, sync_files=False)
 
@@ -232,6 +320,7 @@ def test_frame_archive_refuses_to_consume_disk_reserve(
         depth_device_timestamp_ms=float("nan"),
         depth_frame_number=0,
         color_depth_skew_ms=0.0,
+        timestamp_source="arrival",
     )
     archive = NpzFrameArchive(tmp_path, minimum_free_bytes=100, sync_files=False)
     monkeypatch.setattr(
@@ -276,6 +365,7 @@ def test_sample_backpressure_preserves_capacity_for_critical_events(
         depth_device_timestamp_ms=float("nan"),
         depth_frame_number=0,
         color_depth_skew_ms=0.0,
+        timestamp_source="arrival",
     )
     writer_entered = Event()
     release_writer = Event()

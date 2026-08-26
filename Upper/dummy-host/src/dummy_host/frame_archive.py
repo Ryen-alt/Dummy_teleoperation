@@ -85,6 +85,7 @@ class NpzFrameArchive:
             "device_timestamp_ms": np.float64(frame.device_timestamp_ms),
             "frame_number": np.int64(frame.frame_number),
             "calibration_version": np.asarray(frame.calibration_version),
+            "timestamp_source": np.asarray(frame.timestamp_source),
         }
         if frame.depth is not None:
             payload.update(

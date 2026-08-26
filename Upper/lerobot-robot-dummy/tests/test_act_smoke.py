@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from dummy_host.dataset.raw_session import RawSession
+
 from lerobot_robot_dummy.act_smoke import (
     ActSmokeError,
     TEMP_CLASSIFICATION,
@@ -111,6 +113,7 @@ def test_temp_recipe_enables_both_uncalibrated_source_gates() -> None:
     )
     assert recipe.allow_uncalibrated_cameras
     assert recipe.require_temporary_source
+    assert not recipe.legacy_mode
     assert recipe.required_camera_roles == ("wrist", "global")
 
 
@@ -128,8 +131,19 @@ def test_temp_fixture_writes_a_complete_dual_camera_raw_session(tmp_path: Path) 
     )
     manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["clean_shutdown"] is True
-    assert manifest["firmware_version"] == "dummy-ref-v2.1-fixture-not-hardware"
+    assert manifest["firmware_version"] == "dummy-ref-v2.2-fixture-not-hardware"
+    assert manifest["schema_version"] == 5
     assert manifest["stats"]["samples"] == 8
     assert manifest["stats"]["camera_frames"] == 16
     assert manifest["extra"]["data_classification"] == TEMP_CLASSIFICATION
     assert manifest["extra"]["real_policy_execution_allowed"] is False
+    raw = RawSession(session)
+    recipe = _load_recipe(
+        Path(__file__).parents[1] / "configs" / "export_recipe.temp_uncalibrated.yaml"
+    )
+    raw.validate_export_recipe(recipe)
+    episodes = raw.episodes()
+    assert len(episodes) == 1
+    frames = list(raw.iter_frames(episodes[0], recipe))
+    assert len(frames) == 8
+    assert all(frame.action.shape == (7,) for frame in frames)

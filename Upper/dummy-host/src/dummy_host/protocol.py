@@ -112,6 +112,49 @@ class AckPayload:
     detail: int
 
 
+@dataclass(frozen=True)
+class CanDiagnostics:
+    window_start_us: int
+    window_duration_us: int
+    target_tx_complete: tuple[int, ...]
+    position_response: tuple[int, ...]
+    temperature_response: tuple[int, ...]
+    position_timeout_count: int
+    temperature_timeout_count: int
+    tx_abort_count: int
+    tx_error_count: int
+    tx_recovery_count: int
+    safety_preemption_count: int
+    max_safety_wait_us: int
+    max_fanout_us: int
+
+    def __post_init__(self) -> None:
+        arrays = (
+            self.target_tx_complete,
+            self.position_response,
+            self.temperature_response,
+        )
+        if any(len(values) != 7 for values in arrays):
+            raise ValueError("CAN diagnostic node counters must contain seven values")
+        scalars = (
+            self.window_start_us,
+            self.window_duration_us,
+            *self.target_tx_complete,
+            *self.position_response,
+            *self.temperature_response,
+            self.position_timeout_count,
+            self.temperature_timeout_count,
+            self.tx_abort_count,
+            self.tx_error_count,
+            self.tx_recovery_count,
+            self.safety_preemption_count,
+            self.max_safety_wait_us,
+            self.max_fanout_us,
+        )
+        if any(value < 0 for value in scalars):
+            raise ValueError("CAN diagnostic counters must be non-negative")
+
+
 def crc32c(data: bytes, initial: int = 0) -> int:
     """CRC-32C (Castagnoli), compatible with the firmware implementation."""
     crc = initial ^ 0xFFFFFFFF
@@ -347,6 +390,45 @@ def unpack_time_sync_ack(payload: bytes) -> tuple[int, int, int]:
     if len(payload) != TIME_SYNC_ACK.size:
         raise ProtocolError("invalid TIME_SYNC_ACK payload length")
     return TIME_SYNC_ACK.unpack(payload)
+
+
+def pack_can_diagnostics(value: CanDiagnostics) -> bytes:
+    return CAN_DIAGNOSTICS.pack(
+        value.window_start_us,
+        value.window_duration_us,
+        *value.target_tx_complete,
+        *value.position_response,
+        *value.temperature_response,
+        value.position_timeout_count,
+        value.temperature_timeout_count,
+        value.tx_abort_count,
+        value.tx_error_count,
+        value.tx_recovery_count,
+        value.safety_preemption_count,
+        value.max_safety_wait_us,
+        value.max_fanout_us,
+    )
+
+
+def unpack_can_diagnostics(payload: bytes) -> CanDiagnostics:
+    if len(payload) != CAN_DIAGNOSTICS.size:
+        raise ProtocolError("invalid CAN_DIAGNOSTICS payload length")
+    values = CAN_DIAGNOSTICS.unpack(payload)
+    return CanDiagnostics(
+        window_start_us=values[0],
+        window_duration_us=values[1],
+        target_tx_complete=tuple(values[2:9]),
+        position_response=tuple(values[9:16]),
+        temperature_response=tuple(values[16:23]),
+        position_timeout_count=values[23],
+        temperature_timeout_count=values[24],
+        tx_abort_count=values[25],
+        tx_error_count=values[26],
+        tx_recovery_count=values[27],
+        safety_preemption_count=values[28],
+        max_safety_wait_us=values[29],
+        max_fanout_us=values[30],
+    )
 
 
 def pack_state(state: RobotState) -> bytes:

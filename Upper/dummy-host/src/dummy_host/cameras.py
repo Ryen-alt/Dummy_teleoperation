@@ -35,6 +35,7 @@ class CameraFrame:
     role: str = "wrist"
     calibration_version: str = "uncalibrated-v0"
     depth_scale: float | None = None
+    timestamp_source: str = "unknown"
 
     def __post_init__(self) -> None:
         color = np.asarray(self.color)
@@ -57,6 +58,8 @@ class CameraFrame:
             raise ValueError("camera frame numbers must be non-negative")
         if not self.role or not self.calibration_version:
             raise ValueError("camera role and calibration version are required")
+        if self.timestamp_source not in {"hardware_exposure", "arrival", "unknown"}:
+            raise ValueError("camera timestamp_source is invalid")
         if self.depth_scale is not None and (
             not np.isfinite(self.depth_scale) or self.depth_scale <= 0
         ):
@@ -353,6 +356,7 @@ class D435Camera:
                     role=self.role,
                     calibration_version=self.config.calibration_version,
                     depth_scale=self._depth_scale,
+                    timestamp_source="hardware_exposure",
                 )
                 with self._lock:
                     self._frames.append(frame)
@@ -528,6 +532,7 @@ class OpenCVCamera(SyntheticCamera):
                     color_depth_skew_ms=0.0,
                     role=self.role,
                     calibration_version=self.config.calibration_version,
+                    timestamp_source="arrival",
                 )
                 with self._lock:
                     self._frames.append(frame)
@@ -547,6 +552,7 @@ class _ReplayEntry:
     color_depth_skew_ms: float
     calibration_version: str
     frame_path: str
+    timestamp_source: str
 
 
 class ReplayCamera:
@@ -598,10 +604,20 @@ class ReplayCamera:
             with sqlite3.connect(
                 f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
             ) as connection:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(camera_samples)")
+                }
+                source_column = (
+                    "timestamp_source"
+                    if "timestamp_source" in columns
+                    else "'unknown' AS timestamp_source"
+                )
                 rows = connection.execute(
-                    """
+                    f"""
                     SELECT frame_number, capture_ns, arrival_ns,
-                           color_depth_skew_ms, calibration_version, frame_path
+                           color_depth_skew_ms, calibration_version, frame_path,
+                           {source_column}
                     FROM camera_samples
                     WHERE role = ?
                     GROUP BY frame_path
@@ -621,6 +637,7 @@ class ReplayCamera:
                 color_depth_skew_ms=float(row[3]),
                 calibration_version=str(row[4]),
                 frame_path=str(row[5]),
+                timestamp_source=str(row[6]),
             )
             for row in rows
         )
@@ -780,6 +797,7 @@ class ReplayCamera:
             role=self.role,
             calibration_version=entry.calibration_version,
             depth_scale=None if not np.isfinite(depth_scale_value) else depth_scale_value,
+            timestamp_source=entry.timestamp_source,
         )
         self._cache_index = index
         self._cache_frame = frame
