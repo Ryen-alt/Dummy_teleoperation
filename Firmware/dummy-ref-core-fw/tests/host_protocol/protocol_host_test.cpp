@@ -478,6 +478,45 @@ void TestUnverifiedConfigurationCannotAcquire()
     assert(ResponseCode(result) == ResultCode::BadConfig);
 }
 
+void TestCanDiagnosticsAreReadOnlyAfterConfiguredHello()
+{
+    ControlSession session(MakeConfig(false), "test-fw");
+    Packet diagnostics = MakePacket(MessageType::GetCanDiagnostics,
+                                    0x11223344U, 2U);
+    ProcessResult result = session.Process(diagnostics, 500U);
+    assert(ResponseCode(result) == ResultCode::BadSession);
+    assert(!result.can_diagnostics_requested);
+
+    const Packet hello = MakeConfiguredHello();
+    assert(session.Process(hello, 1000U).response.header.message_type ==
+           static_cast<uint8_t>(MessageType::HelloAck));
+    diagnostics.header.session_id = hello.header.session_id;
+    diagnostics.header.sequence = hello.header.sequence + 1U;
+    result = session.Process(diagnostics, 2000U);
+    assert(ResponseCode(result) == ResultCode::Ok);
+    assert(result.can_diagnostics_requested);
+    assert(!session.lease_active());
+    assert(session.mode() == ControlMode::Hold);
+
+    Packet malformed = diagnostics;
+    malformed.header.payload_length = 1U;
+    result = session.Process(malformed, 3000U);
+    assert(ResponseCode(result) == ResultCode::BadLength);
+    assert(!result.can_diagnostics_requested);
+
+    Packet wrong_session = diagnostics;
+    wrong_session.header.session_id ^= 0x01010101U;
+    result = session.Process(wrong_session, 4000U);
+    assert(ResponseCode(result) == ResultCode::BadSession);
+    assert(!result.can_diagnostics_requested);
+
+    Packet heartbeat = MakePacket(MessageType::Heartbeat,
+                                  hello.header.session_id,
+                                  hello.header.sequence + 2U);
+    assert(ResponseCode(session.Process(heartbeat, 5000U)) ==
+           ResultCode::NoLease);
+}
+
 void TestSessionTargetAndTimeout()
 {
     ControlSession session(MakeConfig(true), "test-fw");
@@ -1550,6 +1589,7 @@ int main()
     TestActuatorApplicationTrackerRejectsAbortAtEveryNode();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
+    TestCanDiagnosticsAreReadOnlyAfterConfiguredHello();
     TestSessionTargetAndTimeout();
     TestTargetKeepaliveIsExactAndControlBound();
     TestTelemetryMovesToLatestHelloAfterRelease();

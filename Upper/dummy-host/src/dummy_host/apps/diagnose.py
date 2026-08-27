@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import time
+from dataclasses import asdict
 
 from dummy_host.cameras import CameraManager
 from dummy_host.protocol import PROTOCOL_VERSION
@@ -43,6 +44,14 @@ def main() -> None:
             print(f"binary_protocol_version={PROTOCOL_VERSION}")
             print(f"session_epoch={robot.session_id}")
             print(f"firmware_capabilities=0x{robot.firmware_capabilities:08x}")
+            print(
+                "can_diagnostics_start="
+                + json.dumps(
+                    asdict(robot.read_can_diagnostics()),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
             started = time.monotonic()
             while args.duration is None or time.monotonic() - started < args.duration:
                 state = robot.read_state()
@@ -79,6 +88,14 @@ def main() -> None:
                         + json.dumps(transport, sort_keys=True, separators=(",", ":"))
                     )
                 time.sleep(args.interval)
+            print(
+                "can_diagnostics_end="
+                + json.dumps(
+                    asdict(robot.read_can_diagnostics()),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
     except KeyboardInterrupt:
         pass
 

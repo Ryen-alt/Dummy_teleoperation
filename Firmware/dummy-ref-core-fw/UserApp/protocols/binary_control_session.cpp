@@ -68,6 +68,19 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
             payload.host_t0_ns, now_us, now_us});
         return result;
     }
+    // CAN diagnostics are read-only evidence.  A matching, hash-validated
+    // HELLO epoch is sufficient; requiring a motion lease here makes it
+    // impossible to preflight a deliberately execution-locked robot.
+    if (message_type == MessageType::GetCanDiagnostics)
+    {
+        if (!hello_valid_ || request.header.session_id != hello_session_id_)
+            return Ack(request, ResultCode::BadSession);
+        if (request.header.payload_length != 0U)
+            return Ack(request, ResultCode::BadLength);
+        ProcessResult result = Ack(request);
+        result.can_diagnostics_requested = true;
+        return result;
+    }
     if (message_type == MessageType::EmergencyStop)
     {
         SetFault(kFaultEmergencyStop);
@@ -242,14 +255,6 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
         }
         case MessageType::ClearFault:
             return Ack(request, ResultCode::Unsupported);
-        case MessageType::GetCanDiagnostics:
-        {
-            if (request.header.payload_length != 0U)
-                return Ack(request, ResultCode::BadLength);
-            ProcessResult result = Ack(request);
-            result.can_diagnostics_requested = true;
-            return result;
-        }
         default:
             return Ack(request, ResultCode::Unsupported);
     }
