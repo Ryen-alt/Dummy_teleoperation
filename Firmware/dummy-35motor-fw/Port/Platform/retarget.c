@@ -81,15 +81,25 @@ int _lseek(int fd, int ptr, int dir)
 
 int _read(int fd, char *ptr, int len)
 {
-    HAL_StatusTypeDef hstatus;
-
     if (fd == STDIN_FILENO)
     {
-        hstatus = HAL_UART_Receive(gHuart, (uint8_t *) ptr, 1, HAL_MAX_DELAY);
+#if MOTOR_DEBUG_UART
+        if (__get_IPSR() != 0U || gHuart == NULL || ptr == NULL || len <= 0)
+        {
+            errno = EWOULDBLOCK;
+            return -1;
+        }
+        const HAL_StatusTypeDef hstatus = HAL_UART_Receive(
+            gHuart, (uint8_t *) ptr, 1, MOTOR_DEBUG_UART_TIMEOUT_MS);
         if (hstatus == HAL_OK)
             return 1;
-        else
-            return EIO;
+        errno = EIO;
+#else
+        (void) ptr;
+        (void) len;
+        errno = EWOULDBLOCK;
+#endif
+        return -1;
     }
     errno = EBADF;
     return -1;
