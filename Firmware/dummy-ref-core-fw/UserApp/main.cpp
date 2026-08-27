@@ -190,7 +190,7 @@ ScheduledActuatorRequest ReadScheduledActuatorRequest()
 
 // This task now owns enable/HOLD/FAULT and per-node target writes in addition
 // to feedback polling, so give it the same reviewed stack budget as control.
-constexpr uint32_t kCanDispatchStackBytes = 2000U;
+constexpr uint32_t kCanDispatchStackBytes = 4096U;
 static_assert(kCanDispatchStackBytes % sizeof(StackType_t) == 0U,
               "CAN dispatcher stack must be word aligned");
 StaticTask_t can_dispatch_task_control_block{};
