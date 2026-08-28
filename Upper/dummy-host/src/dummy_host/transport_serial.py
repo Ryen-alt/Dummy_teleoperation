@@ -58,6 +58,8 @@ class TransportDiagnostics:
     diagnostics_overwritten: int
     reliable_rx_overflow: int
     max_safety_wait_ns: int
+    startup_partial_frames: int
+    invalid_frames: int
 
 
 @dataclass(frozen=True)
@@ -128,7 +130,7 @@ class SerialTransport:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._serial = None
-        self.decoder = StreamDecoder()
+        self.decoder = StreamDecoder(allow_initial_partial_frame=True)
         self._estop_high_watermark = 0
         self._safety_high_watermark = 0
         self._reliable_tx_high_watermark = 0
@@ -161,7 +163,7 @@ class SerialTransport:
                 self._serial.close()
                 self._serial = None
             raise TransportError(f"cannot open serial port {self.port}: {exc}") from exc
-        self.decoder = StreamDecoder()
+        self.decoder = StreamDecoder(allow_initial_partial_frame=True)
         with self._rx_condition:
             self._rx_reliable.clear()
             self._latest_state = None
@@ -319,6 +321,8 @@ class SerialTransport:
                 diagnostics_overwritten=self._diagnostics_overwritten,
                 reliable_rx_overflow=self._reliable_rx_overflow,
                 max_safety_wait_ns=self._max_safety_wait_ns,
+                startup_partial_frames=self.decoder.initial_partial_frames,
+                invalid_frames=self.decoder.dropped_frames,
             )
 
     def _notify_tx(self, update: TransportTxUpdate) -> None:

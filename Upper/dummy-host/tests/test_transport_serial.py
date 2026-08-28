@@ -34,12 +34,39 @@ def test_serial_reader_resynchronizes_after_one_partial_frame() -> None:
     )
     transport._read_loop()
     assert transport.receive(timeout=0) == packet
+    assert transport.decoder.initial_partial_frames == 1
+    assert transport.decoder.dropped_frames == 0
+
+
+def test_serial_reader_counts_invalid_frame_after_startup_alignment() -> None:
+    transport = SerialTransport("unused")
+    packet = Packet(MessageType.HELLO_ACK, 7, 3, 11, b"payload")
+    transport._serial = _ChunkSerial(
+        transport,
+        [b"tail-from-an-old-frame\x00", b"\x01\x00", encode_packet(packet)],
+    )
+    transport._read_loop()
+    assert transport.receive(timeout=0) == packet
+    assert transport.decoder.initial_partial_frames == 1
     assert transport.decoder.dropped_frames == 1
+
+
+def test_serial_reader_treats_initial_overlong_fragment_as_alignment() -> None:
+    transport = SerialTransport("unused")
+    packet = Packet(MessageType.HELLO_ACK, 7, 3, 11, b"payload")
+    transport._serial = _ChunkSerial(
+        transport,
+        [b"x" * 601 + b"tail\x00", encode_packet(packet)],
+    )
+    transport._read_loop()
+    assert transport.receive(timeout=0) == packet
+    assert transport.decoder.initial_partial_frames == 1
+    assert transport.decoder.dropped_frames == 0
 
 
 def test_serial_reader_stops_after_persistent_invalid_frames() -> None:
     transport = SerialTransport("unused", max_consecutive_invalid_frames=3)
-    transport._serial = _ChunkSerial(transport, [b"\x01\x00" * 4])
+    transport._serial = _ChunkSerial(transport, [b"\x01\x00" * 5])
     transport._read_loop()
     with pytest.raises(TransportError, match="too many consecutive invalid serial frames"):
         transport.receive(timeout=0)

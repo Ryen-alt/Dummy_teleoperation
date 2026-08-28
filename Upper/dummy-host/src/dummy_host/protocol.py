@@ -356,25 +356,52 @@ def decode_packet(frame: bytes) -> Packet:
 
 
 class StreamDecoder:
-    def __init__(self, max_encoded_size: int = 600) -> None:
+    def __init__(
+        self,
+        max_encoded_size: int = 600,
+        *,
+        allow_initial_partial_frame: bool = False,
+    ) -> None:
         self._buffer = bytearray()
         self.max_encoded_size = max_encoded_size
         self.dropped_frames = 0
+        self.initial_partial_frames = 0
+        self._allow_initial_partial_frame = allow_initial_partial_frame
+        self._has_frame_boundary = not allow_initial_partial_frame
+        self._discard_until_boundary = False
 
     def feed(self, data: bytes) -> list[Packet]:
         packets: list[Packet] = []
         for byte in data:
             if byte == 0:
-                if self._buffer:
+                if self._discard_until_boundary:
+                    self._discard_until_boundary = False
+                    self._buffer.clear()
+                elif self._buffer:
                     try:
                         packets.append(decode_packet(bytes(self._buffer)))
                     except ProtocolError:
-                        self.dropped_frames += 1
+                        if self._has_frame_boundary:
+                            self.dropped_frames += 1
+                        else:
+                            # A continuously streaming serial producer can be
+                            # opened in the middle of a valid frame.  Bytes
+                            # before the first observed delimiter have no
+                            # trustworthy start boundary and are alignment,
+                            # not evidence of an on-wire CRC/COBS failure.
+                            self.initial_partial_frames += 1
                     self._buffer.clear()
+                self._has_frame_boundary = True
+                continue
+            if self._discard_until_boundary:
                 continue
             if len(self._buffer) >= self.max_encoded_size:
                 self._buffer.clear()
-                self.dropped_frames += 1
+                if self._has_frame_boundary:
+                    self.dropped_frames += 1
+                else:
+                    self.initial_partial_frames += 1
+                self._discard_until_boundary = True
             else:
                 self._buffer.append(byte)
         return packets
