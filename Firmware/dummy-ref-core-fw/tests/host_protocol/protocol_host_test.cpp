@@ -998,6 +998,57 @@ void TestCanDispatcherContinuesSweepAndRetriesOnlyMissingNode()
     }
 }
 
+void TestCanDispatcherSweepIdentityAdvancesPastObservedHardwareBoundary()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    scheduler.Next(0U);
+
+    uint32_t now_us = 25000U;
+    uint32_t completed_sweeps = 0U;
+    uint32_t previous_sweep_id = 0U;
+    bool injected_timeout = false;
+    FeedbackResponseEvents responses{};
+    while (completed_sweeps < 18000U)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.action != CanDispatchAction::PositionRequest)
+        {
+            now_us += 100U;
+            continue;
+        }
+
+        if (step.feedback_sweep_id != previous_sweep_id)
+        {
+            if (previous_sweep_id != 0U)
+                assert(step.feedback_sweep_id == previous_sweep_id + 1U);
+            previous_sweep_id = step.feedback_sweep_id;
+            ++completed_sweeps;
+        }
+        scheduler.OnQueued(step, now_us);
+
+        // Exercise the exact 0x44ff -> 0x4500 transition observed on hardware,
+        // including the bounded skip-and-retry path immediately before it.
+        if (!injected_timeout && step.feedback_sweep_id == 0x44ffU &&
+            step.node_id == 1U)
+        {
+            injected_timeout = true;
+            now_us += config.response_timeout_us;
+        }
+        else
+        {
+            responses.position_mask = static_cast<uint8_t>(
+                1U << (step.node_id - 1U));
+            now_us += 100U;
+        }
+    }
+    assert(injected_timeout);
+    assert(previous_sweep_id >= 0x4500U);
+}
+
 void TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion()
 {
     CanDispatchConfig config{};
@@ -1576,6 +1627,7 @@ int main()
     TestCanDispatcherTransitionsAndFrequencyPlan();
     TestCanDispatcherWaitsForResponseAndTimesOut();
     TestCanDispatcherContinuesSweepAndRetriesOnlyMissingNode();
+    TestCanDispatcherSweepIdentityAdvancesPastObservedHardwareBoundary();
     TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion();
     TestCanDispatcherPreflightTimeoutStopsEnable();
     TestCanDispatcherDoesNotBurstAfterDeferredDeadline();

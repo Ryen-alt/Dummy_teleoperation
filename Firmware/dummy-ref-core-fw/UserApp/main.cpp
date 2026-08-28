@@ -225,6 +225,18 @@ void ThreadControlLoopFixUpdate(void* argument)
 
         const uint64_t now_us = dummy::protocol::BinaryControlMonotonicMicros();
         const auto binary_snapshot = dummy::protocol::ReadBinaryControlSnapshot(now_us);
+        // A configured binary HELLO claims the actuator path even before a
+        // control lease is acquired.  Read-only diagnostics deliberately run
+        // in that pre-lease interval; allowing the legacy 200 Hz writer to
+        // continue would emit 0x07 commands whose mandatory 0x23 ACKs are
+        // indistinguishable from position-query responses and corrupt
+        // coherent sweep attribution.  Ownership remains latched so a serial
+        // disconnect can never silently restore the legacy writer.
+        if (binary_snapshot.hello_valid && !binary_actuator_owner_latched)
+        {
+            binary_actuator_owner_latched = true;
+            PublishActuatorMode(ScheduledActuatorMode::Hold, measured_position);
+        }
         const bool binary_motion_mode =
             binary_snapshot.mode == dummy::protocol::ControlMode::Teleop ||
             binary_snapshot.mode == dummy::protocol::ControlMode::Policy;
@@ -288,6 +300,7 @@ void ThreadControlLoopFixUpdate(void* argument)
         {
             if (binary_actuator_owner_latched)
             {
+                PublishActuatorMode(ScheduledActuatorMode::Hold, measured_position);
                 robot.UpdateJointPose6D();
             }
             else if (robot.IsEnabled())
