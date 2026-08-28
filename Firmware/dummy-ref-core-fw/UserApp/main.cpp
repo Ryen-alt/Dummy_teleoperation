@@ -658,7 +658,8 @@ void ThreadCanDispatch(void* argument)
             while (CanTakeRxFrame(rx_context, rx_frame))
             {
                 const uint32_t dispatch_latency_us =
-                    micros() - rx_frame.received_us;
+                    dummy::protocol::RecentElapsedMicros32(
+                        micros(), rx_frame.received_us);
                 max_rx_dispatch_latency_us = std::max(
                     max_rx_dispatch_latency_us, dispatch_latency_us);
                 OnCanMessage(

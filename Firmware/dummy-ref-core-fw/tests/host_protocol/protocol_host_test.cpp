@@ -214,6 +214,10 @@ void TestCodecVectors()
 
 void TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap()
 {
+    assert(RecentElapsedMicros32(1100U, 1000U) == 100U);
+    assert(RecentElapsedMicros32(1000U, 1001U) == 0U);
+    assert(RecentElapsedMicros32(5U, 0xFFFFFFF0U) == 21U);
+
     MonotonicMicros32 clock;
     assert(clock.Extend(1000U) == 1000U);
     assert(clock.Extend(1100U) == 1100U);
@@ -336,6 +340,21 @@ void TestCanFeedbackMonitorClampsConcurrentFutureTimestampAndPreservesWrap()
         1, std::numeric_limits<uint32_t>::max() - 499U);
     status = monitor.Snapshot(500U);
     assert(status[0].position_age_ms == 1U);
+
+    // The final response in a coherent sweep can carry a slightly regressed
+    // micros() value at a SysTick boundary.  Earlier samples must not appear
+    // almost 2^32 us old and invalidate feedback readiness.
+    monitor.Reset();
+    for (uint8_t node = 1U; node <= 7U; ++node)
+    {
+        monitor.OnPositionRequest(node, 900U, 77U);
+        monitor.OnPositionResponse(
+            node, node < 7U ? 1000U + node : 999U);
+    }
+    const auto coherent = monitor.CoherentSnapshot();
+    assert(coherent.valid);
+    assert(coherent.sweep_id == 77U);
+    assert(coherent.max_skew_us == 0U);
 }
 
 void TestCanFeedbackMonitorPublishesOnlyCompleteLowSkewSweep()

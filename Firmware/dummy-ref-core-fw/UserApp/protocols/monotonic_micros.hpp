@@ -6,6 +6,18 @@
 namespace dummy::protocol
 {
 
+// Measure a short interval between two samples of the wrapping 32-bit
+// microsecond clock.  An ISR may capture `then_us` just after a task captured
+// `now_us`; that small apparent future timestamp must be treated as zero, not
+// as an interval near 2^32 us.  Genuine counter wrap still produces a small
+// positive result.
+inline uint32_t RecentElapsedMicros32(uint32_t now_us, uint32_t then_us)
+{
+    const uint32_t elapsed_us = now_us - then_us;
+    constexpr uint32_t kHalfRange = uint32_t{1} << 31U;
+    return elapsed_us >= kHalfRange ? 0U : elapsed_us;
+}
+
 // Reconstruct a recent 32-bit sample timestamp against an extended current
 // time. CAN RX may publish a sample a few microseconds after the caller took
 // its `now_us` snapshot. Treat that small apparent future offset as zero age;
@@ -21,7 +33,7 @@ inline uint64_t ExtendRecentMicros32(uint64_t now_us, uint32_t sample_low_us)
         return now_us;
     }
 
-    const uint32_t age_us = now_low_us - sample_low_us;
+    const uint32_t age_us = RecentElapsedMicros32(now_low_us, sample_low_us);
     return static_cast<uint64_t>(age_us) > now_us
         ? now_us : now_us - age_us;
 }

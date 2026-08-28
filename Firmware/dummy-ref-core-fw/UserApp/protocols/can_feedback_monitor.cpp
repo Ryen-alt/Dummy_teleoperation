@@ -1,4 +1,5 @@
 #include "can_feedback_monitor.hpp"
+#include "monotonic_micros.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,17 +20,7 @@ uint8_t NodeMask(uint8_t node_id)
 
 uint32_t AgeMilliseconds(uint32_t now_us, uint32_t then_us)
 {
-    const uint32_t elapsed_us = now_us - then_us;
-    constexpr uint32_t kHalfCounterRange = uint32_t{1} << 31U;
-
-    // A CAN RX interrupt can publish a response timestamp just after a task
-    // captured now_us but before that task snapshots the monitor. In modular
-    // arithmetic that small future timestamp looks almost 2^32 us old. Treat
-    // the negative half of the counter range as a concurrent future sample;
-    // genuine 32-bit timer wrap still produces a small positive elapsed value.
-    if (elapsed_us >= kHalfCounterRange)
-        return 0U;
-    return elapsed_us / 1000U;
+    return RecentElapsedMicros32(now_us, then_us) / 1000U;
 }
 }
 
@@ -150,7 +141,8 @@ bool CanFeedbackMonitor::OnPositionResponse(uint8_t node_id, uint32_t now_us)
         if (!candidate.position_seen ||
             candidate.position_sweep_id != candidate_sweep)
             return true;
-        const uint32_t age_us = now_us - candidate.last_position_us;
+        const uint32_t age_us = RecentElapsedMicros32(
+            now_us, candidate.last_position_us);
         if (first)
         {
             newest_age_us = age_us;
