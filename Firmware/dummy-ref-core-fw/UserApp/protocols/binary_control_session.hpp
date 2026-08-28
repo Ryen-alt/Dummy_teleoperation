@@ -17,6 +17,8 @@ struct SessionConfig
     std::array<float, 6> joint_max_rad{};
     std::array<float, 6> max_velocity_rad_s{};
     bool hardware_parameters_verified = false;
+    bool external_target_execution_ready = false;
+    bool external_target_acceptance_ready = false;
     uint32_t max_lease_ms = 1000;
     uint16_t max_target_ttl_ms = 250;
 };

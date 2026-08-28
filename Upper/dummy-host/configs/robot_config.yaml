@@ -1,11 +1,15 @@
 robot_id: dummy_v2_001
-config_version: 8
+config_version: 9
 # Operator-confirmed arm/gripper calibration baseline. Changing a robot-safety
 # value changes the robot hash and requires regenerating/reflashing firmware.
 # Camera fields have their own rig hash and may be overridden by --camera-rig.
 robot_calibration_id: dummy_v2_001-arm-gripper-20260821-v2
 hardware_parameters_verified: true
 external_target_execution_ready: false
+# Provisional H4 engineering gate. It permits only an explicitly acknowledged,
+# dead-man supervised TELEOP acceptance session; POLICY remains fail-closed in
+# both host and firmware. Set this back to false on any H4-H7 failure.
+external_target_acceptance_ready: true
 
 joint_order: [joint1, joint2, joint3, joint4, joint5, joint6, gripper]
 joint_unit: rad

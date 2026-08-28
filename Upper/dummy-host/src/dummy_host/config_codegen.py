@@ -40,7 +40,10 @@ def _hash_array(config_hash: bytes) -> str:
 def render_firmware_header(
     config: RobotConfig,
 ) -> str:
-    if config.external_target_execution_ready and not config.hardware_parameters_verified:
+    if (
+        config.external_target_execution_ready
+        or config.external_target_acceptance_ready
+    ) and not config.hardware_parameters_verified:
         raise ConfigGenerationError(
             "external target execution cannot be enabled while hardware parameters are unverified"
         )
@@ -66,6 +69,8 @@ def render_firmware_header(
         + ("true;" if config.hardware_parameters_verified else "false;"),
         "constexpr bool kExternalTargetExecutionReady = "
         + ("true;" if config.external_target_execution_ready else "false;"),
+        "constexpr bool kExternalTargetAcceptanceReady = "
+        + ("true;" if config.external_target_acceptance_ready else "false;"),
         "constexpr std::array<uint8_t, 32> kConfigSha256 = {",
         _hash_array(config.config_hash_bytes),
         "};",
@@ -107,6 +112,7 @@ def render_firmware_header(
         f"constexpr float kMaxTargetOvershootRad = {_cpp_float(config.max_target_overshoot_rad)};",
         "",
         "static_assert(kFirmwareLoopHz == 200U, \"firmware loop contract changed\");",
+        "static_assert(!(kExternalTargetExecutionReady && kExternalTargetAcceptanceReady), \"production and acceptance gates must be mutually exclusive\");",
         "static_assert(kCanSchedulerWatchdogHz >= 100U && kCanSchedulerWatchdogHz <= 5000U, \"CAN scheduler watchdog rate is outside the reviewed range\");",
         "static_assert(kCanResponseTimeoutUs <= kCanNodeQuietUs, \"CAN response timeout must fit inside the node quiet interval\");",
         "static_assert(kCanTargetFanoutTimeoutUs >= kCanTxAbortTimeoutUs, \"CAN fanout deadline must cover one transport abort deadline\");",

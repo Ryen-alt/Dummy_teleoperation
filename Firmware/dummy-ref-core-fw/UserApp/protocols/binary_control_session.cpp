@@ -104,7 +104,9 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
             return Ack(request, ResultCode::BadConfig);
         if (!ReadPayload(request, payload))
             return Ack(request, ResultCode::BadLength);
-        if (!config_.hardware_parameters_verified)
+        if (!config_.hardware_parameters_verified ||
+            (!config_.external_target_execution_ready &&
+             !config_.external_target_acceptance_ready))
             return Ack(request, ResultCode::BadConfig);
         if (fault_bits_ != 0)
             return Ack(request, ResultCode::FaultActive);
@@ -181,6 +183,13 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
             if (requested_mode != ControlMode::Hold && requested_mode != ControlMode::Teleop &&
                 requested_mode != ControlMode::Policy)
                 return Ack(request, ResultCode::BadMode);
+            if (requested_mode == ControlMode::Teleop &&
+                !config_.external_target_execution_ready &&
+                !config_.external_target_acceptance_ready)
+                return Ack(request, ResultCode::BadConfig);
+            if (requested_mode == ControlMode::Policy &&
+                !config_.external_target_execution_ready)
+                return Ack(request, ResultCode::BadConfig);
             if (fault_bits_ != 0)
                 return Ack(request, ResultCode::FaultActive);
             active_target_ = {};

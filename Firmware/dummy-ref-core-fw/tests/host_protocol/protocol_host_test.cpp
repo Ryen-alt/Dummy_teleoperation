@@ -122,7 +122,8 @@ uint16_t ResponseDetail(const ProcessResult& result)
     return payload.detail;
 }
 
-SessionConfig MakeConfig(bool verified)
+SessionConfig MakeConfig(bool verified, bool execution_ready = true,
+                         bool acceptance_ready = false)
 {
     SessionConfig config{};
     config.config_sha256 = dummy::generated_config::kConfigSha256;
@@ -130,6 +131,8 @@ SessionConfig MakeConfig(bool verified)
     config.joint_max_rad = dummy::generated_config::kJointMaxRad;
     config.max_velocity_rad_s = dummy::generated_config::kMaxVelocityRadS;
     config.hardware_parameters_verified = verified;
+    config.external_target_execution_ready = verified && execution_ready;
+    config.external_target_acceptance_ready = verified && acceptance_ready;
     config.max_lease_ms = 1000;
     config.max_target_ttl_ms = 250;
     return config;
@@ -495,6 +498,46 @@ void TestUnverifiedConfigurationCannotAcquire()
     const ProcessResult result = session.Process(acquire, 2000);
     assert(result.response.header.message_type == static_cast<uint8_t>(MessageType::Nack));
     assert(ResponseCode(result) == ResultCode::BadConfig);
+}
+
+void TestAcceptanceConfigurationAllowsOnlyTeleop()
+{
+    ControlSession session(MakeConfig(true, false, true), "test-fw");
+    session.SetControlReady(true);
+    const Packet hello = MakeConfiguredHello();
+    session.Process(hello, 1000U);
+
+    Packet acquire = MakePacket(MessageType::AcquireControl,
+                                hello.header.session_id,
+                                hello.header.sequence + 1U);
+    SetPayload(acquire, AcquireControlPayload{500U});
+    assert(ResponseCode(session.Process(acquire, 2000U)) == ResultCode::Ok);
+
+    Packet policy = MakePacket(MessageType::SetMode, hello.header.session_id,
+                               hello.header.sequence + 2U);
+    SetPayload(policy, SetModePayload{static_cast<uint8_t>(ControlMode::Policy)});
+    assert(ResponseCode(session.Process(policy, 3000U)) == ResultCode::BadConfig);
+    assert(session.mode() == ControlMode::Hold);
+
+    Packet teleop = MakePacket(MessageType::SetMode, hello.header.session_id,
+                               hello.header.sequence + 3U);
+    SetPayload(teleop, SetModePayload{static_cast<uint8_t>(ControlMode::Teleop)});
+    assert(ResponseCode(session.Process(teleop, 4000U)) == ResultCode::Ok);
+    assert(session.mode() == ControlMode::Teleop);
+}
+
+void TestConfiguredButExecutionLockedCannotAcquire()
+{
+    ControlSession session(MakeConfig(true, false, false), "test-fw");
+    session.SetControlReady(true);
+    const Packet hello = MakeConfiguredHello();
+    session.Process(hello, 1000U);
+    Packet acquire = MakePacket(MessageType::AcquireControl,
+                                hello.header.session_id,
+                                hello.header.sequence + 1U);
+    SetPayload(acquire, AcquireControlPayload{500U});
+    assert(ResponseCode(session.Process(acquire, 2000U)) == ResultCode::BadConfig);
+    assert(!session.lease_active());
 }
 
 void TestCanDiagnosticsAreReadOnlyAfterConfiguredHello()
@@ -1660,6 +1703,8 @@ int main()
     TestActuatorApplicationTrackerRejectsAbortAtEveryNode();
     TestUrdfJointSpaceMapping();
     TestUnverifiedConfigurationCannotAcquire();
+    TestAcceptanceConfigurationAllowsOnlyTeleop();
+    TestConfiguredButExecutionLockedCannotAcquire();
     TestCanDiagnosticsAreReadOnlyAfterConfiguredHello();
     TestSessionTargetAndTimeout();
     TestTargetKeepaliveIsExactAndControlBound();

@@ -13,14 +13,15 @@ namespace dummy::generated_config
 {
 constexpr char kRobotId[] = "dummy_v2_001";
 constexpr char kRobotCalibrationId[] = "dummy_v2_001-arm-gripper-20260821-v2";
-constexpr uint32_t kConfigVersion = 8U;
+constexpr uint32_t kConfigVersion = 9U;
 constexpr bool kHardwareParametersVerified = true;
 constexpr bool kExternalTargetExecutionReady = false;
+constexpr bool kExternalTargetAcceptanceReady = true;
 constexpr std::array<uint8_t, 32> kConfigSha256 = {
-    0xa5, 0xf9, 0x9d, 0x2d, 0xe3, 0x20, 0x13, 0x11,
-    0xe3, 0x4d, 0x9e, 0x0d, 0xde, 0xbf, 0xa6, 0x88,
-    0x61, 0x0c, 0x70, 0x3b, 0x2a, 0x4f, 0xb8, 0xa7,
-    0xa1, 0x07, 0x3a, 0x14, 0x80, 0xfe, 0x12, 0xfe,
+    0xf5, 0xb8, 0x9f, 0xe5, 0xc8, 0xd0, 0x5f, 0xab,
+    0xb5, 0x0a, 0xaf, 0xa2, 0xb3, 0x6a, 0x7e, 0xf2,
+    0x9d, 0xf7, 0x9c, 0xe0, 0x27, 0xcd, 0xe2, 0x6a,
+    0x95, 0x10, 0xc2, 0xb1, 0x0b, 0x13, 0xd4, 0x0d,
 };
 
 constexpr std::array<float, 6> kJointZeroOffsetRad = {0.0F, -1.2740901F, 3.141593F, 0.0F, 0.0F, 0.0F};
@@ -60,6 +61,7 @@ constexpr uint32_t kLeaseTimeoutMs = 500U;
 constexpr float kMaxTargetOvershootRad = 0.1F;
 
 static_assert(kFirmwareLoopHz == 200U, "firmware loop contract changed");
+static_assert(!(kExternalTargetExecutionReady && kExternalTargetAcceptanceReady), "production and acceptance gates must be mutually exclusive");
 static_assert(kCanSchedulerWatchdogHz >= 100U && kCanSchedulerWatchdogHz <= 5000U, "CAN scheduler watchdog rate is outside the reviewed range");
 static_assert(kCanResponseTimeoutUs <= kCanNodeQuietUs, "CAN response timeout must fit inside the node quiet interval");
 static_assert(kCanTargetFanoutTimeoutUs >= kCanTxAbortTimeoutUs, "CAN fanout deadline must cover one transport abort deadline");

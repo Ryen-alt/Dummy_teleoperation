@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -103,6 +104,11 @@ class V221WithoutCanDiagnosticsV2(FakeMcuTransport):
         FakeMcuTransport.firmware_capabilities
         & ~CAPABILITY_CAN_DIAGNOSTICS_V2
     )
+
+
+class CurrentV221RealTransport(FakeMcuTransport):
+    is_simulated = False
+    firmware_version = "dummy-ref-v2.2.1"
 
 
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
@@ -249,6 +255,41 @@ def test_v221_firmware_without_diagnostics_v2_is_rejected(config) -> None:
     with pytest.raises(ConfigError, match="missing required protocol-v5"):
         robot.connect()
     assert not robot.is_connected
+
+
+def test_acceptance_gate_requires_explicit_session_and_blocks_policy(config) -> None:
+    robot = DummyRobot(config, CurrentV221RealTransport(config))
+    with robot:
+        with pytest.raises(ConfigError, match="explicit acceptance session"):
+            robot.acquire_control(ControlMode.TELEOP)
+
+    robot = DummyRobot(
+        config,
+        CurrentV221RealTransport(config),
+        acceptance_session=True,
+    )
+    with robot:
+        robot.acquire_control(ControlMode.TELEOP)
+
+    robot = DummyRobot(
+        config,
+        CurrentV221RealTransport(config),
+        acceptance_session=True,
+    )
+    with robot:
+        with pytest.raises(ConfigError, match="POLICY execution is not production-ready"):
+            robot.acquire_control(ControlMode.POLICY)
+
+
+def test_production_gate_allows_real_policy(config) -> None:
+    production = replace(
+        config,
+        external_target_execution_ready=True,
+        external_target_acceptance_ready=False,
+    )
+    robot = DummyRobot(production, CurrentV221RealTransport(production))
+    with robot:
+        robot.acquire_control(ControlMode.POLICY)
 
 
 def test_state_replay_recovers_complete_action_when_every_event_is_lost(config) -> None:

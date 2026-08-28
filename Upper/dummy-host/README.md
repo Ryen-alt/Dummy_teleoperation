@@ -142,12 +142,19 @@ dummy-host-teleop-collect \
   --input-config configs/teleop_inputs.yaml \
   --source gamepad --mode cartesian --device auto \
   --execute --port /dev/ttyACM0 \
+  --acceptance-session \
+  --acknowledge-real-risk I_ACCEPT_SUPERVISED_REAL_TELEOP \
   --urdf ../../Dummy_URDF/dummy.urdf \
   --cartesian-calibration /path/to/site-validated-cartesian.yaml \
   --allow-joint 1 --allow-joint 2 --allow-joint 3 \
   --allow-joint 4 --allow-joint 5 --allow-joint 6 \
   --session-root sessions/real
 ```
+
+当 canonical 配置为 `external_target_execution_ready=false`、
+`external_target_acceptance_ready=true` 时，上述两个 acceptance 参数是强制项，且固件只接受
+TELEOP；POLICY 仍被 host 与固件共同拒绝。H0～H7 全部 PASS 并切换为 production gate 后，
+不得再携带 acceptance 参数。
 
 连接后必须连续三个 coherent sweep 落入标定的 ready tolerance，才会进入首次控制权
 获取。校准原件、hash、ready pose、TCP 变换和实际 base/tip frame 会归档到 Raw

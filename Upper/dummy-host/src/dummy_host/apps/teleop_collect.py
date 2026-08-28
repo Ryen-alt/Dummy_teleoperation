@@ -27,10 +27,49 @@ from dummy_host.kinematics import (
 from dummy_host.kinematics.contracts import KinematicsError
 from dummy_host.recording import SessionRecorder, estimate_camera_archive_bytes
 from dummy_host.robot_driver import DummyRobot
-from dummy_host.schema import ConfigError, load_robot_config, validate_camera_rig_for_formal_collection
+from dummy_host.schema import (
+    ConfigError,
+    RobotConfig,
+    load_robot_config,
+    validate_camera_rig_for_formal_collection,
+)
 from dummy_host.teleop import load_teleop_profile, validate_profile_for_robot
 from dummy_host.teleop_runtime import run_teleop_collection
 from dummy_host.transport_serial import SerialTransport
+
+
+ACCEPTANCE_RISK_ACKNOWLEDGEMENT = "I_ACCEPT_SUPERVISED_REAL_TELEOP"
+
+
+def validate_execution_authority(
+    config: RobotConfig,
+    *,
+    execute: bool,
+    acceptance_session: bool,
+    risk_acknowledgement: str | None,
+) -> str:
+    if not execute:
+        if acceptance_session or risk_acknowledgement:
+            raise ConfigError(
+                "acceptance-session options require real execution"
+            )
+        return "simulation"
+    if config.external_target_execution_ready:
+        if acceptance_session or risk_acknowledgement:
+            raise ConfigError(
+                "acceptance options are invalid for a production-ready configuration"
+            )
+        return "production_teleop"
+    if not config.external_target_acceptance_ready:
+        raise ConfigError("real TELEOP is blocked by both production and acceptance gates")
+    if not acceptance_session:
+        raise ConfigError("acceptance-only real TELEOP requires --acceptance-session")
+    if risk_acknowledgement != ACCEPTANCE_RISK_ACKNOWLEDGEMENT:
+        raise ConfigError(
+            "acceptance-only real TELEOP requires --acknowledge-real-risk "
+            + ACCEPTANCE_RISK_ACKNOWLEDGEMENT
+        )
+    return "acceptance_teleop"
 
 
 def main() -> None:
@@ -66,6 +105,18 @@ def main() -> None:
     transport.add_argument("--simulate", action="store_true", help="use FakeMcuTransport")
     transport.add_argument("--execute", action="store_true", help="use the real USB CDC serial link")
     parser.add_argument("--port", help="required with --execute, for example /dev/ttyACM0")
+    parser.add_argument(
+        "--acceptance-session",
+        action="store_true",
+        help="authorize an engineering TELEOP session when only the acceptance gate is enabled",
+    )
+    parser.add_argument(
+        "--acknowledge-real-risk",
+        help=(
+            "required literal for an acceptance session: "
+            f"{ACCEPTANCE_RISK_ACKNOWLEDGEMENT}"
+        ),
+    )
     parser.add_argument("--session-root", required=True)
     parser.add_argument("--duration", type=float)
     parser.add_argument(
@@ -104,6 +155,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.execute and not args.port:
         parser.error("--execute requires --port")
+    if not args.execute and (args.acceptance_session or args.acknowledge_real_risk):
+        parser.error(
+            "--acceptance-session/--acknowledge-real-risk require --execute"
+        )
     if args.require_camera and not args.with_cameras:
         parser.error("--require-camera also requires --with-cameras")
     if args.temporary_uncalibrated and not args.with_cameras:
@@ -134,6 +189,15 @@ def main() -> None:
         parser.error("real Cartesian teleoperation requires --allow-joint 1 through 6")
 
     config = load_robot_config(args.config, camera_rig_path=args.camera_rig)
+    try:
+        execution_authority = validate_execution_authority(
+            config,
+            execute=args.execute,
+            acceptance_session=args.acceptance_session,
+            risk_acknowledgement=args.acknowledge_real_risk,
+        )
+    except ConfigError as exc:
+        parser.error(str(exc))
     if args.require_camera:
         try:
             validate_camera_rig_for_formal_collection(config.camera_rig)
@@ -218,7 +282,12 @@ def main() -> None:
         )
     camera_manager = CameraManager.from_config(config.camera_rig) if args.with_cameras else None
     packet_transport = FakeMcuTransport(config) if args.simulate else SerialTransport(args.port)
-    robot = DummyRobot(config, packet_transport, camera_manager=camera_manager)
+    robot = DummyRobot(
+        config,
+        packet_transport,
+        camera_manager=camera_manager,
+        acceptance_session=bool(args.execute and args.acceptance_session),
+    )
     estimated_camera_bytes = (
         estimate_camera_archive_bytes(config, args.duration)
         if args.with_cameras and args.duration is not None
@@ -271,6 +340,8 @@ def main() -> None:
             ),
             "offline_training_only": args.temporary_uncalibrated,
             "real_policy_execution_allowed": False,
+            "acceptance_session": bool(args.execute and args.acceptance_session),
+            "execution_authority": execution_authority,
             "allowed_joints": list(range(1, 7))
             if args.simulate and args.allow_joint is None
             else sorted(set(args.allow_joint or ())),

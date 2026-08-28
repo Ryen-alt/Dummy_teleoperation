@@ -75,6 +75,7 @@ class RobotConfig:
     robot_calibration_id: str
     hardware_parameters_verified: bool
     external_target_execution_ready: bool
+    external_target_acceptance_ready: bool
     joint_order: tuple[str, ...]
     joint_unit: str
     action_semantics: str
@@ -460,9 +461,21 @@ def load_robot_config(
     execution_ready = raw.get("external_target_execution_ready")
     if not isinstance(execution_ready, bool):
         raise ConfigError("external_target_execution_ready must be boolean")
+    acceptance_ready = raw.get("external_target_acceptance_ready")
+    if not isinstance(acceptance_ready, bool):
+        raise ConfigError("external_target_acceptance_ready must be boolean")
     if execution_ready and not verified:
         raise ConfigError(
             "external_target_execution_ready requires hardware_parameters_verified"
+        )
+    if acceptance_ready and not verified:
+        raise ConfigError(
+            "external_target_acceptance_ready requires hardware_parameters_verified"
+        )
+    if execution_ready and acceptance_ready:
+        raise ConfigError(
+            "external_target_acceptance_ready must be false when "
+            "external_target_execution_ready is true"
         )
     robot_calibration_id = raw.get("robot_calibration_id")
     if not isinstance(robot_calibration_id, str) or not robot_calibration_id.strip():
@@ -519,6 +532,7 @@ def load_robot_config(
         robot_calibration_id=robot_calibration_id,
         hardware_parameters_verified=verified,
         external_target_execution_ready=execution_ready,
+        external_target_acceptance_ready=acceptance_ready,
         joint_order=order,
         joint_unit="rad",
         action_semantics="absolute_joint_position",

@@ -243,6 +243,7 @@ class SessionRecorder:
             "robot_calibration_id": robot_config.robot_calibration_id,
             "hardware_parameters_verified": robot_config.hardware_parameters_verified,
             "external_target_execution_ready": robot_config.external_target_execution_ready,
+            "external_target_acceptance_ready": robot_config.external_target_acceptance_ready,
             "camera_rig_id": robot_config.camera_rig.rig_id,
             "camera_rig_version": robot_config.camera_rig.version,
             "camera_rig_hash": robot_config.camera_rig.config_hash,

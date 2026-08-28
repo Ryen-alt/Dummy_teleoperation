@@ -296,6 +296,11 @@ def main() -> None:
         parser.error("--port/--acknowledge-real-risk are only valid with --execute-real")
 
     config = load_robot_config(args.config)
+    if args.execute_real and not (
+        config.external_target_execution_ready
+        or config.external_target_acceptance_ready
+    ):
+        parser.error("real fault injection is blocked by both external target gates")
     scenarios = tuple(args.scenario or SCENARIOS)
     report = run_fault_injection(
         config,

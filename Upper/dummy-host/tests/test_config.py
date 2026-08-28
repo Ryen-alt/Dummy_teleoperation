@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
+import pytest
 
 from dummy_host.schema import (
     ConfigError,
@@ -19,7 +20,7 @@ def test_config_is_deterministic_and_calibrated(config) -> None:
     assert len(config.config_hash) == 64
     assert tuple(config.cameras) == ("wrist",)
     assert config.cameras["wrist"].model == "D435"
-    assert config.config_version == 8
+    assert config.config_version == 9
     assert config.can_scheduler_watchdog_hz == 1000
     assert config.can_target_hz_per_node == 50
     assert config.can_position_hz_per_node == 40
@@ -31,6 +32,7 @@ def test_config_is_deterministic_and_calibrated(config) -> None:
     assert config.joint_reduction.tolist() == [50.0] * 6
     assert config.hardware_parameters_verified
     assert not config.external_target_execution_ready
+    assert config.external_target_acceptance_ready
     assert config.can_node_quiet_us == 5_000
     assert config.can_response_timeout_us == 4_000
     assert config.can_tx_abort_timeout_us == 5_000
@@ -81,6 +83,7 @@ def test_execution_ready_requires_verified_hardware(tmp_path) -> None:
     raw = yaml.safe_load(source.read_text(encoding="utf-8"))
     raw["hardware_parameters_verified"] = False
     raw["external_target_execution_ready"] = True
+    raw["external_target_acceptance_ready"] = False
     bad = tmp_path / "bad-gate.yaml"
     bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
     try:
@@ -89,6 +92,26 @@ def test_execution_ready_requires_verified_hardware(tmp_path) -> None:
         assert "requires hardware_parameters_verified" in str(exc)
     else:
         raise AssertionError("unsafe external execution gate was accepted")
+
+
+def test_acceptance_ready_requires_verified_hardware(tmp_path) -> None:
+    source = Path(__file__).parents[1] / "configs" / "robot_config.yaml"
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    raw["hardware_parameters_verified"] = False
+    bad = tmp_path / "bad-acceptance-gate.yaml"
+    bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="external_target_acceptance_ready requires"):
+        load_robot_config(bad)
+
+
+def test_production_and_acceptance_gates_are_mutually_exclusive(tmp_path) -> None:
+    source = Path(__file__).parents[1] / "configs" / "robot_config.yaml"
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    raw["external_target_execution_ready"] = True
+    bad = tmp_path / "ambiguous-gates.yaml"
+    bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="must be false"):
+        load_robot_config(bad)
 
 
 def test_camera_rig_has_independent_hash(tmp_path) -> None:

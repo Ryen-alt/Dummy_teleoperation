@@ -110,8 +110,11 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
     config.joint_max_rad = dummy::generated_config::kJointMaxRad;
     config.max_velocity_rad_s = dummy::generated_config::kMaxVelocityRadS;
     config.hardware_parameters_verified =
-        dummy::generated_config::kHardwareParametersVerified &&
+        dummy::generated_config::kHardwareParametersVerified;
+    config.external_target_execution_ready =
         dummy::generated_config::kExternalTargetExecutionReady;
+    config.external_target_acceptance_ready =
+        dummy::generated_config::kExternalTargetAcceptanceReady;
     config.max_lease_ms = dummy::generated_config::kLeaseTimeoutMs;
     config.max_target_ttl_ms = dummy::generated_config::kTargetTtlMs;
     return config;

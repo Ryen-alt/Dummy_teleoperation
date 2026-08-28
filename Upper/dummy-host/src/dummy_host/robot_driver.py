@@ -97,6 +97,7 @@ class DummyRobot:
         camera: Camera | None = None,
         camera_manager: CameraManager | None = None,
         allow_unverified_hardware: bool = False,
+        acceptance_session: bool = False,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         response_timeout_s: float = 0.5,
         action_ack_timeout_s: float = 0.05,
@@ -117,6 +118,7 @@ class DummyRobot:
             None if self.camera_manager is None else ObservationSynchronizer(self.camera_manager)
         )
         self.allow_unverified_hardware = allow_unverified_hardware
+        self.acceptance_session = acceptance_session
         self.clock_ns = clock_ns
         if response_timeout_s <= 0:
             raise ValueError("response_timeout_s must be positive")
@@ -263,15 +265,20 @@ class DummyRobot:
         target_mode = ControlMode[mode.upper()] if isinstance(mode, str) else ControlMode(mode)
         if target_mode not in (ControlMode.TELEOP, ControlMode.POLICY):
             raise RobotError("control can only be acquired in TELEOP or POLICY mode")
-        if (
-            (
-                not self.config.hardware_parameters_verified
-                or not self.config.external_target_execution_ready
+        if not self.transport.is_simulated and not self.allow_unverified_hardware:
+            if not self.config.hardware_parameters_verified:
+                raise ConfigError("real external target execution hardware is not verified")
+            if target_mode is ControlMode.POLICY and not self.config.external_target_execution_ready:
+                raise ConfigError("real POLICY execution is not production-ready")
+            teleop_ready = self.config.external_target_execution_ready or (
+                self.config.external_target_acceptance_ready
+                and self.acceptance_session
             )
-            and not self.transport.is_simulated
-            and not self.allow_unverified_hardware
-        ):
-            raise ConfigError("real external target execution is not verified and ready")
+            if target_mode is ControlMode.TELEOP and not teleop_ready:
+                raise ConfigError(
+                    "real TELEOP execution requires the production gate or an "
+                    "explicit acceptance session"
+                )
         self.wait_for_feedback_ready()
         self._expect_ack(
             self._request(MessageType.ACQUIRE_CONTROL, ACQUIRE_CONTROL.pack(self.config.lease_timeout_ms)),
