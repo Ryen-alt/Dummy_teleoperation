@@ -1,0 +1,18 @@
+{
+  "source_session": "sessions/acceptance/20260831_002947_teleop/h5_10min/session_20260831_003221_2674084_026344190",
+  "action_sequence": 7,
+  "session_epoch": 2196142939,
+  "control_tick_id": 2,
+  "received_host_ns": 1223893057452793,
+  "safety_accepted_host_ns": 1223893058228870,
+  "send_enqueued_host_ns": 1223893058551774,
+  "serial_send_started_host_ns": 1223893059837155,
+  "serial_send_finished_host_ns": null,
+  "acknowledged_host_ns": null,
+  "can_queued_exact_host_ns": null,
+  "can_tx_complete_exact_host_ns": null,
+  "post_command_feedback_host_ns": null,
+  "action_credit_miss_host_ns": 1223893106374161,
+  "terminal_stage": "failed",
+  "detail": "Write timeout"
+}

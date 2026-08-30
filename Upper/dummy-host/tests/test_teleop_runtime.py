@@ -258,7 +258,7 @@ def test_keyboard_fake_mcu_collection_closes_in_hold(
     assert not robot.is_connected
 
 
-def test_runtime_missing_exact_fanout_credit_fails_closed_without_overlap(
+def test_runtime_single_delayed_exact_fanout_defers_without_ending_session(
     config: RobotConfig, tmp_path: Path
 ) -> None:
     profile = load_teleop_profile(
@@ -284,12 +284,15 @@ def test_runtime_missing_exact_fanout_credit_fails_closed_without_overlap(
     )
     recorder.close()
 
-    assert result.actions_sent >= 1
+    assert result.actions_sent >= 2
     assert result.action_credit_misses == 1
     assert transport.target_keepalives == 0
     assert transport.lease_heartbeats <= 5
     assert not transport.target_overlap
     assert result.final_mode == "HOLD"
+    events = recorder.events_path.read_text(encoding="utf-8")
+    assert '"event":"action_credit_deferred"' in events
+    assert '"reason":"action_credit_miss"' not in events
     with sqlite3.connect(recorder.db_path) as connection:
         superseded = connection.execute(
             "SELECT COUNT(*) FROM action_lifecycle WHERE terminal_stage = 'superseded'"
