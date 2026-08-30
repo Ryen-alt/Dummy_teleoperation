@@ -18,9 +18,14 @@ typedef struct
     uint32_t rx_cnt;
     uint32_t tx_cnt;
     uint32_t tx_overrun_cnt;
+    uint32_t rx_queue_high_water;
+    uint32_t rx_queue_full_cnt;
+    uint32_t max_rx_endpoint_rearm_us;
+    uint32_t cdc_tx_busy_cnt;
+    uint32_t max_server_processing_us;
 } USBStats_t;
 
-extern USBStats_t usb_stats_;
+extern volatile USBStats_t usb_stats_;
 
 void usb_rx_process_packet(uint8_t *buf, uint32_t len, uint8_t endpoint_pair);
 void StartUsbServer(void);

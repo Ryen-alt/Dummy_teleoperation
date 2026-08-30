@@ -17,7 +17,7 @@
 #include <cstring>
 
 osThreadId_t usbServerTaskHandle;
-USBStats_t usb_stats_ = {0};
+volatile USBStats_t usb_stats_ = {0};
 
 class USBSender : public PacketSink
 {
@@ -45,6 +45,8 @@ public:
         uint8_t status = CDC_Transmit_FS(const_cast<uint8_t *>(buffer), length, endpoint_pair_);
         if (status != USBD_OK)
         {
+            if (status == USBD_BUSY && endpoint_pair_ == CDC_OUT_EP)
+                ++usb_stats_.cdc_tx_busy_cnt;
             osSemaphoreRelease(sem_usb_tx_);
             return -1;
         }
@@ -122,7 +124,7 @@ dummy::protocol::SessionConfig MakeBinarySessionConfig()
 }
 
 dummy::protocol::StreamDecoder binary_decoder;
-dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v2.2.1");
+dummy::protocol::ControlSession binary_session(MakeBinarySessionConfig(), "dummy-ref-v2.2.2");
 dummy::protocol::FeedbackSafetyOutput binary_safety_telemetry{};
 dummy::protocol::MonotonicMicros32 binary_monotonic_micros;
 uint64_t binary_last_state_us = 0;
@@ -612,72 +614,89 @@ struct USBRxPacket
 struct USBInterface
 {
     std::array<USBRxPacket, kUsbRxPacketQueueCapacity> rx_queue{};
-    size_t rx_read = 0;
-    size_t rx_write = 0;
-    size_t rx_count = 0;
+    // The USB callback is the sole producer and UsbServerTask the sole
+    // consumer. Each side owns one monotonic sequence, so the ISR never uses a
+    // task-level FreeRTOS critical section.
+    volatile uint32_t rx_read_sequence = 0;
+    volatile uint32_t rx_write_sequence = 0;
     // When the copy queue is full, leave the OUT endpoint unarmed and retain
     // its stable USB buffer until the server task has made room.
     uint8_t *rx_buf = nullptr;
     uint32_t rx_len = 0;
-    bool data_pending = false;
+    volatile bool data_pending = false;
+    volatile uint32_t endpoint_unarmed_since_us = 0;
     uint8_t out_ep;
     uint8_t in_ep;
     USBSender &usb_sender;
 };
 
+void UpdateMax(volatile uint32_t& destination, uint32_t candidate)
+{
+    if (candidate > destination)
+        destination = candidate;
+}
+
 bool QueueUsbRxPacket(USBInterface& interface, uint8_t* buffer, uint32_t length)
 {
-    bool copied = false;
-    taskENTER_CRITICAL();
-    if (length <= USB_RX_DATA_SIZE &&
-        interface.rx_count < interface.rx_queue.size())
+    const uint32_t write_sequence = interface.rx_write_sequence;
+    const uint32_t read_sequence = interface.rx_read_sequence;
+    const uint32_t depth = write_sequence - read_sequence;
+    if (length <= USB_RX_DATA_SIZE && depth < interface.rx_queue.size())
     {
-        auto& packet = interface.rx_queue[interface.rx_write];
+        auto& packet = interface.rx_queue[
+            write_sequence % interface.rx_queue.size()];
         std::memcpy(packet.data.data(), buffer, length);
         packet.length = length;
-        interface.rx_write =
-            (interface.rx_write + 1U) % interface.rx_queue.size();
-        ++interface.rx_count;
-        copied = true;
+        // Publish the fully copied slot only after its contents are visible.
+        __DMB();
+        interface.rx_write_sequence = write_sequence + 1U;
+        UpdateMax(usb_stats_.rx_queue_high_water, depth + 1U);
+        return true;
     }
-    else
-    {
-        // The endpoint has not been rearmed yet, so this USB-owned buffer
-        // remains valid until the server copies it below.
-        interface.rx_buf = buffer;
-        interface.rx_len = length;
-        interface.data_pending = true;
-    }
-    taskEXIT_CRITICAL();
-    return copied;
+
+    // The endpoint has not been rearmed yet, so this USB-owned buffer remains
+    // valid until the server copies it below. The same endpoint cannot invoke
+    // another producer callback while it remains unarmed.
+    interface.rx_buf = buffer;
+    interface.rx_len = length;
+    interface.endpoint_unarmed_since_us = micros();
+    __DMB();
+    interface.data_pending = true;
+    ++usb_stats_.rx_queue_full_cnt;
+    return false;
 }
 
 bool PopUsbRxPacket(USBInterface& interface, USBRxPacket& packet,
                     bool& should_rearm)
 {
-    bool available = false;
     should_rearm = false;
-    taskENTER_CRITICAL();
-    if (interface.rx_count > 0U)
+    const uint32_t read_sequence = interface.rx_read_sequence;
+    const uint32_t write_sequence = interface.rx_write_sequence;
+    if (read_sequence != write_sequence)
     {
-        packet = interface.rx_queue[interface.rx_read];
-        interface.rx_read =
-            (interface.rx_read + 1U) % interface.rx_queue.size();
-        --interface.rx_count;
-        available = true;
+        // The producer publishes rx_write_sequence only after copying the slot.
+        __DMB();
+        packet = interface.rx_queue[
+            read_sequence % interface.rx_queue.size()];
+        __DMB();
+        interface.rx_read_sequence = read_sequence + 1U;
+        return true;
     }
-    else if (interface.data_pending)
+    if (interface.data_pending)
     {
+        __DMB();
         const uint32_t copy_length =
             std::min<uint32_t>(interface.rx_len, packet.data.size());
         std::memcpy(packet.data.data(), interface.rx_buf, copy_length);
         packet.length = copy_length;
         interface.data_pending = false;
+        const uint32_t rearm_delay_us =
+            micros() - interface.endpoint_unarmed_since_us;
+        UpdateMax(usb_stats_.max_rx_endpoint_rearm_us, rearm_delay_us);
         should_rearm = true;
-        available = true;
+        return true;
     }
-    taskEXIT_CRITICAL();
-    return available;
+    return false;
 }
 
 void ProcessCdcPacket(const USBRxPacket& packet)
@@ -735,6 +754,7 @@ static void UsbServerTask(void *ctx)
         osStatus sem_stat = osSemaphoreAcquire(sem_usb_rx, 20);
         if (sem_stat == osOK)
         {
+            const uint32_t processing_started_us = micros();
             USBRxPacket packet{};
             bool should_rearm = false;
             while (PopUsbRxPacket(CDC_interface, packet, should_rearm))
@@ -752,6 +772,9 @@ static void UsbServerTask(void *ctx)
                 ++usb_stats_.rx_cnt;
                 usb_channel.process_packet(packet.data.data(), packet.length);
             }
+            UpdateMax(
+                usb_stats_.max_server_processing_us,
+                micros() - processing_started_us);
         }
         const uint64_t binary_now_us =
             dummy::protocol::BinaryControlMonotonicMicros();

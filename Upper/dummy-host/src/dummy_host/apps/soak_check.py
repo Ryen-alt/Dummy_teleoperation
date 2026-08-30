@@ -349,7 +349,7 @@ def check_soak_session(
         raise SoakCheckError(str(exc)) from exc
     manifest = json.loads((session_dir / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schema_version") != 6:
-        raise SoakCheckError("v2.2.1 soak acceptance requires Raw Session schema v6")
+        raise SoakCheckError("v2.2.2 soak acceptance requires Raw Session schema v6")
     failures = list(integrity.errors)
     if manifest.get("control_rate_hz") != thresholds.control_rate_hz:
         failures.append(
@@ -678,7 +678,7 @@ def check_soak_session(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Apply dummy-ref-v2.2.1 strict integration/soak acceptance gates"
+        description="Apply dummy-ref-v2.2.2 strict integration/soak acceptance gates"
     )
     parser.add_argument("--session", required=True)
     parser.add_argument("--minimum-duration-s", type=float, default=3600.0)

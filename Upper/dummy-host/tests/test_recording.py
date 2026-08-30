@@ -180,7 +180,7 @@ def test_v6_evidence_tables_store_exact_latency_clock_and_can_diagnostics(
         tmp_path, config, profile, source="test", session_name="v5_evidence"
     )
     recorder.update_runtime_metadata(
-        firmware_version="dummy-ref-v2.2.1", session_epoch=9
+        firmware_version="dummy-ref-v2.2.2", session_epoch=9
     )
     exchange = TimeSyncExchange(1_000_000, 1_000, 1_010, 1_020_000)
     model = TimeSyncModel(1, 1, 1000.0, 0.0, 10_000, 25.0, 3, 1_020_000)

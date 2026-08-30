@@ -181,6 +181,13 @@ def test_write_timeout_is_reported_without_fabricating_send_completion() -> None
     assert updates[0].outcome is TxOutcome.FAILED
     assert updates[0].started_ns > 0
     assert updates[0].finished_ns >= updates[0].started_ns
+    diagnostics = transport.diagnostics()
+    assert diagnostics.writes_enqueued == 1
+    assert diagnostics.writes_started == 1
+    assert diagnostics.writes_completed == 0
+    assert diagnostics.writes_failed == 1
+    assert diagnostics.last_write_message_type == "SET_JOINT_TARGET"
+    assert diagnostics.last_write_outcome == "failed"
 
 
 def test_serial_transport_uses_independent_write_timeout() -> None:
@@ -217,6 +224,43 @@ def test_tx_trace_includes_type_length_and_enqueue_queue_depth() -> None:
     assert updates[0].message_type is MessageType.SET_JOINT_TARGET
     assert updates[0].frame_length == len(encode_packet(packet))
     assert updates[0].queue_depth_at_enqueue >= 1
+
+
+def test_continuous_fake_serial_pressure_has_no_loss_or_queue_deadlock() -> None:
+    packet_count = 200
+    transport = _opened_transport(tx_queue_size=256)
+    serial = _FaultSerial()
+    transport._serial = serial
+    updates = []
+    all_finished = threading.Event()
+
+    def observe(update) -> None:
+        updates.append(update)
+        if len(updates) == packet_count:
+            all_finished.set()
+
+    transport.set_tx_observer(observe)
+    writer = threading.Thread(target=transport._write_loop, daemon=True)
+    writer.start()
+    for sequence in range(1, packet_count + 1):
+        transport.send(Packet(MessageType.HEARTBEAT, 1, sequence, sequence))
+    assert all_finished.wait(1.0)
+    transport._stop.set()
+    with transport._tx_condition:
+        transport._tx_condition.notify_all()
+    writer.join(timeout=0.2)
+
+    assert not writer.is_alive()
+    assert len(serial.frames) == packet_count
+    assert [update.sequence for update in updates] == list(
+        range(1, packet_count + 1)
+    )
+    diagnostics = transport.diagnostics()
+    assert diagnostics.writes_enqueued == packet_count
+    assert diagnostics.writes_started == packet_count
+    assert diagnostics.writes_completed == packet_count
+    assert diagnostics.writes_failed == 0
+    assert diagnostics.reliable_tx_depth == 0
 
 
 def test_multi_usb_packet_diagnostics_does_not_hide_reliable_event() -> None:

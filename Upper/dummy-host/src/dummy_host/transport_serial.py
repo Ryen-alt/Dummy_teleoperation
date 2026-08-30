@@ -37,6 +37,9 @@ class TransportTxUpdate:
     started_ns: int = 0
     finished_ns: int = 0
     detail: str | None = None
+    message_type: MessageType | None = None
+    frame_length: int = 0
+    queue_depth_at_enqueue: int = 0
 
 
 @dataclass(frozen=True)
@@ -60,14 +63,32 @@ class TransportDiagnostics:
     max_safety_wait_ns: int
     startup_partial_frames: int
     invalid_frames: int
+    read_timeout_s: float
+    write_timeout_s: float
+    writes_enqueued: int
+    writes_started: int
+    writes_completed: int
+    writes_failed: int
+    write_in_progress: bool
+    max_tx_wait_ns: int
+    max_target_wait_ns: int
+    max_write_duration_ns: int
+    last_write_message_type: str | None
+    last_write_frame_length: int
+    last_write_queue_depth: int
+    last_write_enqueued_ns: int
+    last_write_started_ns: int
+    last_write_finished_ns: int
+    last_write_outcome: str | None
 
 
-@dataclass(frozen=True)
+@dataclass
 class _TxItem:
     sequence: int | None
     message_type: MessageType | None
     frame: bytes
     enqueued_ns: int
+    queue_depth_at_enqueue: int = 0
 
 
 class PacketTransport(Protocol):
@@ -104,15 +125,19 @@ class SerialTransport:
         baudrate: int = 115_200,
         *,
         read_timeout_s: float = 0.05,
+        write_timeout_s: float = 0.05,
         rx_queue_size: int = 128,
         tx_queue_size: int = 32,
         max_consecutive_invalid_frames: int = 3,
     ) -> None:
         if min(rx_queue_size, tx_queue_size, max_consecutive_invalid_frames) <= 0:
             raise ValueError("transport queue sizes and invalid-frame limit must be positive")
+        if read_timeout_s <= 0 or write_timeout_s <= 0:
+            raise ValueError("serial read and write timeouts must be positive")
         self.port = port
         self.baudrate = baudrate
         self.read_timeout_s = read_timeout_s
+        self.write_timeout_s = write_timeout_s
         self.max_consecutive_invalid_frames = max_consecutive_invalid_frames
         self._rx_capacity = rx_queue_size
         self._tx_capacity = tx_queue_size
@@ -141,6 +166,21 @@ class SerialTransport:
         self._diagnostics_overwritten = 0
         self._reliable_rx_overflow = 0
         self._max_safety_wait_ns = 0
+        self._writes_enqueued = 0
+        self._writes_started = 0
+        self._writes_completed = 0
+        self._writes_failed = 0
+        self._write_in_progress = False
+        self._max_tx_wait_ns = 0
+        self._max_target_wait_ns = 0
+        self._max_write_duration_ns = 0
+        self._last_write_message_type: str | None = None
+        self._last_write_frame_length = 0
+        self._last_write_queue_depth = 0
+        self._last_write_enqueued_ns = 0
+        self._last_write_started_ns = 0
+        self._last_write_finished_ns = 0
+        self._last_write_outcome: str | None = None
 
     def open(self) -> None:
         if self._threads:
@@ -154,7 +194,7 @@ class SerialTransport:
                 self.port,
                 self.baudrate,
                 timeout=self.read_timeout_s,
-                write_timeout=self.read_timeout_s,
+                write_timeout=self.write_timeout_s,
             )
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
@@ -174,6 +214,7 @@ class SerialTransport:
             self._safety_tx.clear()
             self._reliable_tx.clear()
             self._target_tx = None
+            self._write_in_progress = False
         self._stop.clear()
         self._threads = [
             threading.Thread(target=self._read_loop, name="dummy-serial-rx", daemon=True),
@@ -243,6 +284,8 @@ class SerialTransport:
                 self._reliable_tx_high_watermark = max(
                     self._reliable_tx_high_watermark, len(self._reliable_tx)
                 )
+            item.queue_depth_at_enqueue = self._tx_depth_locked()
+            self._writes_enqueued += 1
             if displaced is not None:
                 # Notify while the re-entrant TX lock is still held.  The
                 # robot's SUPERSEDED callback re-enters send() to enqueue HOLD;
@@ -255,6 +298,9 @@ class SerialTransport:
                         outcome,
                         old.enqueued_ns,
                         finished_ns=time.monotonic_ns(),
+                        message_type=old.message_type,
+                        frame_length=len(old.frame),
+                        queue_depth_at_enqueue=old.queue_depth_at_enqueue,
                     )
                 )
             self._tx_condition.notify()
@@ -269,6 +315,8 @@ class SerialTransport:
             if len(self._reliable_tx) >= self._tx_capacity:
                 raise TransportError("serial reliable control queue is full")
             self._reliable_tx.append(item)
+            item.queue_depth_at_enqueue = self._tx_depth_locked()
+            self._writes_enqueued += 1
             self._tx_condition.notify()
 
     def receive(self, timeout: float | None = None) -> Packet | None:
@@ -323,7 +371,32 @@ class SerialTransport:
                 max_safety_wait_ns=self._max_safety_wait_ns,
                 startup_partial_frames=self.decoder.initial_partial_frames,
                 invalid_frames=self.decoder.dropped_frames,
+                read_timeout_s=self.read_timeout_s,
+                write_timeout_s=self.write_timeout_s,
+                writes_enqueued=self._writes_enqueued,
+                writes_started=self._writes_started,
+                writes_completed=self._writes_completed,
+                writes_failed=self._writes_failed,
+                write_in_progress=self._write_in_progress,
+                max_tx_wait_ns=self._max_tx_wait_ns,
+                max_target_wait_ns=self._max_target_wait_ns,
+                max_write_duration_ns=self._max_write_duration_ns,
+                last_write_message_type=self._last_write_message_type,
+                last_write_frame_length=self._last_write_frame_length,
+                last_write_queue_depth=self._last_write_queue_depth,
+                last_write_enqueued_ns=self._last_write_enqueued_ns,
+                last_write_started_ns=self._last_write_started_ns,
+                last_write_finished_ns=self._last_write_finished_ns,
+                last_write_outcome=self._last_write_outcome,
             )
+
+    def _tx_depth_locked(self) -> int:
+        return (
+            len(self._estop_tx)
+            + len(self._safety_tx)
+            + len(self._reliable_tx)
+            + int(self._target_tx is not None)
+        )
 
     def _notify_tx(self, update: TransportTxUpdate) -> None:
         observer = self._tx_observer
@@ -412,10 +485,36 @@ class SerialTransport:
                 if item is None:
                     continue
                 started_ns = time.monotonic_ns()
-                if item.message_type in _SAFETY_TYPES:
-                    self._max_safety_wait_ns = max(
-                        self._max_safety_wait_ns, started_ns - item.enqueued_ns
+                wait_ns = started_ns - item.enqueued_ns
+                with self._tx_condition:
+                    if item.message_type in _SAFETY_TYPES:
+                        self._max_safety_wait_ns = max(
+                            self._max_safety_wait_ns, wait_ns
+                        )
+                    self._writes_started += 1
+                    self._write_in_progress = True
+                    self._max_tx_wait_ns = max(self._max_tx_wait_ns, wait_ns)
+                    if item.message_type is MessageType.SET_JOINT_TARGET:
+                        self._max_target_wait_ns = max(
+                            self._max_target_wait_ns, wait_ns
+                        )
+                    self._last_write_message_type = (
+                        None if item.message_type is None else item.message_type.name
                     )
+                    self._last_write_frame_length = len(item.frame)
+                    self._last_write_queue_depth = item.queue_depth_at_enqueue
+                    self._last_write_enqueued_ns = item.enqueued_ns
+                    self._last_write_started_ns = started_ns
+                    self._last_write_finished_ns = 0
+                    self._last_write_outcome = None
+                LOG.debug(
+                    "USB TX start type=%s bytes=%d queue_depth=%d enqueue_ns=%d start_ns=%d",
+                    self._last_write_message_type or "RAW",
+                    len(item.frame),
+                    item.queue_depth_at_enqueue,
+                    item.enqueued_ns,
+                    started_ns,
+                )
                 error: str | None = None
                 try:
                     written = self._serial.write(item.frame)
@@ -428,15 +527,43 @@ class SerialTransport:
                     error = str(exc)
                     raise
                 finally:
+                    finished_ns = time.monotonic_ns()
+                    outcome = TxOutcome.SENT if error is None else TxOutcome.FAILED
+                    with self._tx_condition:
+                        self._write_in_progress = False
+                        if error is None:
+                            self._writes_completed += 1
+                        else:
+                            self._writes_failed += 1
+                        self._max_write_duration_ns = max(
+                            self._max_write_duration_ns, finished_ns - started_ns
+                        )
+                        self._last_write_finished_ns = finished_ns
+                        self._last_write_outcome = outcome.value
+                    LOG.debug(
+                        "USB TX end type=%s bytes=%d queue_depth=%d enqueue_ns=%d "
+                        "start_ns=%d end_ns=%d outcome=%s detail=%s",
+                        self._last_write_message_type or "RAW",
+                        len(item.frame),
+                        item.queue_depth_at_enqueue,
+                        item.enqueued_ns,
+                        started_ns,
+                        finished_ns,
+                        outcome.value,
+                        error,
+                    )
                     if item.sequence is not None:
                         self._notify_tx(
                             TransportTxUpdate(
                                 item.sequence,
-                                TxOutcome.SENT if error is None else TxOutcome.FAILED,
+                                outcome,
                                 item.enqueued_ns,
                                 started_ns,
-                                time.monotonic_ns(),
+                                finished_ns,
                                 error,
+                                item.message_type,
+                                len(item.frame),
+                                item.queue_depth_at_enqueue,
                             )
                         )
         except BaseException as exc:

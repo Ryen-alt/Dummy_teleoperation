@@ -97,18 +97,18 @@ class OldV22WithProtocolV5(FakeMcuTransport):
     firmware_version = "dummy-ref-v2.2"
 
 
-class V221WithoutCanDiagnosticsV2(FakeMcuTransport):
+class V222WithoutCanDiagnosticsV2(FakeMcuTransport):
     is_simulated = False
-    firmware_version = "dummy-ref-v2.2.1"
+    firmware_version = "dummy-ref-v2.2.2"
     firmware_capabilities = (
         FakeMcuTransport.firmware_capabilities
         & ~CAPABILITY_CAN_DIAGNOSTICS_V2
     )
 
 
-class CurrentV221RealTransport(FakeMcuTransport):
+class CurrentV222RealTransport(FakeMcuTransport):
     is_simulated = False
-    firmware_version = "dummy-ref-v2.2.1"
+    firmware_version = "dummy-ref-v2.2.2"
 
 
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
@@ -243,29 +243,29 @@ def test_protocol_v4_firmware_is_rejected_by_v5_host(config) -> None:
     assert not robot.is_connected
 
 
-def test_v22_firmware_is_rejected_by_v221_host(config) -> None:
+def test_v22_firmware_is_rejected_by_v222_host(config) -> None:
     robot = DummyRobot(config, OldV22WithProtocolV5(config))
-    with pytest.raises(ConfigError, match="dummy-ref-v2.2.1 exactly"):
+    with pytest.raises(ConfigError, match="dummy-ref-v2.2.2 exactly"):
         robot.connect()
     assert not robot.is_connected
 
 
-def test_v221_firmware_without_diagnostics_v2_is_rejected(config) -> None:
-    robot = DummyRobot(config, V221WithoutCanDiagnosticsV2(config))
+def test_v222_firmware_without_diagnostics_v2_is_rejected(config) -> None:
+    robot = DummyRobot(config, V222WithoutCanDiagnosticsV2(config))
     with pytest.raises(ConfigError, match="missing required protocol-v5"):
         robot.connect()
     assert not robot.is_connected
 
 
 def test_acceptance_gate_requires_explicit_session_and_blocks_policy(config) -> None:
-    robot = DummyRobot(config, CurrentV221RealTransport(config))
+    robot = DummyRobot(config, CurrentV222RealTransport(config))
     with robot:
         with pytest.raises(ConfigError, match="explicit acceptance session"):
             robot.acquire_control(ControlMode.TELEOP)
 
     robot = DummyRobot(
         config,
-        CurrentV221RealTransport(config),
+        CurrentV222RealTransport(config),
         acceptance_session=True,
     )
     with robot:
@@ -273,7 +273,7 @@ def test_acceptance_gate_requires_explicit_session_and_blocks_policy(config) -> 
 
     robot = DummyRobot(
         config,
-        CurrentV221RealTransport(config),
+        CurrentV222RealTransport(config),
         acceptance_session=True,
     )
     with robot:
@@ -287,7 +287,7 @@ def test_production_gate_allows_real_policy(config) -> None:
         external_target_execution_ready=True,
         external_target_acceptance_ready=False,
     )
-    robot = DummyRobot(production, CurrentV221RealTransport(production))
+    robot = DummyRobot(production, CurrentV222RealTransport(production))
     with robot:
         robot.acquire_control(ControlMode.POLICY)
 

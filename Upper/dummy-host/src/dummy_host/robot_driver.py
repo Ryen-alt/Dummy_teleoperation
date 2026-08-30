@@ -207,10 +207,10 @@ class DummyRobot:
                 )
             if (
                 not self.transport.is_simulated
-                and self.firmware_version != "dummy-ref-v2.2.1"
+                and self.firmware_version != "dummy-ref-v2.2.2"
             ):
                 raise ConfigError(
-                    "protocol v5 host requires firmware dummy-ref-v2.2.1 exactly; "
+                    "protocol v5 host requires firmware dummy-ref-v2.2.2 exactly; "
                     f"received {self.firmware_version!r}"
                 )
             if (
@@ -236,8 +236,8 @@ class DummyRobot:
                 )
             ):
                 raise ConfigError(
-                    "dummy-ref-v2.2.1 firmware is missing required protocol-v5 "
-                    "execution-evidence capabilities; rebuild and reflash v2.2.1"
+                    "dummy-ref-v2.2.2 firmware is missing required protocol-v5 "
+                    "execution-evidence capabilities; rebuild and reflash v2.2.2"
                 )
             self._wait_for_first_state(deadline)
             self._connected = True

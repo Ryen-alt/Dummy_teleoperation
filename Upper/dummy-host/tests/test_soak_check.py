@@ -168,7 +168,7 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
     epoch = 77
     start_ns = 10_000_000_000
     recorder.update_runtime_metadata(
-        firmware_version="dummy-ref-v2.2.1", session_epoch=epoch
+        firmware_version="dummy-ref-v2.2.2", session_epoch=epoch
     )
     recorder.record_time_sync(
         TimeSyncExchange(start_ns, start_ns // 1000, start_ns // 1000, start_ns),

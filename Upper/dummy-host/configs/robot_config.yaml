@@ -24,7 +24,7 @@ can_target_hz_per_node: 50
 can_position_hz_per_node: 40
 can_temperature_hz_per_node: 1
 coherent_max_skew_ms: 30
-# v2.2.1 offline-safe defaults. The first two values must be replaced by
+# v2.2.2 offline-safe defaults. The first two values must be replaced by
 # bench-measured P99.9 margins before external execution is re-enabled.
 can_node_quiet_us: 5000
 can_response_timeout_us: 4000
