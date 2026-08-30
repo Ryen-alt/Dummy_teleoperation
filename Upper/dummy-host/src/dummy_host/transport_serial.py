@@ -80,6 +80,13 @@ class TransportDiagnostics:
     last_write_started_ns: int
     last_write_finished_ns: int
     last_write_outcome: str | None
+    keepalive_tx_depth: int
+    control_tx_depth: int
+    maintenance_tx_depth: int
+    keepalive_tx_high_watermark: int
+    control_tx_high_watermark: int
+    maintenance_tx_high_watermark: int
+    maintenance_duplicate_rejected: int
 
 
 @dataclass
@@ -107,6 +114,11 @@ _SAFETY_TYPES = {
     MessageType.SET_MODE,
 }
 _MOTION_FLUSH_TYPES = {MessageType.ESTOP, MessageType.HOLD}
+_KEEPALIVE_TYPES = {MessageType.HEARTBEAT, MessageType.TARGET_KEEPALIVE}
+_MAINTENANCE_TYPES = {
+    MessageType.TIME_SYNC,
+    MessageType.GET_CAN_DIAGNOSTICS,
+}
 
 
 class SerialTransport:
@@ -129,11 +141,15 @@ class SerialTransport:
         rx_queue_size: int = 128,
         tx_queue_size: int = 32,
         max_consecutive_invalid_frames: int = 3,
+        realtime_period_s: float = 0.05,
+        maintenance_min_slack_s: float = 0.005,
     ) -> None:
         if min(rx_queue_size, tx_queue_size, max_consecutive_invalid_frames) <= 0:
             raise ValueError("transport queue sizes and invalid-frame limit must be positive")
         if read_timeout_s <= 0 or write_timeout_s <= 0:
             raise ValueError("serial read and write timeouts must be positive")
+        if realtime_period_s <= 0 or maintenance_min_slack_s < 0:
+            raise ValueError("real-time period must be positive and slack non-negative")
         self.port = port
         self.baudrate = baudrate
         self.read_timeout_s = read_timeout_s
@@ -148,7 +164,9 @@ class SerialTransport:
         self._rx_condition = threading.Condition()
         self._estop_tx: deque[_TxItem] = deque()
         self._safety_tx: deque[_TxItem] = deque()
-        self._reliable_tx: deque[_TxItem] = deque()
+        self._keepalive_tx: deque[_TxItem] = deque()
+        self._control_tx: deque[_TxItem] = deque()
+        self._maintenance_tx: deque[_TxItem] = deque()
         self._target_tx: _TxItem | None = None
         self._tx_condition = threading.Condition()
         self._tx_observer: Callable[[TransportTxUpdate], None] | None = None
@@ -159,6 +177,14 @@ class SerialTransport:
         self._estop_high_watermark = 0
         self._safety_high_watermark = 0
         self._reliable_tx_high_watermark = 0
+        self._keepalive_tx_high_watermark = 0
+        self._control_tx_high_watermark = 0
+        self._maintenance_tx_high_watermark = 0
+        self._maintenance_duplicate_rejected = 0
+        self._keepalive_served_while_target_pending = False
+        self._realtime_period_ns = int(realtime_period_s * 1e9)
+        self._maintenance_min_slack_ns = int(maintenance_min_slack_s * 1e9)
+        self._realtime_deadline_ns = 0
         self._reliable_rx_high_watermark = 0
         self._target_superseded = 0
         self._target_preempted = 0
@@ -212,8 +238,12 @@ class SerialTransport:
         with self._tx_condition:
             self._estop_tx.clear()
             self._safety_tx.clear()
-            self._reliable_tx.clear()
+            self._keepalive_tx.clear()
+            self._control_tx.clear()
+            self._maintenance_tx.clear()
             self._target_tx = None
+            self._keepalive_served_while_target_pending = False
+            self._realtime_deadline_ns = 0
             self._write_in_progress = False
         self._stop.clear()
         self._threads = [
@@ -252,6 +282,9 @@ class SerialTransport:
                     displaced = (self._target_tx, TxOutcome.SUPERSEDED)
                     self._target_superseded += 1
                 self._target_tx = item
+                self._realtime_deadline_ns = (
+                    item.enqueued_ns + self._realtime_period_ns
+                )
             elif packet.message_type in _SAFETY_TYPES:
                 target_queue = (
                     self._estop_tx
@@ -277,13 +310,53 @@ class SerialTransport:
                 self._safety_high_watermark = max(
                     self._safety_high_watermark, len(self._safety_tx)
                 )
-            else:
-                if len(self._reliable_tx) >= self._tx_capacity:
-                    raise TransportError("serial reliable control queue is full")
-                self._reliable_tx.append(item)
-                self._reliable_tx_high_watermark = max(
-                    self._reliable_tx_high_watermark, len(self._reliable_tx)
+            elif packet.message_type in _KEEPALIVE_TYPES:
+                if any(
+                    queued.message_type is packet.message_type
+                    for queued in self._keepalive_tx
+                ):
+                    raise TransportError(
+                        f"{packet.message_type.name} is already pending"
+                    )
+                if len(self._keepalive_tx) >= self._tx_capacity:
+                    raise TransportError("serial keepalive queue is full")
+                self._keepalive_tx.append(item)
+                if packet.message_type is MessageType.TARGET_KEEPALIVE:
+                    self._realtime_deadline_ns = (
+                        item.enqueued_ns + self._realtime_period_ns
+                    )
+                self._keepalive_tx_high_watermark = max(
+                    self._keepalive_tx_high_watermark, len(self._keepalive_tx)
                 )
+            elif packet.message_type in _MAINTENANCE_TYPES:
+                if any(
+                    queued.message_type is packet.message_type
+                    for queued in self._maintenance_tx
+                ):
+                    self._maintenance_duplicate_rejected += 1
+                    raise TransportError(
+                        f"{packet.message_type.name} is already pending"
+                    )
+                self._maintenance_tx.append(item)
+                self._maintenance_tx_high_watermark = max(
+                    self._maintenance_tx_high_watermark,
+                    len(self._maintenance_tx),
+                )
+            else:
+                if len(self._control_tx) >= self._tx_capacity:
+                    raise TransportError("serial reliable control queue is full")
+                self._control_tx.append(item)
+                self._control_tx_high_watermark = max(
+                    self._control_tx_high_watermark, len(self._control_tx)
+                )
+            reliable_depth = (
+                len(self._keepalive_tx)
+                + len(self._control_tx)
+                + len(self._maintenance_tx)
+            )
+            self._reliable_tx_high_watermark = max(
+                self._reliable_tx_high_watermark, reliable_depth
+            )
             item.queue_depth_at_enqueue = self._tx_depth_locked()
             self._writes_enqueued += 1
             if displaced is not None:
@@ -312,9 +385,18 @@ class SerialTransport:
             raise ValueError("fault-injection frame must be bounded and zero-delimited")
         item = _TxItem(None, None, bytes(frame), time.monotonic_ns())
         with self._tx_condition:
-            if len(self._reliable_tx) >= self._tx_capacity:
+            if len(self._control_tx) >= self._tx_capacity:
                 raise TransportError("serial reliable control queue is full")
-            self._reliable_tx.append(item)
+            self._control_tx.append(item)
+            self._control_tx_high_watermark = max(
+                self._control_tx_high_watermark, len(self._control_tx)
+            )
+            self._reliable_tx_high_watermark = max(
+                self._reliable_tx_high_watermark,
+                len(self._keepalive_tx)
+                + len(self._control_tx)
+                + len(self._maintenance_tx),
+            )
             item.queue_depth_at_enqueue = self._tx_depth_locked()
             self._writes_enqueued += 1
             self._tx_condition.notify()
@@ -354,7 +436,11 @@ class SerialTransport:
             return TransportDiagnostics(
                 estop_depth=len(self._estop_tx),
                 safety_depth=len(self._safety_tx),
-                reliable_tx_depth=len(self._reliable_tx),
+                reliable_tx_depth=(
+                    len(self._keepalive_tx)
+                    + len(self._control_tx)
+                    + len(self._maintenance_tx)
+                ),
                 target_pending=self._target_tx is not None,
                 reliable_rx_depth=len(self._rx_reliable),
                 state_pending=self._latest_state is not None,
@@ -388,13 +474,22 @@ class SerialTransport:
                 last_write_started_ns=self._last_write_started_ns,
                 last_write_finished_ns=self._last_write_finished_ns,
                 last_write_outcome=self._last_write_outcome,
+                keepalive_tx_depth=len(self._keepalive_tx),
+                control_tx_depth=len(self._control_tx),
+                maintenance_tx_depth=len(self._maintenance_tx),
+                keepalive_tx_high_watermark=self._keepalive_tx_high_watermark,
+                control_tx_high_watermark=self._control_tx_high_watermark,
+                maintenance_tx_high_watermark=self._maintenance_tx_high_watermark,
+                maintenance_duplicate_rejected=self._maintenance_duplicate_rejected,
             )
 
     def _tx_depth_locked(self) -> int:
         return (
             len(self._estop_tx)
             + len(self._safety_tx)
-            + len(self._reliable_tx)
+            + len(self._keepalive_tx)
+            + len(self._control_tx)
+            + len(self._maintenance_tx)
             + int(self._target_tx is not None)
         )
 
@@ -468,12 +563,32 @@ class SerialTransport:
                     return self._estop_tx.popleft()
                 if self._safety_tx:
                     return self._safety_tx.popleft()
-                if self._reliable_tx:
-                    return self._reliable_tx.popleft()
+                if self._target_tx is not None and (
+                    not self._keepalive_tx
+                    or self._keepalive_served_while_target_pending
+                ):
+                    item = self._target_tx
+                    self._target_tx = None
+                    self._keepalive_served_while_target_pending = False
+                    return item
+                if self._keepalive_tx:
+                    if self._target_tx is not None:
+                        self._keepalive_served_while_target_pending = True
+                    return self._keepalive_tx.popleft()
                 if self._target_tx is not None:
                     item = self._target_tx
                     self._target_tx = None
+                    self._keepalive_served_while_target_pending = False
                     return item
+                if self._control_tx:
+                    return self._control_tx.popleft()
+                if self._maintenance_tx:
+                    now_ns = time.monotonic_ns()
+                    slack_ns = self._realtime_deadline_ns - now_ns
+                    if 0 < slack_ns < self._maintenance_min_slack_ns:
+                        self._tx_condition.wait(slack_ns / 1e9)
+                        continue
+                    return self._maintenance_tx.popleft()
                 self._tx_condition.wait(0.1)
         return None
 

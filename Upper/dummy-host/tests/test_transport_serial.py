@@ -15,6 +15,7 @@ from dummy_host.transport_serial import (
     SerialTransport,
     TransportError,
     TxOutcome,
+    _TxItem,
 )
 
 
@@ -243,7 +244,7 @@ def test_continuous_fake_serial_pressure_has_no_loss_or_queue_deadlock() -> None
     writer = threading.Thread(target=transport._write_loop, daemon=True)
     writer.start()
     for sequence in range(1, packet_count + 1):
-        transport.send(Packet(MessageType.HEARTBEAT, 1, sequence, sequence))
+        transport.send(Packet(MessageType.CLEAR_FAULT, 1, sequence, sequence))
     assert all_finished.wait(1.0)
     transport._stop.set()
     with transport._tx_condition:
@@ -315,16 +316,125 @@ def test_tx_safety_priority_and_estop_order_preempt_motion_mailbox() -> None:
 
 def test_motion_target_precedes_thirty_two_pending_diagnostics_requests() -> None:
     transport = _opened_transport(tx_queue_size=32)
-    for sequence in range(1, 33):
-        transport.send(
-            Packet(MessageType.GET_CAN_DIAGNOSTICS, 1, sequence, sequence)
-        )
+    # Recreate the legacy backlog directly. Public send() now permits at most
+    # one pending request of each maintenance type, but arbitration must remain
+    # safe even if old state or a future producer presents a full queue.
+    now_ns = time.monotonic_ns()
+    with transport._tx_condition:
+        for sequence in range(1, 33):
+            packet = Packet(
+                MessageType.GET_CAN_DIAGNOSTICS, 1, sequence, sequence
+            )
+            transport._maintenance_tx.append(
+                _TxItem(
+                    sequence,
+                    packet.message_type,
+                    encode_packet(packet),
+                    now_ns,
+                    sequence,
+                )
+            )
     target = Packet(MessageType.SET_JOINT_TARGET, 1, 99, 99, b"target")
     transport.send(target)
 
     queued = transport._next_tx()
     assert queued is not None
     assert queued.message_type is MessageType.SET_JOINT_TARGET
+
+
+def test_time_sync_and_diagnostics_each_allow_only_one_pending_request() -> None:
+    transport = _opened_transport()
+    transport.send(Packet(MessageType.TIME_SYNC, 1, 1, 1))
+    transport.send(Packet(MessageType.GET_CAN_DIAGNOSTICS, 1, 2, 2))
+
+    with pytest.raises(TransportError, match="TIME_SYNC is already pending"):
+        transport.send(Packet(MessageType.TIME_SYNC, 1, 3, 3))
+    with pytest.raises(
+        TransportError, match="GET_CAN_DIAGNOSTICS is already pending"
+    ):
+        transport.send(Packet(MessageType.GET_CAN_DIAGNOSTICS, 1, 4, 4))
+
+    diagnostics = transport.diagnostics()
+    assert diagnostics.maintenance_tx_depth == 2
+    assert diagnostics.maintenance_duplicate_rejected == 2
+
+
+def test_target_is_not_infinitely_starved_by_lease_heartbeats() -> None:
+    transport = _opened_transport()
+    target = Packet(MessageType.SET_JOINT_TARGET, 1, 50, 1, b"target")
+    transport.send(target)
+    transport.send(Packet(MessageType.HEARTBEAT, 1, 51, 2))
+    transport.send(Packet(MessageType.TARGET_KEEPALIVE, 1, 52, 3))
+
+    assert transport._next_tx().message_type in {
+        MessageType.HEARTBEAT,
+        MessageType.TARGET_KEEPALIVE,
+    }
+    assert transport._next_tx().message_type is MessageType.SET_JOINT_TARGET
+
+
+def test_sent_target_is_removed_and_cannot_be_replayed() -> None:
+    transport = _opened_transport()
+    transport.send(Packet(MessageType.SET_JOINT_TARGET, 1, 70, 1, b"target"))
+    assert transport._next_tx().sequence == 70
+
+    transport._stop.set()
+    assert transport._next_tx() is None
+
+
+def test_maintenance_waits_when_realtime_deadline_has_no_slack() -> None:
+    transport = _opened_transport(maintenance_min_slack_s=0.2)
+    transport.send(Packet(MessageType.GET_CAN_DIAGNOSTICS, 1, 80, 1))
+    with transport._tx_condition:
+        transport._realtime_deadline_ns = time.monotonic_ns() + 100_000_000
+    selected: list[_TxItem | None] = []
+    ready = threading.Event()
+
+    def select() -> None:
+        selected.append(transport._next_tx())
+        ready.set()
+
+    selector = threading.Thread(target=select, daemon=True)
+    selector.start()
+    time.sleep(0.005)
+    transport.send(Packet(MessageType.SET_JOINT_TARGET, 1, 81, 2, b"target"))
+    assert ready.wait(0.2)
+    assert selected[0] is not None
+    assert selected[0].message_type is MessageType.SET_JOINT_TARGET
+    transport._stop.set()
+    with transport._tx_condition:
+        transport._tx_condition.notify_all()
+    selector.join(timeout=0.2)
+
+
+def test_synthetic_target_enqueue_to_write_start_p99_is_below_5_ms() -> None:
+    transport = _opened_transport()
+    transport._serial = _FaultSerial()
+    updates = []
+    condition = threading.Condition()
+
+    def observe(update) -> None:
+        if update.message_type is MessageType.SET_JOINT_TARGET:
+            with condition:
+                updates.append(update)
+                condition.notify_all()
+
+    transport.set_tx_observer(observe)
+    writer = threading.Thread(target=transport._write_loop, daemon=True)
+    writer.start()
+    for sequence in range(1, 101):
+        transport.send(
+            Packet(MessageType.SET_JOINT_TARGET, 1, sequence, sequence, b"target")
+        )
+        with condition:
+            assert condition.wait_for(lambda: len(updates) == sequence, timeout=0.2)
+    transport._stop.set()
+    with transport._tx_condition:
+        transport._tx_condition.notify_all()
+    writer.join(timeout=0.2)
+
+    waits_ns = sorted(update.started_ns - update.enqueued_ns for update in updates)
+    assert waits_ns[98] < 5_000_000
 
 
 def test_latest_target_mailbox_reports_exact_superseded_sequence() -> None:
