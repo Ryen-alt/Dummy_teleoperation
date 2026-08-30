@@ -10,11 +10,18 @@ import pytest
 
 from dummy_host.domain import EpisodeManager, EpisodeStatus
 from dummy_host.fake_mcu import FakeMcuTransport
-from dummy_host.protocol import MessageType
+from dummy_host.protocol import MessageType, unpack_joint_target
 from dummy_host.recording import RecorderBackpressure, SessionRecorder
 from dummy_host.robot_driver import DummyRobot
+from dummy_host.scheduler import ScheduledTick
 from dummy_host.schema import RobotConfig
-from dummy_host.teleop import KeyboardMapper, TeleopCommand, TeleopError, load_teleop_profile
+from dummy_host.teleop import (
+    JointVelocityIntegrator,
+    KeyboardMapper,
+    TeleopCommand,
+    TeleopError,
+    load_teleop_profile,
+)
 from dummy_host.teleop_runtime import _LeaseCoordinator, run_teleop_collection
 
 
@@ -108,20 +115,33 @@ class AdvancingClock:
 class DelayedExactFanoutTransport(FakeMcuTransport):
     """Hide exact fan-out progress long enough to require target refreshes."""
 
-    def __init__(self, config: RobotConfig) -> None:
+    def __init__(
+        self,
+        config: RobotConfig,
+        *,
+        hidden_states_per_target: int = 3,
+        delayed_target_count: int = 1,
+    ) -> None:
         super().__init__(config)
+        self.hidden_states_per_target = hidden_states_per_target
+        self.delayed_targets_remaining = delayed_target_count
         self.hidden_sequence: int | None = None
         self.hidden_states_remaining = 0
         self.target_keepalives = 0
         self.lease_heartbeats = 0
         self.target_overlap = False
+        self.target_ttls_ms: list[int] = []
 
     def send(self, packet) -> None:
         if packet.message_type is MessageType.SET_JOINT_TARGET:
             if self.hidden_sequence is not None:
                 self.target_overlap = True
-            self.hidden_sequence = packet.sequence
-            self.hidden_states_remaining = 3
+            if self.delayed_targets_remaining > 0:
+                self.hidden_sequence = packet.sequence
+                self.hidden_states_remaining = self.hidden_states_per_target
+                self.delayed_targets_remaining -= 1
+            _, _, ttl_ms, _, _ = unpack_joint_target(packet.payload)
+            self.target_ttls_ms.append(ttl_ms)
         elif packet.message_type is MessageType.TARGET_KEEPALIVE:
             self.target_keepalives += 1
         elif packet.message_type is MessageType.HEARTBEAT:
@@ -259,13 +279,26 @@ def test_keyboard_fake_mcu_collection_closes_in_hold(
 
 
 def test_runtime_single_delayed_exact_fanout_defers_without_ending_session(
-    config: RobotConfig, tmp_path: Path
+    config: RobotConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     profile = load_teleop_profile(
         Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
     )
     source = ScriptedKeyboard(KeyboardMapper(profile))
-    transport = DelayedExactFanoutTransport(config)
+    transport = DelayedExactFanoutTransport(config, hidden_states_per_target=1)
+    deferred_integrator_calls = 0
+    real_advance = JointVelocityIntegrator.advance_without_motion
+
+    def record_deferred_integrator(self, now_ns: int) -> None:
+        nonlocal deferred_integrator_calls
+        deferred_integrator_calls += 1
+        real_advance(self, now_ns)
+
+    monkeypatch.setattr(
+        JointVelocityIntegrator,
+        "advance_without_motion",
+        record_deferred_integrator,
+    )
     robot = DummyRobot(config, transport)
     recorder = SessionRecorder(
         tmp_path,
@@ -286,9 +319,13 @@ def test_runtime_single_delayed_exact_fanout_defers_without_ending_session(
 
     assert result.actions_sent >= 2
     assert result.action_credit_misses == 1
-    assert transport.target_keepalives == 0
+    assert transport.target_keepalives == 1
     assert transport.lease_heartbeats <= 5
     assert not transport.target_overlap
+    assert deferred_integrator_calls == 1
+    assert transport.target_ttls_ms
+    assert set(transport.target_ttls_ms) == {200}
+    assert config.lease_timeout_ms == 500
     assert result.final_mode == "HOLD"
     events = recorder.events_path.read_text(encoding="utf-8")
     assert '"event":"action_credit_deferred"' in events
@@ -298,6 +335,109 @@ def test_runtime_single_delayed_exact_fanout_defers_without_ending_session(
             "SELECT COUNT(*) FROM action_lifecycle WHERE terminal_stage = 'superseded'"
         ).fetchone()
     assert superseded == (0,)
+
+
+def test_runtime_sustained_exact_fanout_delay_holds_after_second_miss(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = ScriptedKeyboard(KeyboardMapper(profile))
+    transport = DelayedExactFanoutTransport(
+        config, hidden_states_per_target=100
+    )
+    robot = DummyRobot(config, transport)
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_sustained_delayed_exact",
+    )
+
+    result = run_teleop_collection(
+        robot,
+        source,
+        recorder,
+        profile,
+        duration_s=0.8,
+    )
+    recorder.close()
+
+    assert result.actions_sent == 1
+    assert result.action_credit_misses == 2
+    assert not transport.target_overlap
+    events = recorder.events_path.read_text(encoding="utf-8")
+    assert events.count('"event":"action_credit_deferred"') == 1
+    assert events.count('"event":"action_credit_hold"') == 1
+    assert '"reason":"action_credit_timeout"' in events
+    with sqlite3.connect(recorder.db_path) as connection:
+        fabricated_exact = connection.execute(
+            "SELECT COUNT(*) FROM action_lifecycle "
+            "WHERE can_tx_complete_exact_host_ns IS NOT NULL"
+        ).fetchone()
+        superseded = connection.execute(
+            "SELECT COUNT(*) FROM action_lifecycle "
+            "WHERE terminal_stage = 'superseded'"
+        ).fetchone()
+    assert fabricated_exact == (0,)
+    assert superseded == (0,)
+
+
+def test_control_overrun_drops_one_frame_then_holds_if_it_persists(
+    config: RobotConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = ScriptedKeyboard(KeyboardMapper(profile))
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_control_overrun_degradation",
+    )
+
+    def scripted_run(scheduler, callback, stop):
+        # Two ticks establish the lease/integrator. A transient missed period
+        # recovers; the final two consecutive misses must escalate to HOLD.
+        for index, missed_periods in enumerate((0, 0, 0, 1, 0, 1, 1)):
+            now_ns = time.monotonic_ns()
+            callback(
+                ScheduledTick(
+                    index,
+                    now_ns,
+                    now_ns,
+                    missed_periods,
+                    now_ns + scheduler.period_ns,
+                )
+            )
+            time.sleep(0.055)
+        return scheduler.stats()
+
+    monkeypatch.setattr(
+        "dummy_host.teleop_runtime.FixedRateScheduler.run_timed",
+        scripted_run,
+    )
+    result = run_teleop_collection(
+        robot,
+        source,
+        recorder,
+        profile,
+        duration_s=0.8,
+    )
+    recorder.close()
+
+    events = recorder.events_path.read_text(encoding="utf-8")
+    assert events.count('"event":"control_timing_deferred"') == 2
+    assert events.count('"event":"control_timing_recovered"') == 1
+    assert events.count('"event":"control_timing_overrun"') == 1
+    assert result.hold_transitions >= 1
 
 
 def test_idle_fake_mcu_collection_keeps_state_fresh(

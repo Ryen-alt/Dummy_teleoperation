@@ -582,6 +582,9 @@ def run_teleop_collection(
     coherent_sweep_skips = 0
     ik_hard_timeouts = 0
     action_credit_misses = 0
+    consecutive_action_credit_misses = 0
+    latest_action_reserved_ns: int | None = None
+    consecutive_control_overruns = 0
     idle_input_timeout_active = False
     runtime_error: BaseException | None = None
 
@@ -753,6 +756,8 @@ def run_teleop_collection(
             nonlocal last_fresh_sweep_ns, cartesian_reanchors, ik_soft_overruns
             nonlocal coherent_sweep_skips, ik_hard_timeouts
             nonlocal action_credit_misses
+            nonlocal consecutive_action_credit_misses, latest_action_reserved_ns
+            nonlocal consecutive_control_overruns
             nonlocal episode_last_sequence, episode_finalize_deadline_ns
             nonlocal latest_action_sequence
             nonlocal idle_input_timeout_active
@@ -785,20 +790,52 @@ def run_teleop_collection(
             last_command = command
             final_state = robot.read_state()
 
+            # This token proves that the control thread itself is still alive;
+            # target refresh remains a separate, explicit decision below. It is
+            # published before transient-overrun handling so one intentionally
+            # dropped frame is not misclassified as a dead control thread.
+            control_tick_id = robot.advance_control_tick() if acquired else None
+            if control_tick_id is not None:
+                lease.note_control_tick(control_tick_id, now_ns)
+
             interval_s = None if last_control_start_ns is None else (
                 now_ns - last_control_start_ns
             ) / 1e9
             last_control_start_ns = now_ns
             budget_s = 1.5 / robot.config.control_rate_hz
-            if acquired and interval_s is not None and interval_s > budget_s:
+            control_overrun = acquired and (
+                scheduled.missed_periods > 0
+                or (interval_s is not None and interval_s > budget_s)
+            )
+            if control_overrun:
+                consecutive_control_overruns += 1
+                reason = (
+                    f"control interval {0.0 if interval_s is None else interval_s * 1000:.1f} ms "
+                    f"or {scheduled.missed_periods} missed period(s) exceeds budget"
+                )
+                if consecutive_control_overruns == 1:
+                    integrator.advance_without_motion(now_ns)
+                    recorder.record_event(
+                        "control_timing_deferred",
+                        monotonic_ns=now_ns,
+                        payload={
+                            "measured_dt_s": interval_s,
+                            "budget_s": budget_s,
+                            "missed_periods": scheduled.missed_periods,
+                        },
+                    )
+                    record_control_sample(
+                        command,
+                        final_state,
+                        scheduled,
+                        valid=False,
+                        invalid_reason=reason,
+                    )
+                    return
                 hold_latched = True
                 lease.request("hold")
                 integrator.reset()
                 hold_transitions += 1
-                reason = (
-                    f"control interval {interval_s * 1000:.1f} ms exceeds "
-                    f"{budget_s * 1000:.1f} ms budget"
-                )
                 fail_active_episode("control_timing_overrun", now_ns)
                 recorder.record_event(
                     "control_timing_overrun",
@@ -807,6 +844,13 @@ def run_teleop_collection(
                 )
                 record_control_sample(command, final_state, scheduled, valid=False, invalid_reason=reason)
                 return
+            if consecutive_control_overruns:
+                recorder.record_event(
+                    "control_timing_recovered",
+                    monotonic_ns=now_ns,
+                    payload={"deferred_frames": consecutive_control_overruns},
+                )
+                consecutive_control_overruns = 0
 
             if action_failure.is_set():
                 hold_latched = True
@@ -818,6 +862,8 @@ def run_teleop_collection(
                 record_control_sample(command, final_state, scheduled, valid=False, invalid_reason=reason)
                 action_failure.clear()
                 latest_action_sequence = None
+                latest_action_reserved_ns = None
+                consecutive_action_credit_misses = 0
                 return
 
             if command.teleop_mode != teleop_mode:
@@ -1019,13 +1065,6 @@ def run_teleop_collection(
                 stop.set()
                 return
 
-            # Every healthy acquired control iteration publishes exactly one
-            # freshness generation. The lease thread may consume it once for
-            # the active target; it can never synthesize fresh generations.
-            control_tick_id = robot.advance_control_tick() if acquired else None
-            if control_tick_id is not None:
-                lease.note_control_tick(control_tick_id, now_ns)
-
             episode_snapshot = episode_manager.snapshot
             if episode_snapshot.status is EpisodeStatus.FINALIZING:
                 assert episode_last_sequence is not None
@@ -1074,6 +1113,8 @@ def run_teleop_collection(
                     episode_last_sequence = None
                     episode_finalize_deadline_ns = None
                     latest_action_sequence = None
+                    latest_action_reserved_ns = None
+                    consecutive_action_credit_misses = 0
                     record_control_sample(command, final_state, scheduled)
                     return
                 if now_ns >= episode_finalize_deadline_ns:
@@ -1124,6 +1165,8 @@ def run_teleop_collection(
                     integrator.reset()
                     control_had_lease = False
                     latest_action_sequence = None
+                    latest_action_reserved_ns = None
+                    consecutive_action_credit_misses = 0
                     hold_transitions += 1
                     hold_event = (
                         "operator_hold"
@@ -1164,6 +1207,8 @@ def run_teleop_collection(
                 integrator.reset(final_state, now_ns=now_ns)
                 control_had_lease = True
                 latest_action_sequence = None
+                latest_action_reserved_ns = None
+                consecutive_action_credit_misses = 0
                 last_fresh_sweep_ns = now_ns if teleop_mode == "cartesian" else None
                 record_control_sample(command, final_state, scheduled)
                 return
@@ -1242,18 +1287,66 @@ def run_teleop_collection(
             )
             if action_credit is None:
                 action_credit_misses += 1
+                consecutive_action_credit_misses += 1
+                outstanding_age_ns = (
+                    0
+                    if latest_action_reserved_ns is None
+                    else max(0, now_ns - latest_action_reserved_ns)
+                )
+                if (
+                    consecutive_action_credit_misses == 1
+                    and outstanding_age_ns <= 100_000_000
+                ):
+                    # Drop exactly this update and advance only the time anchor.
+                    # Position/pose and velocity state remain unchanged, so the
+                    # next successful tick cannot integrate the deferred period.
+                    integrator.advance_without_motion(now_ns)
+                    if latest_action_sequence is not None:
+                        with action_stage_lock:
+                            refresh_stages = set(
+                                action_stages.get(latest_action_sequence, set())
+                            )
+                        if ActionStage.ACKNOWLEDGED in refresh_stages:
+                            lease.request_target_refresh(
+                                latest_action_sequence,
+                                control_tick_id,
+                                now_ns,
+                            )
+                    recorder.record_event(
+                        "action_credit_deferred",
+                        monotonic_ns=now_ns,
+                        payload={
+                            "latest_action_sequence": latest_action_sequence,
+                            "control_tick_id": control_tick_id,
+                            "outstanding_age_ns": outstanding_age_ns,
+                            "consecutive_misses": consecutive_action_credit_misses,
+                        },
+                    )
+                    record_control_sample(
+                        command,
+                        final_state,
+                        scheduled,
+                        valid=False,
+                        invalid_reason=(
+                            "previous action is awaiting CAN_TX_COMPLETE_EXACT; "
+                            "this control update was deferred"
+                        ),
+                    )
+                    return
                 hold_latched = True
                 robot.request_priority_hold()
                 lease.request("hold")
                 integrator.reset()
                 hold_transitions += 1
-                fail_active_episode("action_credit_miss", now_ns)
+                fail_active_episode("action_credit_timeout", now_ns)
                 recorder.record_event(
-                    "action_credit_miss",
+                    "action_credit_hold",
                     monotonic_ns=now_ns,
                     payload={
                         "latest_action_sequence": latest_action_sequence,
                         "control_tick_id": control_tick_id,
+                        "outstanding_age_ns": outstanding_age_ns,
+                        "consecutive_misses": consecutive_action_credit_misses,
                     },
                 )
                 record_control_sample(
@@ -1267,6 +1360,21 @@ def run_teleop_collection(
                     ),
                 )
                 return
+            if consecutive_action_credit_misses:
+                recorder.record_event(
+                    "action_credit_recovered",
+                    monotonic_ns=now_ns,
+                    payload={
+                        "latest_action_sequence": latest_action_sequence,
+                        "outstanding_age_ns": (
+                            0
+                            if latest_action_reserved_ns is None
+                            else max(0, now_ns - latest_action_reserved_ns)
+                        ),
+                        "deferred_updates": consecutive_action_credit_misses,
+                    },
+                )
+                consecutive_action_credit_misses = 0
 
             try:
                 if teleop_mode == "cartesian":
@@ -1412,6 +1520,7 @@ def run_teleop_collection(
             send_enqueued_ns = clock_ns()
             actions_sent += 1
             latest_action_sequence = action.sequence
+            latest_action_reserved_ns = action_credit.reserved_ns
             if episode_manager.snapshot.status is EpisodeStatus.RECORDING:
                 episode_last_sequence = action.sequence
             record_control_sample(
