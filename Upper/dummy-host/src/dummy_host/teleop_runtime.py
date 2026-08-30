@@ -680,8 +680,11 @@ def run_teleop_collection(
         evidence_telemetry = _EvidenceTelemetryWorker(
             robot, recorder, clock_ns=clock_ns
         )
-        evidence_telemetry.start()
+        # Establish the fail-safe mode before background evidence traffic begins.
+        # TIME_SYNC and CAN_DIAGNOSTICS responses can span several USB CDC
+        # packets; starting them first used to race this initial HOLD request.
         robot.hold()
+        evidence_telemetry.start()
         final_state = robot.read_state()
         if teleop_mode == "cartesian" and not robot.transport.is_simulated:
             assert cartesian_calibration is not None

@@ -13,6 +13,7 @@
 #include "configurations/robot_config_generated.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 osThreadId_t usbServerTaskHandle;
@@ -598,8 +599,24 @@ void MaybeSendBinaryState(uint64_t now_us)
 } // namespace
 
 
+namespace
+{
+constexpr size_t kUsbRxPacketQueueCapacity = 16;
+
+struct USBRxPacket
+{
+    std::array<uint8_t, USB_RX_DATA_SIZE> data{};
+    uint32_t length = 0;
+};
+
 struct USBInterface
 {
+    std::array<USBRxPacket, kUsbRxPacketQueueCapacity> rx_queue{};
+    size_t rx_read = 0;
+    size_t rx_write = 0;
+    size_t rx_count = 0;
+    // When the copy queue is full, leave the OUT endpoint unarmed and retain
+    // its stable USB buffer until the server task has made room.
     uint8_t *rx_buf = nullptr;
     uint32_t rx_len = 0;
     bool data_pending = false;
@@ -608,20 +625,101 @@ struct USBInterface
     USBSender &usb_sender;
 };
 
+bool QueueUsbRxPacket(USBInterface& interface, uint8_t* buffer, uint32_t length)
+{
+    bool copied = false;
+    taskENTER_CRITICAL();
+    if (length <= USB_RX_DATA_SIZE &&
+        interface.rx_count < interface.rx_queue.size())
+    {
+        auto& packet = interface.rx_queue[interface.rx_write];
+        std::memcpy(packet.data.data(), buffer, length);
+        packet.length = length;
+        interface.rx_write =
+            (interface.rx_write + 1U) % interface.rx_queue.size();
+        ++interface.rx_count;
+        copied = true;
+    }
+    else
+    {
+        // The endpoint has not been rearmed yet, so this USB-owned buffer
+        // remains valid until the server copies it below.
+        interface.rx_buf = buffer;
+        interface.rx_len = length;
+        interface.data_pending = true;
+    }
+    taskEXIT_CRITICAL();
+    return copied;
+}
+
+bool PopUsbRxPacket(USBInterface& interface, USBRxPacket& packet,
+                    bool& should_rearm)
+{
+    bool available = false;
+    should_rearm = false;
+    taskENTER_CRITICAL();
+    if (interface.rx_count > 0U)
+    {
+        packet = interface.rx_queue[interface.rx_read];
+        interface.rx_read =
+            (interface.rx_read + 1U) % interface.rx_queue.size();
+        --interface.rx_count;
+        available = true;
+    }
+    else if (interface.data_pending)
+    {
+        const uint32_t copy_length =
+            std::min<uint32_t>(interface.rx_len, packet.data.size());
+        std::memcpy(packet.data.data(), interface.rx_buf, copy_length);
+        packet.length = copy_length;
+        interface.data_pending = false;
+        should_rearm = true;
+        available = true;
+    }
+    taskEXIT_CRITICAL();
+    return available;
+}
+
+void ProcessCdcPacket(const USBRxPacket& packet)
+{
+    const bool starts_binary = packet.length > 0 && packet.data[0] == 0x06;
+    const bool starts_ascii = packet.length > 0 &&
+        packet.data[0] >= 0x20 && packet.data[0] <= 0x7e;
+    const bool binary_lease_active =
+        dummy::protocol::BinaryControlLeaseActive();
+    if (starts_ascii && binary_lease_active && !cdc_binary_frame_active)
+    {
+        // The maintenance channel cannot take ownership while a binary
+        // control lease exists. Drop the text command.
+    }
+    else if (cdc_binary_frame_active ||
+        (!starts_ascii && (binary_state_stream_enabled || starts_binary)))
+    {
+        ProcessBinaryBytes(
+            packet.data.data(), packet.length,
+            dummy::protocol::BinaryControlMonotonicMicros());
+        cdc_binary_frame_active =
+            packet.length > 0 && packet.data[packet.length - 1] != 0;
+    }
+    else
+    {
+        // Returning to the maintenance protocol also stops binary telemetry.
+        binary_state_stream_enabled = false;
+        ASCII_protocol_parse_stream(
+            packet.data.data(), packet.length, usb_stream_output);
+    }
+}
+} // namespace
+
 // Note: statics make this less modular.
-// Note: we use a single rx semaphore and loop over data_pending to allow a single pump loop thread
+// Note: one semaphore is sufficient because the server drains both packet queues
+// after every wake-up; semaphore releases may therefore be safely coalesced.
 static USBInterface CDC_interface = {
-    .rx_buf = nullptr,
-    .rx_len = 0,
-    .data_pending = false,
     .out_ep = CDC_OUT_EP,
     .in_ep = CDC_IN_EP,
     .usb_sender = usb_packet_output_cdc,
 };
 static USBInterface ODrive_interface = {
-    .rx_buf = nullptr,
-    .rx_len = 0,
-    .data_pending = false,
     .out_ep = ODRIVE_OUT_EP,
     .in_ep = ODRIVE_IN_EP,
     .usb_sender = usb_packet_output_native,
@@ -637,46 +735,22 @@ static void UsbServerTask(void *ctx)
         osStatus sem_stat = osSemaphoreAcquire(sem_usb_rx, 20);
         if (sem_stat == osOK)
         {
-            usb_stats_.rx_cnt++;
-
-            // CDC Interface
-            if (CDC_interface.data_pending)
+            USBRxPacket packet{};
+            bool should_rearm = false;
+            while (PopUsbRxPacket(CDC_interface, packet, should_rearm))
             {
-                CDC_interface.data_pending = false;
-
-                const bool starts_binary = CDC_interface.rx_len > 0 && CDC_interface.rx_buf[0] == 0x06;
-                const bool starts_ascii = CDC_interface.rx_len > 0 &&
-                    CDC_interface.rx_buf[0] >= 0x20 && CDC_interface.rx_buf[0] <= 0x7e;
-                const bool binary_lease_active = dummy::protocol::BinaryControlLeaseActive();
-                if (starts_ascii && binary_lease_active && !cdc_binary_frame_active)
-                {
-                    // The maintenance channel cannot take ownership while a
-                    // binary control lease exists. Drop the text command.
-                }
-                else if (cdc_binary_frame_active ||
-                    (!starts_ascii && (binary_state_stream_enabled || starts_binary)))
-                {
-                    ProcessBinaryBytes(
-                        CDC_interface.rx_buf, CDC_interface.rx_len,
-                        dummy::protocol::BinaryControlMonotonicMicros());
-                    cdc_binary_frame_active =
-                        CDC_interface.rx_len > 0 && CDC_interface.rx_buf[CDC_interface.rx_len - 1] != 0;
-                }
-                else
-                {
-                    // Returning to the maintenance protocol also stops binary telemetry.
-                    binary_state_stream_enabled = false;
-                    ASCII_protocol_parse_stream(CDC_interface.rx_buf, CDC_interface.rx_len, usb_stream_output);
-                }
-                USBD_CDC_ReceivePacket(&hUsbDeviceFS, CDC_interface.out_ep);  // Allow next packet
+                if (should_rearm)
+                    USBD_CDC_ReceivePacket(&hUsbDeviceFS, CDC_interface.out_ep);
+                ++usb_stats_.rx_cnt;
+                ProcessCdcPacket(packet);
             }
 
-            // Native Interface
-            if (ODrive_interface.data_pending)
+            while (PopUsbRxPacket(ODrive_interface, packet, should_rearm))
             {
-                ODrive_interface.data_pending = false;
-                usb_channel.process_packet(ODrive_interface.rx_buf, ODrive_interface.rx_len);
-                USBD_CDC_ReceivePacket(&hUsbDeviceFS, ODrive_interface.out_ep);  // Allow next packet
+                if (should_rearm)
+                    USBD_CDC_ReceivePacket(&hUsbDeviceFS, ODrive_interface.out_ep);
+                ++usb_stats_.rx_cnt;
+                usb_channel.process_packet(packet.data.data(), packet.length);
             }
         }
         const uint64_t binary_now_us =
@@ -702,11 +776,12 @@ void usb_rx_process_packet(uint8_t *buf, uint32_t len, uint8_t endpoint_pair)
         return;
     }
 
-    // We don't allow the next USB packet until the previous one has been processed completely.
-    // Therefore it's safe to write to these vars directly since we know previous processing is complete.
-    usb_iface->rx_buf = buf;
-    usb_iface->rx_len = len;
-    usb_iface->data_pending = true;
+    // Copy before rearming: the USB stack reuses its endpoint buffer. This lets
+    // the host continue writing while the server is transmitting a multi-packet
+    // response. If the bounded queue fills, leaving the endpoint unarmed applies
+    // lossless USB backpressure until the server has copied the stalled packet.
+    if (QueueUsbRxPacket(*usb_iface, buf, len))
+        USBD_CDC_ReceivePacket(&hUsbDeviceFS, usb_iface->out_ep);
     osSemaphoreRelease(sem_usb_rx);
 }
 
@@ -714,7 +789,9 @@ void usb_rx_process_packet(uint8_t *buf, uint32_t len, uint8_t endpoint_pair)
 const osThreadAttr_t usbServerTask_attributes = {
     .name = "UsbServerTask",
     .stack_size = 4096,
-    .priority = (osPriority_t) osPriorityNormal,
+    // Keep CDC packet draining ahead of normal-priority maintenance tasks while
+    // remaining below the high/realtime CAN and robot-control tasks.
+    .priority = (osPriority_t) osPriorityAboveNormal,
 };
 
 void StartUsbServer()

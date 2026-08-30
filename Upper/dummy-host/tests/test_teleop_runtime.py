@@ -149,6 +149,16 @@ class DelayedExactFanoutTransport(FakeMcuTransport):
             self.hidden_sequence = None
 
 
+class RecordingStartupOrderTransport(FakeMcuTransport):
+    def __init__(self, config: RobotConfig) -> None:
+        super().__init__(config)
+        self.sent_types: list[MessageType] = []
+
+    def send(self, packet) -> None:
+        self.sent_types.append(packet.message_type)
+        super().send(packet)
+
+
 def test_lease_coordinator_holds_within_75_ms_when_control_ticks_stop() -> None:
     class Robot:
         config = SimpleNamespace(lease_timeout_ms=500)
@@ -321,6 +331,37 @@ def test_idle_fake_mcu_collection_keeps_state_fresh(
         ).fetchone()
     assert exchanges is not None and exchanges[0] >= 1
     assert diagnostics is not None and diagnostics[0] >= 1
+
+
+def test_runtime_enters_hold_before_starting_evidence_traffic(
+    config: RobotConfig, tmp_path: Path
+) -> None:
+    profile = load_teleop_profile(
+        Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
+    )
+    source = IdleKeyboard(KeyboardMapper(profile))
+    transport = RecordingStartupOrderTransport(config)
+    robot = DummyRobot(config, transport)
+    recorder = SessionRecorder(
+        tmp_path,
+        config,
+        profile,
+        source="keyboard",
+        session_name="session_startup_order",
+    )
+
+    run_teleop_collection(
+        robot,
+        source,
+        recorder,
+        profile,
+        duration_s=0.31,
+    )
+    recorder.close()
+
+    initial_hold = transport.sent_types.index(MessageType.HOLD)
+    assert initial_hold < transport.sent_types.index(MessageType.TIME_SYNC)
+    assert initial_hold < transport.sent_types.index(MessageType.GET_CAN_DIAGNOSTICS)
 
 
 def test_stray_episode_failure_while_idle_does_not_abort_teleoperation(
