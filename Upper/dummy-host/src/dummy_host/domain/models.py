@@ -104,6 +104,7 @@ class ActionLifecycleUpdate:
     detail: str | None = None
     session_epoch: int = 0
     control_tick_id: int = 0
+    measurement_us: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -112,8 +113,10 @@ class ActionLifecycleUpdate:
             or self.mcu_time_us < 0
             or self.session_epoch < 0
             or self.control_tick_id < 0
+            or self.measurement_us < 0
             or self.session_epoch > 0xFFFFFFFF
             or self.control_tick_id > 0xFFFFFFFF
+            or self.measurement_us > 0xFFFFFFFF
         ):
             raise ValueError("action lifecycle identifiers and timestamps are invalid")
 

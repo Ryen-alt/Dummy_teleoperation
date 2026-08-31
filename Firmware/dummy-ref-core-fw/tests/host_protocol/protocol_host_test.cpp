@@ -1396,8 +1396,12 @@ void TestCanTimingProfileRejectsLateWrongPage()
 
 void TestCanTimingProfilerBuildsFixedEvidencePayload()
 {
+    CanDispatchDiagnostics scheduler_baseline{};
+    scheduler_baseline.timing_profile_requested.fill(9U);
+    scheduler_baseline.timing_profile_responded.fill(8U);
+    scheduler_baseline.timing_profile_timed_out.fill(1U);
     CanTimingProfiler profiler;
-    profiler.Reset(77U, 1000000U);
+    profiler.Reset(77U, 1000000U, scheduler_baseline);
     uint32_t now_us = 10U;
     for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
     {
@@ -1419,24 +1423,31 @@ void TestCanTimingProfilerBuildsFixedEvidencePayload()
         for (const uint8_t page : kOutOfOrderPages)
         {
             const uint16_t first = static_cast<uint16_t>(100U + page);
-            const uint16_t second = static_cast<uint16_t>(200U + page);
+            const uint16_t second = page == DUMMY_MOTOR_TIMING_PAGE_COUNTS
+                ? 0U : static_cast<uint16_t>(200U + page);
             const uint8_t data[8]{
                 0xA9U, page, 0x0FU, 0U,
                 static_cast<uint8_t>(first),
                 static_cast<uint8_t>(first >> 8U),
                 static_cast<uint8_t>(second),
                 static_cast<uint8_t>(second >> 8U)};
-            assert(profiler.RecordMotorPage(node_id, data, sizeof(data)));
+            const uint32_t received_us =
+                page == DUMMY_MOTOR_TIMING_PAGE_COUNTS
+                ? 1500000U + node_id : 0U;
+            assert(profiler.RecordMotorPage(
+                node_id, data, sizeof(data), received_us));
         }
     }
     CanDispatchDiagnostics scheduler{};
-    scheduler.timing_profile_requested.fill(4U);
-    scheduler.timing_profile_responded.fill(4U);
+    scheduler.timing_profile_requested.fill(13U);
+    scheduler.timing_profile_responded.fill(12U);
+    scheduler.timing_profile_timed_out.fill(1U);
     const CanTimingProfilePayload payload = profiler.MakePayload(
         2000000U, scheduler);
     assert(payload.format_version == kCanTimingProfileFormatVersion);
     assert(payload.payload_size == sizeof(CanTimingProfilePayload));
     assert(payload.session_epoch == 77U);
+    assert(payload.window_duration_us == 500001U);
     assert(payload.window_flags == kCanTimingProfileWindowValid);
     for (size_t index = 0U; index < kActuatorNodeCount; ++index)
     {
@@ -1446,7 +1457,7 @@ void TestCanTimingProfilerBuildsFixedEvidencePayload()
         assert(payload.temperature_p999_us[index] >= 201U);
         assert(payload.motor_flags[index] == 0x0FU);
         assert(payload.motor_can_samples[index] == 103U);
-        assert(payload.motor_missed_ticks[index] == 203U);
+        assert(payload.motor_missed_ticks[index] == 0U);
         assert(payload.timing_request[index] == 4U);
         assert(payload.timing_response[index] == 4U);
         assert(payload.timing_timeout[index] == 0U);
@@ -1698,6 +1709,7 @@ void TestTargetCompletionRetriesOnlyTheExactFailedNode()
     }
     assert(tracker.RecordCompletion(key, kActuatorNodeCount, true, 1200U) ==
            TargetCompletionResult::CompleteExact);
+    assert(tracker.last_fanout_us() == 1100U);
     assert(!tracker.active());
     const TargetCompletionDiagnostics diagnostics = tracker.diagnostics();
     assert(diagnostics.retry_count == 1U);

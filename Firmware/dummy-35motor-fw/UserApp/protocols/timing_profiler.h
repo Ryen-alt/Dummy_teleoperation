@@ -13,6 +13,7 @@ uint32_t MotorTimingProfilerControlBegin(void);
 void MotorTimingProfilerControlEnd(uint32_t start_cycles);
 uint32_t MotorTimingProfilerCanBegin(void);
 void MotorTimingProfilerRecordCan05(uint32_t start_cycles);
+void MotorTimingProfilerStartWindow(uint32_t window_token);
 void MotorTimingProfilerRefresh(void);
 bool MotorTimingProfilerEncodePage(uint8_t page, uint8_t output[8]);
 

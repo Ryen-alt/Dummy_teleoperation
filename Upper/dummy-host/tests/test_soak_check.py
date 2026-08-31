@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
 
+from dummy_host.apps.can_r5_check import check_can_r5_session
 from dummy_host.apps.soak_check import (
     SoakMetrics,
     SoakThresholds,
     check_soak_session,
     evaluate_soak_metrics,
 )
+from dummy_host.can_a9 import load_can_timing_profile_events
+from dummy_host.can_r5 import CanR5Thresholds
 from dummy_host.domain import ActionLifecycleUpdate, ActionStage
 from dummy_host.protocol import (
     CAN_DIAGNOSTICS_FORMAT_VERSION,
@@ -34,6 +37,7 @@ def _passing_metrics() -> SoakMetrics:
         control_rate_hz=20.0,
         coherent_ratio=0.999,
         maximum_feedback_skew_ms=29.0,
+        coherent_sweep_p99_ms=20.0,
         action_sequences=70_000,
         incomplete_action_sequences=0,
         superseded_actions=0,
@@ -56,6 +60,8 @@ def _passing_metrics() -> SoakMetrics:
         target_retry_exhausted_count=0,
         target_deadline_failure_count=0,
         transition_failure_count=0,
+        position_timeout_count=0,
+        temperature_timeout_count=0,
         position_timeout_rate=0.0,
         diagnostic_window_valid=True,
         can_safety_preemption_count=0,
@@ -244,6 +250,15 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
                     control_tick_id=index,
                 )
             )
+        recorder.record_event(
+            "can_target_fanout",
+            monotonic_ns=tick_ns + 2_000_000,
+            payload={
+                "action_sequence": index,
+                "session_epoch": epoch,
+                "duration_us": 900,
+            },
+        )
     recorder.record_can_diagnostics(
         _can_diagnostics(
             epoch=epoch,
@@ -254,6 +269,21 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
             temperature=1,
         ),
         host_time_ns=start_ns + 1_000_000_000,
+    )
+    a9_fixture = load_can_timing_profile_events(
+        Path(__file__).parent / "fixtures" / "can_a9_valid_events.jsonl"
+    )
+    recorder.record_event(
+        "can_timing_profile",
+        monotonic_ns=start_ns + 999_000_000,
+        payload=asdict(
+            replace(
+                a9_fixture,
+                session_epoch=epoch,
+                window_start_us=start_ns // 1_000,
+                window_duration_us=1_000_000,
+            )
+        ),
     )
     recorder.record_event(
         "collection_stopped", monotonic_ns=start_ns + 1_000_000_000
@@ -267,3 +297,15 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
     assert report.metrics.coherent_ratio == 1.0
     assert report.metrics.control_rate_hz == 20.0
     assert report.metrics.target_rate_hz_per_node == (50.0,) * 7
+
+    r5 = check_can_r5_session(
+        recorder.session_dir,
+        config,
+        thresholds=CanR5Thresholds(
+            minimum_duration_s=1.0,
+            minimum_fanout_samples=10,
+        ),
+    )
+    assert r5.result == "RECONFIGURE"
+    assert r5.runtime.exact_fanout_samples == 20
+    assert r5.runtime.exact_fanout_p99_ms == 0.9

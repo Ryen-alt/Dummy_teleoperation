@@ -5,8 +5,10 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 
-from dummy_host.can_a9 import evaluate_can_a9
+import pytest
+
 from dummy_host.apps.can_a9_profile import main as can_a9_profile_main
+from dummy_host.can_a9 import evaluate_can_a9, load_can_timing_profile_events
 from dummy_host.protocol import (
     CAN_TIMING_PROFILE_FORMAT_VERSION,
     CAN_TIMING_PROFILE_PAYLOAD_SIZE,
@@ -108,3 +110,20 @@ def test_can_a9_cli_reports_fixed_fixture_with_explicit_pass(
     }
     assert output["recommended_node_quiet_us"] == 500
     assert output["recommended_response_timeout_us"] == 500
+
+
+def test_a9_event_loader_can_be_bounded_to_collection_window() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "can_a9_valid_events.jsonl"
+
+    profile = load_can_timing_profile_events(
+        fixture,
+        minimum_monotonic_ns=123456789,
+        maximum_monotonic_ns=123456789,
+    )
+
+    assert profile.session_epoch == 7
+    with pytest.raises(ValueError, match="no can_timing_profile"):
+        load_can_timing_profile_events(
+            fixture,
+            minimum_monotonic_ns=123456790,
+        )

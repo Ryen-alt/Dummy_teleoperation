@@ -5,8 +5,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from dummy_host.can_a9 import evaluate_can_a9
-from dummy_host.protocol import CAN_TIMING_PROFILE_WINDOW_ACTIVE, CanTimingProfile
+from dummy_host.can_a9 import evaluate_can_a9, load_can_timing_profile_events
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import load_robot_config
 from dummy_host.transport_serial import SerialTransport
@@ -33,25 +32,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.events is not None:
-        latest: dict[str, object] | None = None
-        latest_active: dict[str, object] | None = None
-        for line in args.events.read_text(encoding="utf-8").splitlines():
-            record = json.loads(line)
-            if record.get("event") == "can_timing_profile":
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    parser.error("can_timing_profile event payload is not an object")
-                latest = payload
-                if int(payload.get("window_flags", 0)) & CAN_TIMING_PROFILE_WINDOW_ACTIVE:
-                    latest_active = payload
-        if latest is None:
-            parser.error("events file contains no can_timing_profile record")
-        latest = latest_active if latest_active is not None else latest
-        converted = {
-            key: tuple(value) if isinstance(value, list) else value
-            for key, value in latest.items()
-        }
-        profile = CanTimingProfile(**converted)
+        try:
+            profile = load_can_timing_profile_events(args.events)
+        except (OSError, TypeError, ValueError) as exc:
+            parser.error(str(exc))
     else:
         if args.config is None:
             parser.error("--config is required with --port")

@@ -149,6 +149,7 @@ class DummyRobot:
         self._deadline_heap: list[tuple[int, int, int]] = []
         self._action_stages: dict[int, set[ActionStage]] = {}
         self._action_control_ticks: dict[int, int] = {}
+        self._action_fanout_measurements: dict[int, int] = {}
         self._active_action_sequence: int | None = None
         self._action_credit_generation = 0
         self._action_credit: ActionCredit | None = None
@@ -962,7 +963,6 @@ class DummyRobot:
         mcu_time_us: int,
         sweep_id: int,
     ) -> None:
-        del sweep_id
         with self._pending_lock:
             if sequence not in self._action_stages:
                 return
@@ -984,7 +984,41 @@ class DummyRobot:
                 if stage is ActionProgressStage.SUPERSEDED
                 else None
             ),
+            measurement_us=(
+                sweep_id
+                if stage is ActionProgressStage.CAN_TX_COMPLETE_EXACT
+                else 0
+            ),
         )
+        if (
+            not emitted
+            and stage is ActionProgressStage.CAN_TX_COMPLETE_EXACT
+            and sweep_id > 0
+        ):
+            with self._pending_lock:
+                previous_measurement = self._action_fanout_measurements.get(
+                    sequence, 0
+                )
+                listener = (
+                    self._action_listener
+                    if previous_measurement == 0
+                    else None
+                )
+                if listener is not None:
+                    self._action_fanout_measurements[sequence] = sweep_id
+                control_tick_id = self._action_control_ticks.get(sequence, 0)
+            if listener is not None:
+                listener(
+                    ActionLifecycleUpdate(
+                        sequence,
+                        ActionStage.CAN_TX_COMPLETE_EXACT,
+                        self.clock_ns(),
+                        mcu_time_us=mcu_time_us,
+                        session_epoch=self.session_id,
+                        control_tick_id=control_tick_id,
+                        measurement_us=sweep_id,
+                    )
+                )
         if emitted and stage in {
             ActionProgressStage.SUPERSEDED,
             ActionProgressStage.FAILED,
@@ -1057,6 +1091,7 @@ class DummyRobot:
         *,
         mcu_time_us: int = 0,
         detail: str | None = None,
+        measurement_us: int = 0,
     ) -> bool:
         with self._pending_lock:
             stages = self._action_stages.setdefault(sequence, set())
@@ -1081,6 +1116,11 @@ class DummyRobot:
             }:
                 return False
             stages.add(stage)
+            if (
+                stage is ActionStage.CAN_TX_COMPLETE_EXACT
+                and measurement_us > 0
+            ):
+                self._action_fanout_measurements[sequence] = measurement_us
             listener = self._action_listener
             control_tick_id = self._action_control_ticks.get(sequence, 0)
             completed = {
@@ -1106,6 +1146,7 @@ class DummyRobot:
                     if oldest != sequence:
                         self._action_stages.pop(oldest, None)
                         self._action_control_ticks.pop(oldest, None)
+                        self._action_fanout_measurements.pop(oldest, None)
             if stage is ActionStage.CAN_TX_COMPLETE_EXACT or terminal:
                 self._release_action_credit_locked(sequence)
             if (
@@ -1129,6 +1170,7 @@ class DummyRobot:
                     detail=detail,
                     session_epoch=self.session_id,
                     control_tick_id=control_tick_id,
+                    measurement_us=measurement_us,
                 )
             )
         return True
@@ -1188,6 +1230,7 @@ class DummyRobot:
         with self._watchdog_condition:
             self._action_stages.pop(sequence, None)
             self._action_control_ticks.pop(sequence, None)
+            self._action_fanout_measurements.pop(sequence, None)
             self._ack_deadlines.pop(sequence, None)
             self._completion_deadlines.pop(sequence, None)
 

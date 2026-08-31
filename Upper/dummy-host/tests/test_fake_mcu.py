@@ -382,6 +382,49 @@ def test_action_progress_from_an_old_session_epoch_is_ignored(config) -> None:
         assert ActionStage.CAN_TX_COMPLETE_EXACT not in observed
 
 
+def test_exact_progress_exposes_firmware_fanout_measurement(config) -> None:
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    updates = []
+    robot.set_action_lifecycle_listener(updates.append)
+    sequence = 123
+    robot._prepare_action_sequence(sequence)
+    robot._emit_action_stage(sequence, ActionStage.RECEIVED, robot.clock_ns())
+    updates.clear()
+
+    robot._apply_action_progress(
+        sequence,
+        ActionProgressStage.CAN_TX_COMPLETE_EXACT,
+        1000,
+        4321,
+    )
+
+    assert updates[-1].stage is ActionStage.CAN_TX_COMPLETE_EXACT
+    assert updates[-1].measurement_us == 4321
+
+
+def test_late_reliable_exact_event_enriches_state_replay_measurement(config) -> None:
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    updates = []
+    robot.set_action_lifecycle_listener(updates.append)
+    sequence = 124
+    robot._prepare_action_sequence(sequence)
+    robot._emit_action_stage(sequence, ActionStage.RECEIVED, robot.clock_ns())
+    updates.clear()
+    robot._apply_action_progress(
+        sequence, ActionProgressStage.CAN_TX_COMPLETE_EXACT, 1000, 0
+    )
+    robot._apply_action_progress(
+        sequence, ActionProgressStage.CAN_TX_COMPLETE_EXACT, 1000, 987
+    )
+    robot._apply_action_progress(
+        sequence, ActionProgressStage.CAN_TX_COMPLETE_EXACT, 1000, 987
+    )
+
+    assert len(updates) == 2
+    assert updates[0].measurement_us == 0
+    assert updates[1].measurement_us == 987
+
+
 def test_action_watchdog_expires_lost_ack_while_state_continues(config) -> None:
     robot = DummyRobot(
         config,

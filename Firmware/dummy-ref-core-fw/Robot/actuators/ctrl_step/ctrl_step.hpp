@@ -65,7 +65,8 @@ public:
     float GetTemp();
     bool TryGetTemp(const CanTxMetadata* metadata = nullptr);
     bool TryGetTimingProfile(
-        uint8_t page, const CanTxMetadata* metadata = nullptr);
+        uint8_t page, uint32_t window_token,
+        const CanTxMetadata* metadata = nullptr);
     void EraseConfigs();
 
     void UpdateAngle();

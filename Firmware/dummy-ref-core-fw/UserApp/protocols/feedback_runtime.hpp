@@ -34,7 +34,8 @@ void RecordMotorTransportDiagnostics(uint8_t node_id, const uint8_t* data,
 void RecordTemperatureFeedbackTimeout(uint8_t node_id);
 bool RecordMotorTimingProfile(uint8_t node_id, const uint8_t* data,
                               uint32_t length);
-bool AcceptMotorTimingProfile(uint8_t node_id, uint8_t page);
+bool AcceptMotorTimingProfile(uint8_t node_id, uint8_t page,
+                              uint32_t received_us);
 FeedbackResponseEvents ConsumeFeedbackResponseEvents();
 void CancelPendingFeedbackRequests();
 void PublishFeedbackSnapshot(uint32_t now_us);
@@ -61,7 +62,8 @@ void PublishCanFeedbackReady(bool ready);
 bool ReadCanFeedbackReady();
 void PublishCanDiagnostics(const CanDiagnosticsPayload& diagnostics);
 CanDiagnosticsPayload ReadCanDiagnostics();
-void ResetCanTimingProfile(uint32_t session_epoch, uint64_t start_us);
+void ResetCanTimingProfile(uint32_t session_epoch, uint64_t start_us,
+                           const CanDispatchDiagnostics& scheduler);
 void SetCanTimingProfileActive(bool active);
 void SetCanTimingProfileEpochStable(bool stable);
 void PublishCanTimingProfile(uint64_t now_us,

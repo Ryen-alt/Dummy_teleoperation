@@ -3,7 +3,7 @@
 All multi-byte values are little-endian. A wire frame is
 `COBS(header || payload || crc32c) || 0x00`; CRC32C covers the decoded header
 and payload. The maximum decoded frame is 576 bytes. A real peer must report
-firmware `dummy-ref-v2.2.1`; v4/v5 peers never share a control session, and a
+firmware `dummy-ref-v2.2.2`; v4/v5 peers never share a control session, and a
 v2.2 peer is rejected even though it also speaks protocol v5.
 
 ## Header and epoch
@@ -31,10 +31,11 @@ Message values are:
 - Requests: `HELLO=0x01`, `ACQUIRE_CONTROL=0x02`, `RELEASE_CONTROL=0x03`,
   `SET_MODE=0x04`, `HEARTBEAT=0x05`, `SET_JOINT_TARGET=0x06`, `HOLD=0x07`,
   `ESTOP=0x08`, `CLEAR_FAULT=0x09`, `TARGET_KEEPALIVE=0x0a`,
-  `TIME_SYNC=0x0b`, `GET_CAN_DIAGNOSTICS=0x0c`.
+  `TIME_SYNC=0x0b`, `GET_CAN_DIAGNOSTICS=0x0c`,
+  `GET_CAN_TIMING_PROFILE=0x0d`.
 - Responses/telemetry: `HELLO_ACK=0x81`, `STATE=0x82`, `ACK=0x83`,
   `NACK=0x84`, `FAULT=0x85`, `EVENT=0x86`, `TIME_SYNC_ACK=0x87`,
-  `CAN_DIAGNOSTICS=0x88`.
+  `CAN_DIAGNOSTICS=0x88`, `CAN_TIMING_PROFILE=0x89`.
 
 Modes are `DISABLED=1`, `HOLD=2`, `TELEOP=3`, `POLICY=4`, `GRAVITY=5`,
 `FAULT=6`. Policy code cannot write protocol packets directly; all actions pass
@@ -52,6 +53,7 @@ CONTROL_FRESHNESS_TOKEN    0x00000008
 TIME_SYNC                  0x00000010
 CAN_DIAGNOSTICS            0x00000020
 CAN_DIAGNOSTICS_V2         0x00000040
+CAN_TIMING_PROFILE         0x00000080
 ```
 
 ## Control payloads
@@ -109,8 +111,12 @@ The host extends low timestamps against `STATE.mcu_time_us`. Flags are
 
 EVENT uses the full 20-byte action-progress payload:
 `uint32 sequence; uint8 stage; uint8 reserved[3]; uint64 stage_time_us;`
-`uint32 feedback_sweep_id`. EVENT is the fast path; STATE replay is the loss
-recovery path. The host de-duplicates by equal `(session_epoch, sequence)`.
+`uint32 stage_value`. For `CAN_TX_COMPLETE_EXACT`, `stage_value` is the measured
+first-enqueue→last-TX-complete fanout duration in microseconds; for queued/post-
+feedback stages it remains the coherent sweep identifier, and otherwise is zero.
+EVENT is the fast path; STATE replay is the loss recovery path. If STATE replay
+arrives first without the fanout measurement, the later reliable EVENT enriches
+that lifecycle exactly once.
 
 The monotonic action lifecycle is:
 
@@ -138,6 +144,17 @@ node sample times.
 `CAN_DIAGNOSTICS` is fixed at 380 bytes and starts with
 `format_version=2`, `payload_size=380`. The host rejects the legacy 132-byte
 payload and requires both diagnostics capability bits.
+
+`CAN_TIMING_PROFILE` is a separate fixed 520-byte v1 payload. It contains the
+active Stream epoch/window, four 0x26 page masks, seven-node position and
+temperature TX-complete→RX-ISR histograms, motor DWT P99.9/max values, windowed
+0x05 sample/missed-tick counters, and timing-query request/response/timeout
+counters. Every 0x26 request also carries a per-Stream window token so a motor's
+old uptime counters cannot contaminate the current acceptance window. This is the
+canonical A9 measurement path; an external CAN analyzer is optional.
+`window_duration_us` is conservatively capped at the earliest latest-counts-page
+timestamp across all seven nodes, so an uncovered tail cannot satisfy a duration
+gate.
 
 ```c
 uint16_t format_version;

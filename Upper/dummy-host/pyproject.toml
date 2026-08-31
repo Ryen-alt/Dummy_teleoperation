@@ -24,6 +24,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 dummy-host-diagnose = "dummy_host.apps.diagnose:main"
 dummy-host-can-a9-profile = "dummy_host.apps.can_a9_profile:main"
+dummy-host-can-r5-check = "dummy_host.apps.can_r5_check:main"
 dummy-host-camera = "dummy_host.apps.camera_check:main"
 dummy-host-generate-firmware-config = "dummy_host.config_codegen:main"
 dummy-host-joint-bringup = "dummy_host.bringup:main"

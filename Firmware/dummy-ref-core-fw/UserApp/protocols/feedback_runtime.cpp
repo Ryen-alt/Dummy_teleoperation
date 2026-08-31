@@ -148,7 +148,8 @@ bool RecordMotorTimingProfile(uint8_t node_id, const uint8_t* data,
     return true;
 }
 
-bool AcceptMotorTimingProfile(uint8_t node_id, uint8_t page)
+bool AcceptMotorTimingProfile(uint8_t node_id, uint8_t page,
+                              uint32_t received_us)
 {
     if (node_id < 1U || node_id > kActuatorNodeCount ||
         page >= DUMMY_MOTOR_TIMING_PAGE_COUNT)
@@ -157,7 +158,7 @@ bool AcceptMotorTimingProfile(uint8_t node_id, uint8_t page)
     if (data[0] != DUMMY_MOTOR_TIMING_FORMAT_V1 || data[1] != page)
         return false;
     return can_timing_profiler.RecordMotorPage(
-        node_id, data.data(), static_cast<uint32_t>(data.size()));
+        node_id, data.data(), static_cast<uint32_t>(data.size()), received_us);
 }
 
 FeedbackResponseEvents ConsumeFeedbackResponseEvents()
@@ -273,9 +274,10 @@ CanDiagnosticsPayload ReadCanDiagnostics()
     return can_diagnostics_snapshot.Read();
 }
 
-void ResetCanTimingProfile(uint32_t session_epoch, uint64_t start_us)
+void ResetCanTimingProfile(uint32_t session_epoch, uint64_t start_us,
+                           const CanDispatchDiagnostics& scheduler)
 {
-    can_timing_profiler.Reset(session_epoch, start_us);
+    can_timing_profiler.Reset(session_epoch, start_us, scheduler);
 }
 
 void SetCanTimingProfileActive(bool active)

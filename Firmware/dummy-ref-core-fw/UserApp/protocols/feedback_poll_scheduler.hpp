@@ -247,6 +247,7 @@ public:
     bool active() const { return active_; }
     TargetFanoutKey key() const { return key_; }
     TargetRetryRequest retry_request() const { return retry_request_; }
+    uint32_t last_fanout_us() const { return last_fanout_us_; }
     TargetCompletionDiagnostics diagnostics() const { return diagnostics_; }
 
 private:
@@ -262,6 +263,7 @@ private:
     uint8_t retried_mask_ = 0U;
     TargetRetryRequest retry_request_{};
     bool active_ = false;
+    uint32_t last_fanout_us_ = 0U;
     TargetCompletionDiagnostics diagnostics_{};
 };
 

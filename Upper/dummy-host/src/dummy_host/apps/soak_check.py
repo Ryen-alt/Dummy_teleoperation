@@ -71,6 +71,7 @@ class SoakMetrics:
     control_rate_hz: float
     coherent_ratio: float
     maximum_feedback_skew_ms: float
+    coherent_sweep_p99_ms: float
     action_sequences: int
     incomplete_action_sequences: int
     superseded_actions: int
@@ -93,6 +94,8 @@ class SoakMetrics:
     target_retry_exhausted_count: int
     target_deadline_failure_count: int
     transition_failure_count: int
+    position_timeout_count: int
+    temperature_timeout_count: int
     position_timeout_rate: float
     diagnostic_window_valid: bool
     can_safety_preemption_count: int
@@ -461,12 +464,20 @@ def check_soak_session(
             transport_rows = connection.execute(
                 "SELECT transport_diagnostics_json FROM samples"
             ).fetchall()
+            feedback_skews_us = [
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT feedback_max_skew_us FROM samples "
+                    "WHERE coherent_sweep_id > 0 AND position_valid = 1"
+                )
+            ]
     except sqlite3.Error as exc:
         raise SoakCheckError(f"cannot read soak evidence: {exc}") from exc
 
     diagnostic_duration_s = 0.0
     target_counts = position_counts = temperature_counts = (0,) * 7
     position_request_counts = position_timeout_counts = (0,) * 7
+    temperature_timeout_counts = (0,) * 7
     can_abort_error = can_preemption = can_safety_wait_us = max_fanout_us = 0
     can_recovery = can_busoff = can_rx_overflow = can_completion_overflow = 0
     motor_tx_drop = motor_rx_error = motor_busoff = 0
@@ -539,6 +550,9 @@ def check_soak_session(
         position_counts = array_delta(11, "position_response_json")
         position_timeout_counts = array_delta(12, "position_timeout_json")
         temperature_counts = array_delta(14, "temperature_response_json")
+        temperature_timeout_counts = array_delta(
+            15, "temperature_timeout_json"
+        )
         motor_tx_drop = sum(array_delta(16, "motor_tx_drop_json"))
         motor_rx_error = sum(array_delta(17, "motor_rx_error_json"))
         motor_busoff = sum(array_delta(18, "motor_busoff_json"))
@@ -622,12 +636,20 @@ def check_soak_session(
         control_rate_hz=0.0 if duration_s <= 0 else samples / duration_s,
         coherent_ratio=0.0 if samples == 0 else coherent / samples,
         maximum_feedback_skew_ms=max_skew_us / 1000.0,
+        coherent_sweep_p99_ms=(
+            0.0
+            if not feedback_skews_us
+            else float(np.percentile(feedback_skews_us, 99)) / 1000.0
+        ),
         action_sequences=action_sequences,
         incomplete_action_sequences=incomplete_actions,
         superseded_actions=superseded_actions,
         rejected_actions=rejected_actions,
         failed_actions=failed_actions,
-        action_credit_miss_events=event_counts.get("action_credit_miss", 0),
+        action_credit_miss_events=(
+            event_counts.get("action_credit_miss", 0)
+            + event_counts.get("action_credit_deferred", 0)
+        ),
         bad_mode_rejections=bad_mode_rejections,
         target_ttl_hold_samples=ttl_holds,
         reliable_rx_overflow=reliable_rx_overflow,
@@ -644,6 +666,8 @@ def check_soak_session(
         target_retry_exhausted_count=target_retry_exhausted,
         target_deadline_failure_count=target_deadline_failure,
         transition_failure_count=transition_failure,
+        position_timeout_count=sum(position_timeout_counts),
+        temperature_timeout_count=sum(temperature_timeout_counts),
         position_timeout_rate=(
             0.0
             if sum(position_request_counts) == 0

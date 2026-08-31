@@ -246,6 +246,15 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
         case DUMMY_MOTOR_TIMING_COMMAND: // Get internal timing profile page
         {
             const uint8_t page = _len == 0U ? UINT8_MAX : _data[0];
+            if (_len >= 5U)
+            {
+                const uint32_t window_token =
+                    static_cast<uint32_t>(_data[1]) |
+                    (static_cast<uint32_t>(_data[2]) << 8U) |
+                    (static_cast<uint32_t>(_data[3]) << 16U) |
+                    (static_cast<uint32_t>(_data[4]) << 24U);
+                MotorTimingProfilerStartWindow(window_token);
+            }
             if (MotorTimingProfilerEncodePage(page, _data))
             {
                 txHeader.StdId = (boardConfig.canNodeId << 7) |

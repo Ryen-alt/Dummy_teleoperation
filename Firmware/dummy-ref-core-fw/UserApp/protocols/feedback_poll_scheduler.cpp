@@ -873,6 +873,7 @@ bool TargetCompletionTracker::Begin(const TargetFanoutKey& key,
     completed_mask_ = 0U;
     retried_mask_ = 0U;
     retry_request_ = {};
+    last_fanout_us_ = 0U;
     active_ = true;
     return true;
 }
@@ -882,6 +883,7 @@ TargetCompletionResult TargetCompletionTracker::Fail(
 {
     diagnostics_.max_fanout_us = std::max(
         diagnostics_.max_fanout_us, elapsed_us);
+    last_fanout_us_ = elapsed_us;
     if (retry_exhausted)
         diagnostics_.retry_exhausted_count = SaturatingIncrement(
             diagnostics_.retry_exhausted_count);
@@ -925,6 +927,7 @@ TargetCompletionResult TargetCompletionTracker::RecordCompletion(
 
     diagnostics_.max_fanout_us = std::max(
         diagnostics_.max_fanout_us, elapsed_us);
+    last_fanout_us_ = elapsed_us;
     retry_request_ = {};
     active_ = false;
     return TargetCompletionResult::CompleteExact;

@@ -611,6 +611,19 @@ def run_teleop_collection(
 
     def lifecycle(update: ActionLifecycleUpdate) -> None:
         recorder.record_action_lifecycle(update)
+        if (
+            update.stage is ActionStage.CAN_TX_COMPLETE_EXACT
+            and update.measurement_us > 0
+        ):
+            recorder.record_event(
+                "can_target_fanout",
+                monotonic_ns=update.host_time_ns,
+                payload={
+                    "action_sequence": update.sequence,
+                    "session_epoch": update.session_epoch,
+                    "duration_us": update.measurement_us,
+                },
+            )
         with action_stage_lock:
             action_stages.setdefault(update.sequence, set()).add(update.stage)
         if update.stage in {
@@ -1551,6 +1564,12 @@ def run_teleop_collection(
             )
 
         scheduler_stats = scheduler.run_timed(tick, stop)
+        if robot.firmware_capabilities & CAPABILITY_CAN_TIMING_PROFILE:
+            recorder.record_event(
+                "can_timing_profile",
+                monotonic_ns=clock_ns(),
+                payload=asdict(robot.read_can_timing_profile()),
+            )
         recorder.record_event(
             "collection_stopped",
             monotonic_ns=clock_ns(),

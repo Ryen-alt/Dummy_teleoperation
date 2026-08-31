@@ -70,7 +70,8 @@ uint16_t CanTimingProfiler::Load16(const uint8_t* data)
         static_cast<uint16_t>(static_cast<uint16_t>(data[1]) << 8U);
 }
 
-void CanTimingProfiler::Reset(uint32_t session_epoch, uint64_t start_us)
+void CanTimingProfiler::Reset(uint32_t session_epoch, uint64_t start_us,
+                              const CanDispatchDiagnostics& scheduler)
 {
     if (reset_count_ != std::numeric_limits<uint32_t>::max())
         ++reset_count_;
@@ -86,6 +87,8 @@ void CanTimingProfiler::Reset(uint32_t session_epoch, uint64_t start_us)
         histogram.Reset();
     motor_profiles_ = {};
     motor_page_valid_mask_.fill(0U);
+    motor_counts_received_us_.fill(0U);
+    scheduler_baseline_ = scheduler;
 }
 
 void CanTimingProfiler::RecordPositionRequest(uint8_t node_id,
@@ -155,7 +158,8 @@ void CanTimingProfiler::RecordTemperatureTimeout(uint8_t node_id)
 }
 
 bool CanTimingProfiler::RecordMotorPage(uint8_t node_id, const uint8_t* data,
-                                        uint32_t length)
+                                        uint32_t length,
+                                        uint32_t received_us)
 {
     if (!active_)
         return false;
@@ -186,8 +190,11 @@ bool CanTimingProfiler::RecordMotorPage(uint8_t node_id, const uint8_t* data,
     }
     else
     {
+        // Motor firmware scopes both counters to the window token carried in
+        // each 0x26 request. Do not subtract another main-controller baseline.
         profile.can_samples = first;
         profile.missed_ticks = second;
+        motor_counts_received_us_[index] = received_us;
     }
     motor_page_valid_mask_[page] = static_cast<uint8_t>(
         motor_page_valid_mask_[page] | (1U << index));
@@ -226,8 +233,22 @@ CanTimingProfilePayload CanTimingProfiler::MakePayload(
     output.session_epoch = session_epoch_;
     output.window_reset_count = reset_count_;
     output.window_start_us = start_us_;
-    output.window_duration_us = start_us_ == 0U || now_us < start_us_
-        ? 0U : now_us - start_us_;
+    uint64_t evidence_end_us = now_us;
+    if (MotorPagesComplete() && std::all_of(
+            motor_counts_received_us_.begin(), motor_counts_received_us_.end(),
+            [](uint32_t value) { return value != 0U; }))
+    {
+        for (const uint32_t received_low_us : motor_counts_received_us_)
+        {
+            uint64_t received_us =
+                (now_us & ~uint64_t{UINT32_MAX}) | received_low_us;
+            if (received_us > now_us)
+                received_us -= uint64_t{1} << 32U;
+            evidence_end_us = std::min(evidence_end_us, received_us);
+        }
+    }
+    output.window_duration_us = start_us_ == 0U || evidence_end_us < start_us_
+        ? 0U : evidence_end_us - start_us_;
     std::copy(motor_page_valid_mask_.begin(), motor_page_valid_mask_.end(),
               output.motor_page_valid_mask);
     if (active_)
@@ -287,9 +308,22 @@ CanTimingProfilePayload CanTimingProfiler::MakePayload(
     CopyArray(output.temperature_p99_us, temperature_p99);
     CopyArray(output.temperature_p999_us, temperature_p999);
     CopyArray(output.temperature_max_us, temperature_max);
-    CopyArray(output.timing_request, scheduler.timing_profile_requested);
-    CopyArray(output.timing_response, scheduler.timing_profile_responded);
-    CopyArray(output.timing_timeout, scheduler.timing_profile_timed_out);
+    for (size_t index = 0U; index < kActuatorNodeCount; ++index)
+    {
+        const auto delta = [](uint32_t current, uint32_t baseline)
+        {
+            return current >= baseline ? current - baseline : UINT32_MAX;
+        };
+        output.timing_request[index] = delta(
+            scheduler.timing_profile_requested[index],
+            scheduler_baseline_.timing_profile_requested[index]);
+        output.timing_response[index] = delta(
+            scheduler.timing_profile_responded[index],
+            scheduler_baseline_.timing_profile_responded[index]);
+        output.timing_timeout[index] = delta(
+            scheduler.timing_profile_timed_out[index],
+            scheduler_baseline_.timing_profile_timed_out[index]);
+    }
     return output;
 }
 

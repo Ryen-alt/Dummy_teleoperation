@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from .protocol import (
     CAN_TIMING_PROFILE_EPOCH_STABLE,
@@ -46,6 +48,14 @@ def evaluate_can_a9(profile: CanTimingProfile) -> CanA9Evaluation:
         failures.append("not all four timing pages were read from all seven motors")
     if not samples_valid:
         failures.append("latency sample minimum is not reached (position 1000, temperature 100 per node)")
+    if any(count < 1000 for count in profile.position_samples) or any(
+        count < 100 for count in profile.temperature_samples
+    ):
+        failures.append(
+            "reported latency sample counts are below the A9 per-node minimum"
+        )
+    if any(count < 100 for count in profile.motor_can_samples):
+        failures.append("motor 0x05 profiler has fewer than 100 samples on a node")
 
     required_motor_flags = 0x0F
     invalid_nodes = [
@@ -119,3 +129,67 @@ def evaluate_can_a9(profile: CanTimingProfile) -> CanA9Evaluation:
         failures=tuple(failures),
         profile=asdict(profile),
     )
+
+
+def load_can_timing_profile_events(
+    path: str | Path,
+    *,
+    minimum_monotonic_ns: int | None = None,
+    maximum_monotonic_ns: int | None = None,
+) -> CanTimingProfile:
+    """Load the latest active A9 snapshot from a session events file."""
+
+    if (
+        minimum_monotonic_ns is not None
+        and maximum_monotonic_ns is not None
+        and maximum_monotonic_ns < minimum_monotonic_ns
+    ):
+        raise ValueError("timing-profile event bounds are reversed")
+
+    latest: dict[str, object] | None = None
+    latest_active: dict[str, object] | None = None
+    for line_number, line in enumerate(
+        Path(path).read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"invalid events JSON on line {line_number}: {exc}"
+            ) from exc
+        if record.get("event") != "can_timing_profile":
+            continue
+        if minimum_monotonic_ns is not None or maximum_monotonic_ns is not None:
+            monotonic_ns = record.get("monotonic_ns")
+            if (
+                isinstance(monotonic_ns, bool)
+                or not isinstance(monotonic_ns, int)
+                or monotonic_ns < 0
+            ):
+                raise ValueError(
+                    "bounded can_timing_profile event has invalid monotonic_ns"
+                )
+            if (
+                minimum_monotonic_ns is not None
+                and monotonic_ns < minimum_monotonic_ns
+            ) or (
+                maximum_monotonic_ns is not None
+                and monotonic_ns > maximum_monotonic_ns
+            ):
+                continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("can_timing_profile event payload is not an object")
+        latest = payload
+        if int(payload.get("window_flags", 0)) & CAN_TIMING_PROFILE_WINDOW_ACTIVE:
+            latest_active = payload
+    selected = latest_active if latest_active is not None else latest
+    if selected is None:
+        raise ValueError("events file contains no can_timing_profile record")
+    converted = {
+        key: tuple(value) if isinstance(value, list) else value
+        for key, value in selected.items()
+    }
+    return CanTimingProfile(**converted)

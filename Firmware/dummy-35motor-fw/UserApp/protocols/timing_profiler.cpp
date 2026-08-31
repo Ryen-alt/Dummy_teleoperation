@@ -41,6 +41,9 @@ Histogram control_execution_histogram;
 CachedProfile cached_profiles[2];
 volatile uint8_t active_cached_profile = 0U;
 volatile uint32_t missed_control_ticks = 0U;
+volatile uint32_t active_window_token = 0U;
+volatile uint32_t window_can_sample_baseline = 0U;
+volatile uint32_t window_missed_tick_baseline = 0U;
 uint32_t previous_control_start = 0U;
 uint32_t control_tick_count = 0U;
 uint32_t last_refresh_ms = 0U;
@@ -162,6 +165,16 @@ extern "C" void MotorTimingProfilerRecordCan05(uint32_t start_cycles)
         RecordHistogram(can_service_histogram, DWT->CYCCNT - start_cycles);
 }
 
+extern "C" void MotorTimingProfilerStartWindow(uint32_t window_token)
+{
+    if (window_token == 0U || window_token == active_window_token)
+        return;
+    window_can_sample_baseline = can_service_histogram.samples;
+    window_missed_tick_baseline = missed_control_ticks;
+    __DMB();
+    active_window_token = window_token;
+}
+
 extern "C" void MotorTimingProfilerRefresh(void)
 {
     const uint32_t now_ms = HAL_GetTick();
@@ -177,7 +190,11 @@ extern "C" void MotorTimingProfilerRefresh(void)
     if (control_jitter_histogram.samples >= kMinimumControlSamples &&
         control_execution_histogram.samples >= kMinimumControlSamples)
         profile.flags |= DUMMY_MOTOR_TIMING_FLAG_CONTROL_VALID;
-    if (missed_control_ticks == 0U)
+    const uint32_t window_can_samples =
+        can_service_histogram.samples - window_can_sample_baseline;
+    const uint32_t window_missed_ticks =
+        missed_control_ticks - window_missed_tick_baseline;
+    if (window_missed_ticks == 0U)
         profile.flags |= DUMMY_MOTOR_TIMING_FLAG_NO_MISSED_TICKS;
     profile.can_p999_x10_us = CyclesToDeciMicroseconds(
         PercentileCycles(can_service_histogram, 999U, 1000U));
@@ -190,8 +207,8 @@ extern "C" void MotorTimingProfilerRefresh(void)
         PercentileCycles(control_execution_histogram, 999U, 1000U));
     profile.control_max_x10_us =
         CyclesToDeciMicroseconds(control_execution_histogram.maximum_cycles);
-    profile.can_samples = Saturate16(can_service_histogram.samples);
-    profile.missed_ticks = Saturate16(missed_control_ticks);
+    profile.can_samples = Saturate16(window_can_samples);
+    profile.missed_ticks = Saturate16(window_missed_ticks);
     __DMB();
     active_cached_profile = inactive;
 }

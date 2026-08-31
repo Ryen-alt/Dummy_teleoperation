@@ -32,7 +32,8 @@ private:
 class CanTimingProfiler
 {
 public:
-    void Reset(uint32_t session_epoch, uint64_t start_us);
+    void Reset(uint32_t session_epoch, uint64_t start_us,
+               const CanDispatchDiagnostics& scheduler = {});
     void SetActive(bool active) { active_ = active; }
     void SetEpochStable(bool stable) { epoch_stable_ = stable; }
     void RecordPositionRequest(uint8_t node_id, uint32_t now_us);
@@ -42,7 +43,7 @@ public:
     void RecordTemperatureResponse(uint8_t node_id, uint32_t received_us);
     void RecordTemperatureTimeout(uint8_t node_id);
     bool RecordMotorPage(uint8_t node_id, const uint8_t* data,
-                         uint32_t length);
+                         uint32_t length, uint32_t received_us = 0U);
     CanTimingProfilePayload MakePayload(
         uint64_t now_us, const CanDispatchDiagnostics& scheduler) const;
 
@@ -80,6 +81,8 @@ private:
     std::array<TimingHistogram, kActuatorNodeCount> temperature_histograms_{};
     std::array<MotorProfile, kActuatorNodeCount> motor_profiles_{};
     std::array<uint8_t, 4U> motor_page_valid_mask_{};
+    std::array<uint32_t, kActuatorNodeCount> motor_counts_received_us_{};
+    CanDispatchDiagnostics scheduler_baseline_{};
     uint32_t session_epoch_ = 0U;
     uint32_t reset_count_ = 0U;
     uint64_t start_us_ = 0U;

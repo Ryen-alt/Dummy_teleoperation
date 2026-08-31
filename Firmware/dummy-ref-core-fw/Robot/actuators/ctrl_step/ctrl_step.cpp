@@ -343,12 +343,16 @@ bool CtrlStepMotor::TryGetTemp(const CanTxMetadata* metadata)
 }
 
 bool CtrlStepMotor::TryGetTimingProfile(
-    uint8_t page, const CanTxMetadata* metadata)
+    uint8_t page, uint32_t window_token, const CanTxMetadata* metadata)
 {
     CAN_TxHeaderTypeDef request_header = txHeader;
     request_header.StdId = nodeID << 7 | DUMMY_MOTOR_TIMING_COMMAND;
     uint8_t request_data[8] = {};
     request_data[0] = page;
+    request_data[1] = static_cast<uint8_t>(window_token);
+    request_data[2] = static_cast<uint8_t>(window_token >> 8U);
+    request_data[3] = static_cast<uint8_t>(window_token >> 16U);
+    request_data[4] = static_cast<uint8_t>(window_token >> 24U);
     return CanTrySendMessage(
         get_can_ctx(hcan), request_data, &request_header,
         nullptr, nullptr, metadata) == CanTxStatus::Queued;

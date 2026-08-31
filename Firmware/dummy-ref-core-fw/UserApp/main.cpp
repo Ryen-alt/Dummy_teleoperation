@@ -77,6 +77,8 @@ uint32_t WindowCounterDelta(uint32_t current, uint32_t baseline,
     return current - baseline;
 }
 
+uint32_t timing_profile_window_token = 0U;
+
 uint8_t WindowMotorCounterDelta(uint8_t current, uint8_t baseline,
                                 bool& monotonic)
 {
@@ -574,8 +576,14 @@ void ThreadCanDispatch(void* argument)
                     diagnostics_window.session_epoch =
                         control_snapshot.session_epoch;
                     diagnostics_window.start_us = completed_us;
+                    timing_profile_window_token =
+                        control_snapshot.session_epoch ^
+                        diagnostics_window.reset_count * 0x9E3779B9U;
+                    if (timing_profile_window_token == 0U)
+                        timing_profile_window_token = 1U;
                     dummy::protocol::ResetCanTimingProfile(
-                        control_snapshot.session_epoch, completed_us);
+                        control_snapshot.session_epoch, completed_us,
+                        can_dispatch_scheduler.diagnostics());
                     diagnostics_window.motor_marker_mask =
                         motor_diagnostics.valid_mask;
                     diagnostics_window.scheduler =
@@ -657,7 +665,8 @@ void ThreadCanDispatch(void* argument)
                     dummy::protocol::TargetCompletionResult::CompleteExact)
                 {
                     dummy::protocol::RecordBinaryTargetCanTxCompleteExact(
-                        completion.metadata.action_sequence, completed_us);
+                        completion.metadata.action_sequence, completed_us,
+                        completion_tracker.last_fanout_us());
                     completion_target = {};
                     completion_tracker.Cancel();
                 }
@@ -731,7 +740,7 @@ void ThreadCanDispatch(void* argument)
         if (step.accepted_timing_profile_node_id != 0U)
             (void) dummy::protocol::AcceptMotorTimingProfile(
                 step.accepted_timing_profile_node_id,
-                step.accepted_timing_profile_page);
+                step.accepted_timing_profile_page, now_us);
         if (step.timed_out_final)
         {
             if (step.timed_out_action ==
@@ -873,7 +882,8 @@ void ThreadCanDispatch(void* argument)
                 break;
             case dummy::protocol::CanDispatchAction::MotorTimingRequest:
                 queued = robot.TryRequestTimingProfile(
-                    step.node_id, step.timing_profile_page, &tx_metadata);
+                    step.node_id, step.timing_profile_page,
+                    timing_profile_window_token, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::ConfigureGripperVelocity:
                 if (dummy::protocol::ReadMotorTransportDiagnostics().valid_mask !=

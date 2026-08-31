@@ -259,7 +259,8 @@ void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
     taskEXIT_CRITICAL();
 }
 
-void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us)
+void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us,
+                                          uint32_t fanout_us)
 {
     if (sequence == 0U)
         return;
@@ -279,7 +280,8 @@ void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us)
             &record - binary_progress.data());
         binary_pending_progress[index].tx_complete_us = now_us;
         QueueProgressEvent(
-            sequence, ActionProgressStage::CanTxCompleteExact, now_us, 0U);
+            sequence, ActionProgressStage::CanTxCompleteExact, now_us,
+            fanout_us);
     }
     taskEXIT_CRITICAL();
 }
