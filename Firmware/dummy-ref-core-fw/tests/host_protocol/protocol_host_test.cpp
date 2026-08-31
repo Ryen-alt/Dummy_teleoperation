@@ -1852,6 +1852,38 @@ void TestLatestTargetExecutorIsBoundedAndHolds()
     assert(!executor.Step(none, false, measured).entered_hold);
 }
 
+void TestMotionLeasePrimesCanStreamBeforeFirstTarget()
+{
+    ActuatorPublishInput input{};
+    assert(SelectActuatorPublishDecision(input) ==
+           ActuatorPublishDecision::None);
+
+    input.binary_context_active = true;
+    assert(SelectActuatorPublishDecision(input) ==
+           ActuatorPublishDecision::Hold);
+
+    input.motion_authorized = true;
+    assert(SelectActuatorPublishDecision(input) ==
+           ActuatorPublishDecision::StreamPrime);
+
+    input.command_valid = true;
+    assert(SelectActuatorPublishDecision(input) ==
+           ActuatorPublishDecision::StreamTarget);
+
+    input.hold_requested = true;
+    assert(SelectActuatorPublishDecision(input) ==
+           ActuatorPublishDecision::Hold);
+
+    input.fault_requested = true;
+    assert(SelectActuatorPublishDecision(input) ==
+           ActuatorPublishDecision::Fault);
+
+    input = {};
+    input.fault_requested = true;
+    assert(SelectActuatorPublishDecision(input) ==
+           ActuatorPublishDecision::Fault);
+}
+
 void TestExecutorRejectsInvalidRuntimeLimits()
 {
     ExecutorConfig config{};
@@ -1986,6 +2018,7 @@ int main()
     TestSequenceWrapUsesUint32SerialArithmetic();
     TestReliableControlMayOvertakeAnOlderMotionTarget();
     TestLatestTargetExecutorIsBoundedAndHolds();
+    TestMotionLeasePrimesCanStreamBeforeFirstTarget();
     TestExecutorRejectsInvalidRuntimeLimits();
     TestLatestTargetWinsBeforeApplication();
     TestLeaseTimeoutAndSessionIndependentEstop();

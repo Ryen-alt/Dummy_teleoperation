@@ -281,24 +281,42 @@ void ThreadControlLoopFixUpdate(void* argument)
                 binary_snapshot.mode == dummy::protocol::ControlMode::Fault ||
                 safety.fault_bits != 0;
             const bool hold_requested = step.entered_hold || safety_stop;
+            const auto publish_decision =
+                dummy::protocol::SelectActuatorPublishDecision({
+                    binary_context_active,
+                    binary_snapshot.lease_active && binary_motion_mode,
+                    step.command_valid,
+                    hold_requested,
+                    fault_requested,
+                });
 
-            if (fault_requested)
+            switch (publish_decision)
             {
-                PublishActuatorMode(ScheduledActuatorMode::Fault, measured_position);
-            }
-            else if (hold_requested || !step.command_valid)
-            {
+            case dummy::protocol::ActuatorPublishDecision::Fault:
+                PublishActuatorMode(
+                    ScheduledActuatorMode::Fault, measured_position);
+                break;
+            case dummy::protocol::ActuatorPublishDecision::Hold:
+            case dummy::protocol::ActuatorPublishDecision::None:
                 // The CAN task owns all binary-mode actuator writes. Keeping
                 // HOLD latched in this mailbox prevents a delayed CAN task from
                 // missing a one-control-tick transition during lease release.
-                PublishActuatorMode(ScheduledActuatorMode::Hold, measured_position);
-            }
-            else
-            {
+                PublishActuatorMode(
+                    ScheduledActuatorMode::Hold, measured_position);
+                break;
+            case dummy::protocol::ActuatorPublishDecision::StreamPrime:
+                // Start HoldTargets/Diagnostics/Enable using measured positions
+                // and sequence zero. No motion target is dispatched until the
+                // host observes the current-session diagnostics window.
+                PublishActuatorMode(
+                    ScheduledActuatorMode::Stream, measured_position);
+                break;
+            case dummy::protocol::ActuatorPublishDecision::StreamTarget:
                 // Latest-value mailbox: the 200 Hz executor may overwrite an
                 // intermediate point before a node's 50 Hz slot. No stale
                 // backlog is ever replayed onto the actuator bus.
                 PublishStreamingActuatorTarget(step.position, step.sequence);
+                break;
             }
             robot.UpdateJointPose6D();
         }

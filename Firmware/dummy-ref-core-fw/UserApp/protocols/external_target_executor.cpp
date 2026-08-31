@@ -6,6 +6,20 @@
 namespace dummy::protocol
 {
 
+ActuatorPublishDecision SelectActuatorPublishDecision(
+    const ActuatorPublishInput& input)
+{
+    if (input.fault_requested)
+        return ActuatorPublishDecision::Fault;
+    if (!input.binary_context_active)
+        return ActuatorPublishDecision::None;
+    if (input.hold_requested || !input.motion_authorized)
+        return ActuatorPublishDecision::Hold;
+    return input.command_valid
+        ? ActuatorPublishDecision::StreamTarget
+        : ActuatorPublishDecision::StreamPrime;
+}
+
 ExternalTargetExecutor::ExternalTargetExecutor(const ExecutorConfig& config)
     : config_(config)
 {

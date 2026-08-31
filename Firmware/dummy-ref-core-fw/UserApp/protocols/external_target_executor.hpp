@@ -31,6 +31,31 @@ struct ExecutorStep
     bool entered_hold = false;
 };
 
+enum class ActuatorPublishDecision : uint8_t
+{
+    None,
+    StreamPrime,
+    StreamTarget,
+    Hold,
+    Fault,
+};
+
+struct ActuatorPublishInput
+{
+    bool binary_context_active = false;
+    bool motion_authorized = false;
+    bool command_valid = false;
+    bool hold_requested = false;
+    bool fault_requested = false;
+};
+
+// Select the CAN mailbox state independently of target interpolation. A valid
+// TELEOP/POLICY lease must be able to complete the CAN Stream transition before
+// the first motion target exists; StreamPrime carries measured positions with
+// sequence zero and therefore cannot manufacture an executed action.
+ActuatorPublishDecision SelectActuatorPublishDecision(
+    const ActuatorPublishInput& input);
+
 // Pure C++ 200 Hz target interpolator. Session/TTL/lease validation remains in
 // ControlSession; this class only converts the latest validated target into a
 // velocity- and acceleration-limited position command.
