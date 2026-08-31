@@ -80,7 +80,7 @@ include_directories(
 
 add_definitions(-DUSE_HAL_DRIVER -DSTM32F4 -DSTM32F4xx -DSTM32F405xx -DconfigAPPLICATION_ALLOCATED_HEAP)
 
-file(GLOB_RECURSE SOURCES
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
         "startup/*.*"
         "Drivers/*.*"
         "Core/*.*"
