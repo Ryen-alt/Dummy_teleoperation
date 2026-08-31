@@ -1428,7 +1428,10 @@ class DummyRobot:
                 diagnostics_detail = (
                     f"session_epoch={diagnostics.session_epoch} "
                     f"window_flags=0x{diagnostics.window_flags:02x} "
-                    f"motor_marker_mask=0x{diagnostics.motor_marker_mask:02x}"
+                    f"motor_marker_mask=0x{diagnostics.motor_marker_mask:02x} "
+                    f"failure={diagnostics.last_transition_failure_name} "
+                    f"node={diagnostics.last_transition_failure_node_id} "
+                    f"detail={diagnostics.last_transition_failure_detail}"
                 )
             except BaseException as exc:
                 diagnostics_detail = f"CAN diagnostics unavailable: {exc}"

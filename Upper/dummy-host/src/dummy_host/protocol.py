@@ -32,6 +32,22 @@ CAN_DIAGNOSTICS = struct.Struct(
     + "6I" + "2I" * 4 + "4I" + "2I2I" + "I3I"
 )
 assert CAN_DIAGNOSTICS.size == CAN_DIAGNOSTICS_PAYLOAD_SIZE
+
+
+class CanTransitionFailureCode(enum.IntEnum):
+    NONE = 0
+    EPOCH_CHANGED = 1
+    AUTHORIZATION_LOST = 2
+    TRANSPORT_OVERFLOW = 3
+    SAFETY_TX_COMPLETION = 4
+    CONFIGURATION_TX_COMPLETION = 5
+    ENABLE_VALIDATION = 6
+    MOTOR_DIAGNOSTICS_TIMEOUT = 7
+    MOTOR_MARKERS_INCOMPLETE = 8
+    CONFIGURATION_QUEUE = 9
+    ENABLE_QUEUE = 10
+
+
 CAN_TIMING_PROFILE_FORMAT_VERSION = 1
 CAN_TIMING_PROFILE_PAYLOAD_SIZE = 520
 CAN_TIMING_PROFILE = struct.Struct(
@@ -188,6 +204,11 @@ class CanDiagnostics:
     main_can_rx_frame: tuple[int, ...]
     main_can_tx_busy: tuple[int, ...]
     transition_failure_count: int
+    # diagnostics-v2 reserved tail adopted without changing the fixed wire
+    # size. Zero remains compatible with firmware predating this evidence.
+    last_transition_failure_code: int = 0
+    last_transition_failure_node_id: int = 0
+    last_transition_failure_detail: int = 0
 
     def __post_init__(self) -> None:
         arrays = (
@@ -249,9 +270,30 @@ class CanDiagnostics:
             self.max_fanout_us,
             self.max_rx_dispatch_latency_us,
             self.transition_failure_count,
+            self.last_transition_failure_code,
+            self.last_transition_failure_node_id,
+            self.last_transition_failure_detail,
         )
         if any(value < 0 for value in scalars):
             raise ValueError("CAN diagnostic counters must be non-negative")
+        if any(
+            value > 0xFFFFFFFF
+            for value in (
+                self.last_transition_failure_code,
+                self.last_transition_failure_node_id,
+                self.last_transition_failure_detail,
+            )
+        ):
+            raise ValueError("CAN transition failure evidence must be uint32")
+
+    @property
+    def last_transition_failure_name(self) -> str:
+        try:
+            return CanTransitionFailureCode(
+                self.last_transition_failure_code
+            ).name
+        except ValueError:
+            return f"UNKNOWN_{self.last_transition_failure_code}"
 
     @property
     def window_valid(self) -> bool:
@@ -660,9 +702,9 @@ def pack_can_diagnostics(value: CanDiagnostics) -> bytes:
         *value.main_can_rx_frame,
         *value.main_can_tx_busy,
         value.transition_failure_count,
-        0,
-        0,
-        0,
+        value.last_transition_failure_code,
+        value.last_transition_failure_node_id,
+        value.last_transition_failure_detail,
     )
 
 
@@ -706,6 +748,9 @@ def unpack_can_diagnostics(payload: bytes) -> CanDiagnostics:
         main_can_rx_frame=tuple(values[103:105]),
         main_can_tx_busy=tuple(values[105:107]),
         transition_failure_count=values[107],
+        last_transition_failure_code=values[108],
+        last_transition_failure_node_id=values[109],
+        last_transition_failure_detail=values[110],
     )
 
 

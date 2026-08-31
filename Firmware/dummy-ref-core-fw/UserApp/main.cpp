@@ -384,6 +384,24 @@ void ThreadCanDispatch(void* argument)
     uint32_t max_safety_wait_us = 0U;
     uint32_t max_rx_dispatch_latency_us = 0U;
     uint32_t transition_failure_count = 0U;
+    uint32_t last_transition_failure_code = 0U;
+    uint32_t last_transition_failure_node_id = 0U;
+    uint32_t last_transition_failure_detail = 0U;
+    const auto record_transition_failure =
+        [&](dummy::protocol::CanTransitionFailureCode code,
+            uint32_t node_id, uint32_t detail)
+        {
+            if (transition_failure_count != UINT32_MAX)
+                ++transition_failure_count;
+            // Preserve the first cause of the current Stream attempt. Later
+            // fail-closed cleanup must not overwrite the initiating evidence.
+            if (last_transition_failure_code == 0U)
+            {
+                last_transition_failure_code = static_cast<uint32_t>(code);
+                last_transition_failure_node_id = node_id;
+                last_transition_failure_detail = detail;
+            }
+        };
     for (;;)
     {
         // TX-complete, RX-response and the 1 kHz watchdog all wake this task.
@@ -439,6 +457,9 @@ void ThreadCanDispatch(void* argument)
             dummy::protocol::CancelPendingFeedbackRequests();
             if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
             {
+                last_transition_failure_code = 0U;
+                last_transition_failure_node_id = 0U;
+                last_transition_failure_detail = 0U;
                 dummy::protocol::ResetMotorTransportDiagnostics();
                 dummy::protocol::SetCanTimingProfileActive(false);
             }
@@ -455,6 +476,9 @@ void ThreadCanDispatch(void* argument)
         {
             diagnostics_window.epoch_stable = false;
             dummy::protocol::SetCanTimingProfileEpochStable(false);
+            record_transition_failure(
+                dummy::protocol::CanTransitionFailureCode::EpochChanged,
+                0U, control_snapshot.session_epoch);
             stream_fail_closed = true;
             dummy::protocol::RequestBinaryRuntimeHold();
         }
@@ -469,6 +493,19 @@ void ThreadCanDispatch(void* argument)
               control_snapshot.session_epoch !=
                   completion_tracker.key().session_epoch)))
         {
+            uint32_t authorization_detail = 0U;
+            if (!control_snapshot.lease_active)
+                authorization_detail |= 1U << 0U;
+            if (control_snapshot.mode != dummy::protocol::ControlMode::Teleop &&
+                control_snapshot.mode != dummy::protocol::ControlMode::Policy)
+                authorization_detail |= 1U << 1U;
+            if (completion_tracker.active() &&
+                control_snapshot.session_epoch !=
+                    completion_tracker.key().session_epoch)
+                authorization_detail |= 1U << 2U;
+            record_transition_failure(
+                dummy::protocol::CanTransitionFailureCode::AuthorizationLost,
+                0U, authorization_detail);
             const uint32_t preempted_sequence = completion_tracker.active()
                 ? completion_tracker.key().action_sequence
                 : target_fanout.sequence;
@@ -488,6 +525,7 @@ void ThreadCanDispatch(void* argument)
         }
 
         bool transport_overflow = false;
+        uint32_t transport_overflow_detail = 0U;
         for (size_t index = 0U; index < can_contexts.size(); ++index)
         {
             CAN_context* context = can_contexts[index];
@@ -499,6 +537,7 @@ void ThreadCanDispatch(void* argument)
                 observed_completion_overflow_count[index] =
                     context->tx_completion_overflow_count;
                 transport_overflow = true;
+                transport_overflow_detail |= 1U << index;
             }
             if (context->rx_overflow_count !=
                 observed_rx_overflow_count[index])
@@ -506,10 +545,14 @@ void ThreadCanDispatch(void* argument)
                 observed_rx_overflow_count[index] =
                     context->rx_overflow_count;
                 transport_overflow = true;
+                transport_overflow_detail |= 1U << (8U + index);
             }
         }
         if (transport_overflow)
         {
+            record_transition_failure(
+                dummy::protocol::CanTransitionFailureCode::TransportOverflow,
+                0U, transport_overflow_detail);
             const uint32_t failed_sequence = completion_tracker.active()
                 ? completion_tracker.key().action_sequence
                 : target_fanout.sequence;
@@ -547,8 +590,11 @@ void ThreadCanDispatch(void* argument)
                     completion.status != CanTxCompletionStatus::Complete &&
                     dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
                 {
-                    if (transition_failure_count != UINT32_MAX)
-                        ++transition_failure_count;
+                    record_transition_failure(
+                        dummy::protocol::CanTransitionFailureCode::
+                            SafetyTxCompletion,
+                        completion.metadata.node_id,
+                        static_cast<uint32_t>(completion.status));
                     stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
                     continue;
@@ -557,8 +603,11 @@ void ThreadCanDispatch(void* argument)
                         CanTxChannel::Configuration &&
                     completion.status != CanTxCompletionStatus::Complete)
                 {
-                    if (transition_failure_count != UINT32_MAX)
-                        ++transition_failure_count;
+                    record_transition_failure(
+                        dummy::protocol::CanTransitionFailureCode::
+                            ConfigurationTxCompletion,
+                        completion.metadata.node_id,
+                        static_cast<uint32_t>(completion.status));
                     stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
                     continue;
@@ -579,8 +628,28 @@ void ThreadCanDispatch(void* argument)
                             control_snapshot.session_epoch ||
                         motor_diagnostics.valid_mask != kAllMotorMarkers)
                     {
-                        if (transition_failure_count != UINT32_MAX)
-                            ++transition_failure_count;
+                        uint32_t enable_detail = 0U;
+                        if (completion.status !=
+                            CanTxCompletionStatus::Complete)
+                            enable_detail |= 1U << 0U;
+                        if (dispatch_mode !=
+                            dummy::protocol::CanDispatchMode::Stream)
+                            enable_detail |= 1U << 1U;
+                        if (!binary_stream_authorized)
+                            enable_detail |= 1U << 2U;
+                        if (stream_fail_closed)
+                            enable_detail |= 1U << 3U;
+                        if (control_snapshot.session_epoch == 0U)
+                            enable_detail |= 1U << 4U;
+                        if (completion.metadata.session_epoch !=
+                            control_snapshot.session_epoch)
+                            enable_detail |= 1U << 5U;
+                        if (motor_diagnostics.valid_mask != kAllMotorMarkers)
+                            enable_detail |= 1U << 6U;
+                        record_transition_failure(
+                            dummy::protocol::CanTransitionFailureCode::
+                                EnableValidation,
+                            0U, enable_detail);
                         stream_fail_closed = true;
                         dummy::protocol::RequestBinaryRuntimeHold();
                         continue;
@@ -778,8 +847,11 @@ void ThreadCanDispatch(void* argument)
             if (step.timed_out_action ==
                 dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
             {
-                if (transition_failure_count != UINT32_MAX)
-                    ++transition_failure_count;
+                record_transition_failure(
+                    dummy::protocol::CanTransitionFailureCode::
+                        MotorDiagnosticsTimeout,
+                    step.timed_out_node_id,
+                    dummy::generated_config::kCanResponseTimeoutUs);
                 stream_fail_closed = true;
                 dummy::protocol::RequestBinaryRuntimeHold();
             }
@@ -908,8 +980,11 @@ void ThreadCanDispatch(void* argument)
                     static_cast<uint8_t>(
                         (1U << dummy::protocol::kActuatorNodeCount) - 1U))
                 {
-                    if (transition_failure_count != UINT32_MAX)
-                        ++transition_failure_count;
+                    record_transition_failure(
+                        dummy::protocol::CanTransitionFailureCode::
+                            MotorMarkersIncomplete,
+                        dummy::protocol::kActuatorNodeCount,
+                        dummy::protocol::ReadMotorTransportDiagnostics().valid_mask);
                     stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
                 }
@@ -1009,8 +1084,13 @@ void ThreadCanDispatch(void* argument)
                     step.action ==
                         dummy::protocol::CanDispatchAction::EnableBroadcast)
                 {
-                    if (transition_failure_count != UINT32_MAX)
-                        ++transition_failure_count;
+                    const auto code = step.action ==
+                            dummy::protocol::CanDispatchAction::
+                                ConfigureGripperVelocity
+                        ? dummy::protocol::CanTransitionFailureCode::
+                            ConfigurationQueue
+                        : dummy::protocol::CanTransitionFailureCode::EnableQueue;
+                    record_transition_failure(code, step.node_id, 0U);
                     stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
                 }
@@ -1065,6 +1145,13 @@ void ThreadCanDispatch(void* argument)
         can_diagnostics.payload_size =
             dummy::protocol::kCanDiagnosticsPayloadSize;
         can_diagnostics.session_epoch = diagnostics_window.session_epoch;
+        can_diagnostics.transition_failure_count = transition_failure_count;
+        can_diagnostics.last_transition_failure_code =
+            last_transition_failure_code;
+        can_diagnostics.last_transition_failure_node_id =
+            last_transition_failure_node_id;
+        can_diagnostics.last_transition_failure_detail =
+            last_transition_failure_detail;
         can_diagnostics.window_reset_count = diagnostics_window.reset_count;
         can_diagnostics.window_start_us = diagnostics_window.start_us;
         if (diagnostics_window.start_us != 0U)

@@ -8,6 +8,7 @@ import pytest
 
 from dummy_host.protocol import (
     CanDiagnostics,
+    CanTransitionFailureCode,
     CAN_DIAGNOSTICS_FORMAT_VERSION,
     CAN_DIAGNOSTICS_PAYLOAD_SIZE,
     CAN_DIAGNOSTICS_WINDOW_VALID,
@@ -135,6 +136,9 @@ def test_can_diagnostics_payload_round_trip() -> None:
         main_can_rx_frame=(72, 73),
         main_can_tx_busy=(74, 75),
         transition_failure_count=76,
+        last_transition_failure_code=CanTransitionFailureCode.MOTOR_DIAGNOSTICS_TIMEOUT,
+        last_transition_failure_node_id=4,
+        last_transition_failure_detail=0xA5,
     )
     payload = pack_can_diagnostics(diagnostics)
     assert len(payload) == 380

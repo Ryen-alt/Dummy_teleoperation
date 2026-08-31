@@ -220,6 +220,24 @@ struct ActionProgressRecord
     uint32_t feedback_sweep_id;
 };
 
+// Stable codes stored in the diagnostics-v2 reserved tail. This preserves the
+// 380-byte payload and protocol-v5 compatibility while making a failed
+// pre-window Stream transition diagnosable after the firmware returns HOLD.
+enum class CanTransitionFailureCode : uint32_t
+{
+    None = 0U,
+    EpochChanged = 1U,
+    AuthorizationLost = 2U,
+    TransportOverflow = 3U,
+    SafetyTxCompletion = 4U,
+    ConfigurationTxCompletion = 5U,
+    EnableValidation = 6U,
+    MotorDiagnosticsTimeout = 7U,
+    MotorMarkersIncomplete = 8U,
+    ConfigurationQueue = 9U,
+    EnableQueue = 10U,
+};
+
 struct CanDiagnosticsPayload
 {
     uint16_t format_version;
@@ -262,7 +280,9 @@ struct CanDiagnosticsPayload
     uint32_t main_can_rx_frame[2];
     uint32_t main_can_tx_busy[2];
     uint32_t transition_failure_count;
-    uint32_t reserved1[3];
+    uint32_t last_transition_failure_code;
+    uint32_t last_transition_failure_node_id;
+    uint32_t last_transition_failure_detail;
 };
 
 // Independent A9 timing evidence. Keeping this separate from the fixed

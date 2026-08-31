@@ -79,6 +79,22 @@ void TestPublishedDoubleBufferReturnsWholeSnapshots()
     assert(second_read.values == second.values);
 }
 
+void TestCanTransitionFailureUsesDiagnosticsReservedTail()
+{
+    assert(static_cast<uint32_t>(
+        CanTransitionFailureCode::MotorDiagnosticsTimeout) == 7U);
+    assert(static_cast<uint32_t>(CanTransitionFailureCode::EnableQueue) == 10U);
+    CanDiagnosticsPayload diagnostics{};
+    diagnostics.last_transition_failure_code = static_cast<uint32_t>(
+        CanTransitionFailureCode::MotorDiagnosticsTimeout);
+    diagnostics.last_transition_failure_node_id = 4U;
+    diagnostics.last_transition_failure_detail = 4000U;
+    assert(diagnostics.last_transition_failure_code == 7U);
+    assert(diagnostics.last_transition_failure_node_id == 4U);
+    assert(diagnostics.last_transition_failure_detail == 4000U);
+    assert(sizeof(diagnostics) == kCanDiagnosticsPayloadSize);
+}
+
 std::vector<uint8_t> FromHex(const std::string& hex)
 {
     assert(hex.size() % 2 == 0);
@@ -1977,6 +1993,7 @@ int main()
 {
     TestSpscRingUsesAllSlotsAndWrapsWithoutOverwrite();
     TestPublishedDoubleBufferReturnsWholeSnapshots();
+    TestCanTransitionFailureUsesDiagnosticsReservedTail();
     TestCodecVectors();
     TestMonotonicMicrosIgnoresSmallRegressionAndExtendsWrap();
     TestMeasuredVelocityUsesOnlyValidMonotonicIntervals();

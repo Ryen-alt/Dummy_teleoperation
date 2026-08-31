@@ -187,8 +187,21 @@ uint32_t max_fanout_us;
 uint32_t max_rx_dispatch_latency_us;
 uint32_t main_can_rx_frame[2], main_can_tx_busy[2];
 uint32_t transition_failure_count;
-uint32_t reserved1[3];
+uint32_t last_transition_failure_code;
+uint32_t last_transition_failure_node_id;
+uint32_t last_transition_failure_detail;
 ```
+
+The final three words were reserved in the original diagnostics-v2 layout and
+are now used without changing the 380-byte payload or protocol version. They
+latch the first failure from the most recent Stream transition attempt and
+remain readable after fail-closed HOLD. Codes are: `0=NONE`, `1=EPOCH_CHANGED`,
+`2=AUTHORIZATION_LOST`, `3=TRANSPORT_OVERFLOW`, `4=SAFETY_TX_COMPLETION`,
+`5=CONFIGURATION_TX_COMPLETION`, `6=ENABLE_VALIDATION`,
+`7=MOTOR_DIAGNOSTICS_TIMEOUT`, `8=MOTOR_MARKERS_INCOMPLETE`,
+`9=CONFIGURATION_QUEUE`, and `10=ENABLE_QUEUE`. The node is zero for a
+non-node-specific failure. Detail is code-specific (for code 7 it is the
+response timeout in microseconds).
 
 The window opens only after the Stream enable frame completes successfully.
 Motor counters are reported relative to the seven-node preflight baseline.

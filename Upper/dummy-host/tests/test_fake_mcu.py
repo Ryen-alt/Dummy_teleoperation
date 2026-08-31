@@ -238,10 +238,26 @@ def test_runtime_hold_during_set_mode_fails_early_with_can_markers(config) -> No
     robot = DummyRobot(config, transport, response_timeout_s=0.5)
 
     with robot:
+        original_read = robot.read_can_diagnostics
+
+        def failed_transition():
+            return replace(
+                original_read(),
+                transition_failure_count=1,
+                last_transition_failure_code=7,
+                last_transition_failure_node_id=4,
+                last_transition_failure_detail=4000,
+            )
+
+        robot.read_can_diagnostics = failed_transition  # type: ignore[method-assign]
         started = time.monotonic()
         with pytest.raises(
             RobotError,
-            match=r"CAN stream transition failed before TELEOP.*motor_marker_mask=0x7f",
+            match=(
+                r"CAN stream transition failed before TELEOP.*"
+                r"motor_marker_mask=0x7f.*"
+                r"failure=MOTOR_DIAGNOSTICS_TIMEOUT node=4 detail=4000"
+            ),
         ):
             robot.acquire_control(ControlMode.TELEOP)
         assert time.monotonic() - started < 0.3
