@@ -196,7 +196,45 @@ dummy-host-session-qa --session /path/to/session_dir \
   --html-output /tmp/session_qa.html
 ```
 
-v2.2.1 的 10 分钟基础验收和 60 分钟 soak 使用同一个严格检查器；短测显式覆盖默认
+v2.2.2 不要求外置 CAN 分析仪。主控以 CAN 请求帧实际 TX-complete 到 RX ISR 的时间戳
+统计响应直方图，42/35 电机通过 DWT 和 `0x26` 四页报告 0x05 ISR、20 kHz jitter/
+执行时间和窗口内 missed tick。遥操作 session 每 5 秒记录 `can_timing_profile`，并在
+collection 停止前记录最终 snapshot。先读取内部 A9 证据：
+
+```bash
+dummy-host-can-a9-profile \
+  --events /path/to/session_dir/events.jsonl \
+  | tee /tmp/a9_profile.json
+```
+
+A9 CLI 只负责验证 520-byte profile、四页完整性、样本量、P50/P99/P99.9/max 和固定
+裕量公式。R5 使用完整 session 执行正式 10 分钟参数/频率门禁：
+
+```bash
+dummy-host-can-r5-check \
+  --session /path/to/session_dir \
+  --config configs/robot_config.yaml \
+  --json-output /tmp/r5_can_decision.json
+```
+
+R5 只统计 `collection_started` 到 `collection_stopped` 之间、与 manifest epoch 匹配的
+证据，并要求 profile 有效时长至少 600 秒、每个完整动作恰有一个固件实测 fanout 事件、
+coherent sweep P99 `<50 ms`、exact target fanout P99 `<15 ms`，以及 timeout、bus-off、
+drop/error、missed tick、deadline failure、action-credit miss/defer 全为零。结果含义：
+
+- `PASS`：当前配置与测量公式完全一致，可以冻结 R5；
+- `RECONFIGURE`：把 quiet/timeout 改为建议值，重新 codegen、构建、刷写并采全新 10 分钟；
+- `RETEST_B`：40 Hz 单事务预算不足，按建议降到 30/25 Hz，控制循环仍保持 20 Hz，
+  不增加重试，再采全新 10 分钟；
+- `REVIEW_C`：只有单 outstanding 无法满足明确的更高反馈率需求时，进入有限并发专项
+  评审；不允许无限 outstanding；
+- `FAIL`：证据或严格运行门失败，禁止用放宽阈值绕过。
+
+canonical 配置中的 5000/4000 µs 是首次测量用的离线安全占位值，因此第一份有效
+session 正常情况下会返回 `RECONFIGURE` 或 `RETEST_B`，而不是直接 `PASS`。应用建议值
+会改变 config hash，必须重新生成固件配置并重刷；旧 session 不能用于证明新 hash。
+
+10 分钟基础 soak 和 60 分钟 soak 继续使用同一个通用严格检查器；短测显式覆盖默认
 3600 秒时长，其余阈值完全相同：
 
 ```bash
