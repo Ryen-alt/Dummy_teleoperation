@@ -143,6 +143,7 @@ class DummyRobot:
         self._sequence_lock = threading.Lock()
         self._state: RobotState | None = None
         self._state_condition = threading.Condition()
+        self._can_diagnostics_request_lock = threading.Lock()
         self._pending: dict[int, queue.Queue[Packet]] = {}
         self._ack_deadlines: dict[int, int] = {}
         self._completion_deadlines: dict[int, int] = {}
@@ -633,16 +634,22 @@ class DummyRobot:
         return TimeSyncExchange(host_t0_ns, mcu_rx_us, mcu_tx_us, host_t3_ns)
 
     def read_can_diagnostics(self) -> CanDiagnostics:
-        self._require_connected()
-        required = CAPABILITY_CAN_DIAGNOSTICS | CAPABILITY_CAN_DIAGNOSTICS_V2
-        if self.firmware_capabilities & required != required:
-            raise RobotError("firmware does not advertise CAN diagnostics v2")
-        response = self._request(MessageType.GET_CAN_DIAGNOSTICS)
-        if response.message_type != MessageType.CAN_DIAGNOSTICS:
-            raise RobotError(
-                f"expected CAN_DIAGNOSTICS, received {response.message_type.name}"
-            )
-        return unpack_can_diagnostics(response.payload)
+        # SerialTransport deliberately stores large diagnostics in a bounded
+        # latest-value mailbox. Two callers issuing the same RPC concurrently
+        # could therefore overwrite one sequence-specific response and leave
+        # its waiter to time out. Keep the public RPC single-flight while still
+        # allowing TIME_SYNC, heartbeats and safety traffic to run normally.
+        with self._can_diagnostics_request_lock:
+            self._require_connected()
+            required = CAPABILITY_CAN_DIAGNOSTICS | CAPABILITY_CAN_DIAGNOSTICS_V2
+            if self.firmware_capabilities & required != required:
+                raise RobotError("firmware does not advertise CAN diagnostics v2")
+            response = self._request(MessageType.GET_CAN_DIAGNOSTICS)
+            if response.message_type != MessageType.CAN_DIAGNOSTICS:
+                raise RobotError(
+                    f"expected CAN_DIAGNOSTICS, received {response.message_type.name}"
+                )
+            return unpack_can_diagnostics(response.payload)
 
     def read_can_timing_profile(self) -> CanTimingProfile:
         self._require_connected()

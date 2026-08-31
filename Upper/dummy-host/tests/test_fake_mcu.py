@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from threading import Event, Lock, Thread
 
 import numpy as np
 import pytest
@@ -230,6 +231,58 @@ def test_protocol_v5_time_sync_and_can_diagnostics(config) -> None:
         diagnostics = robot.read_can_diagnostics()
         assert len(diagnostics.target_tx_complete) == 7
         assert diagnostics.window_duration_us >= 0
+
+
+def test_can_diagnostics_requests_are_single_flight(config) -> None:
+    robot = DummyRobot(config, FakeMcuTransport(config))
+
+    with robot:
+        original_request = robot._request
+        first_entered = Event()
+        release_first = Event()
+        metric_lock = Lock()
+        active = 0
+        max_active = 0
+        errors: list[BaseException] = []
+
+        def monitored_request(message_type, payload=b""):
+            nonlocal active, max_active
+            if message_type is not MessageType.GET_CAN_DIAGNOSTICS:
+                return original_request(message_type, payload)
+            with metric_lock:
+                active += 1
+                max_active = max(max_active, active)
+                is_first = active == 1
+            if is_first:
+                first_entered.set()
+                release_first.wait(0.1)
+            else:
+                release_first.set()
+            try:
+                return original_request(message_type, payload)
+            finally:
+                with metric_lock:
+                    active -= 1
+
+        robot._request = monitored_request  # type: ignore[method-assign]
+
+        def read_diagnostics() -> None:
+            try:
+                robot.read_can_diagnostics()
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = Thread(target=read_diagnostics)
+        second = Thread(target=read_diagnostics)
+        first.start()
+        assert first_entered.wait(0.5)
+        second.start()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert errors == []
+        assert max_active == 1
 
 
 def test_target_keepalive_is_exact_and_heartbeat_does_not_refresh_target(config) -> None:
