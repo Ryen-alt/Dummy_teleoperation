@@ -18,6 +18,7 @@ from .domain import (
     ActionProposal,
     ActionSpace,
     ActionStage,
+    HoldReasonBits,
     RobotHealth,
 )
 from .protocol import (
@@ -309,11 +310,15 @@ class DummyRobot:
         # releases the lease instead of waiting for its watchdog to expire.
         self._control_acquired = True
         try:
+            mode_request_started_ns = self.clock_ns()
             self._expect_ack(
                 self._request(MessageType.SET_MODE, SET_MODE.pack(int(target_mode))),
                 MessageType.SET_MODE,
             )
-            self._wait_for_mode(target_mode)
+            self._wait_for_mode(
+                target_mode,
+                failure_not_before_ns=mode_request_started_ns,
+            )
             self._wait_for_can_stream_ready(target_mode)
         except BaseException:
             self._abort_control_acquisition()
@@ -1380,14 +1385,60 @@ class DummyRobot:
         if ack.request_type != expected or ack.result != ResultCode.OK:
             raise CommandRejected(f"unexpected ACK: {ack}")
 
-    def _wait_for_mode(self, expected: ControlMode) -> None:
+    def _wait_for_mode(
+        self,
+        expected: ControlMode,
+        *,
+        failure_not_before_ns: int | None = None,
+    ) -> None:
         deadline = time.monotonic() + self.response_timeout_s
+        failed_state: RobotState | None = None
         with self._state_condition:
             while self._state is None or self._state.mode != expected:
+                self._raise_reader_error()
+                state = self._state
+                is_new_failure_state = (
+                    state is not None
+                    and failure_not_before_ns is not None
+                    and state.monotonic_ns >= failure_not_before_ns
+                )
+                if (
+                    expected in (ControlMode.TELEOP, ControlMode.POLICY)
+                    and is_new_failure_state
+                    and (
+                        state.mode == ControlMode.FAULT
+                        or (
+                            state.mode == ControlMode.HOLD
+                            and state.hold_reason_bits
+                            & int(HoldReasonBits.RUNTIME_LIMIT)
+                        )
+                    )
+                ):
+                    failed_state = state
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RobotError(f"timeout waiting for STATE mode {expected.name}")
                 self._state_condition.wait(remaining)
+
+        if failed_state is not None:
+            diagnostics_detail = "CAN diagnostics unavailable"
+            try:
+                diagnostics = self.read_can_diagnostics()
+                diagnostics_detail = (
+                    f"session_epoch={diagnostics.session_epoch} "
+                    f"window_flags=0x{diagnostics.window_flags:02x} "
+                    f"motor_marker_mask=0x{diagnostics.motor_marker_mask:02x}"
+                )
+            except BaseException as exc:
+                diagnostics_detail = f"CAN diagnostics unavailable: {exc}"
+            raise RobotError(
+                f"CAN stream transition failed before {expected.name}: "
+                f"firmware entered {failed_state.mode.name} "
+                f"(hold_reason_bits=0x{failed_state.hold_reason_bits:04x}, "
+                f"fault_bits=0x{failed_state.fault_bits:04x}); "
+                f"{diagnostics_detail}"
+            )
 
     def _wait_for_can_stream_ready(self, expected_mode: ControlMode) -> None:
         """Wait until the firmware's current-session CAN stream is measurable.

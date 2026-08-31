@@ -44,6 +44,18 @@ class HelloAckWithoutStateTransport(FakeMcuTransport):
             self._next_state_ns = None
 
 
+class RuntimeHoldOnSetModeTransport(FakeMcuTransport):
+    def send(self, packet: Packet) -> None:
+        if packet.message_type is MessageType.SET_MODE:
+            self._mode = ControlMode.HOLD
+            self._hold_reason_bits |= int(HoldReasonBits.RUNTIME_LIMIT)
+            self._extend_lease()
+            self._ack(packet)
+            self._emit_state(packet.sequence)
+            return
+        super().send(packet)
+
+
 class ContinuousStateWithoutTargetAckTransport(FakeMcuTransport):
     def _ack(self, request: Packet) -> None:
         if request.message_type != MessageType.SET_JOINT_TARGET:
@@ -217,6 +229,22 @@ def test_failed_can_stream_transition_holds_and_releases_lease(config) -> None:
         robot.read_can_diagnostics = failed_window  # type: ignore[method-assign]
         with pytest.raises(RobotError, match="CAN stream transition"):
             robot.acquire_control(ControlMode.TELEOP)
+        assert robot.read_state().mode == ControlMode.HOLD
+        assert not transport._lease
+
+
+def test_runtime_hold_during_set_mode_fails_early_with_can_markers(config) -> None:
+    transport = RuntimeHoldOnSetModeTransport(config)
+    robot = DummyRobot(config, transport, response_timeout_s=0.5)
+
+    with robot:
+        started = time.monotonic()
+        with pytest.raises(
+            RobotError,
+            match=r"CAN stream transition failed before TELEOP.*motor_marker_mask=0x7f",
+        ):
+            robot.acquire_control(ControlMode.TELEOP)
+        assert time.monotonic() - started < 0.3
         assert robot.read_state().mode == ControlMode.HOLD
         assert not transport._lease
 
