@@ -11,6 +11,7 @@ from dummy_host.protocol import (
     ACTION_PROGRESS,
     CAPABILITY_CAN_DIAGNOSTICS_V2,
     CAPABILITY_CAN_TIMING_PROFILE,
+    CAN_DIAGNOSTICS_WINDOW_VALID,
     ActionProgressStage,
     MessageType,
     Packet,
@@ -157,6 +158,63 @@ def test_control_acquire_rejects_feedback_outside_hard_limits(config) -> None:
 
     with robot:
         with pytest.raises(RobotError, match=r"joint2=.*outside"):
+            robot.acquire_control(ControlMode.TELEOP)
+        assert robot.read_state().mode == ControlMode.HOLD
+        assert not transport._lease
+
+
+def test_control_acquire_waits_for_current_can_stream_window(config) -> None:
+    transport = FakeMcuTransport(config)
+    robot = DummyRobot(config, transport)
+
+    with robot:
+        original_read = robot.read_can_diagnostics
+        reads = 0
+
+        def delayed_window():
+            nonlocal reads
+            reads += 1
+            current = original_read()
+            if reads < 3:
+                return replace(
+                    current,
+                    session_epoch=0,
+                    motor_marker_mask=0,
+                    window_flags=0,
+                )
+            return replace(
+                current,
+                session_epoch=robot.session_id,
+                motor_marker_mask=0x7F,
+                window_flags=CAN_DIAGNOSTICS_WINDOW_VALID,
+            )
+
+        robot.read_can_diagnostics = delayed_window  # type: ignore[method-assign]
+        robot.acquire_control(ControlMode.TELEOP)
+        assert reads >= 3
+
+
+def test_failed_can_stream_transition_holds_and_releases_lease(config) -> None:
+    transport = FakeMcuTransport(config)
+    robot = DummyRobot(config, transport, connect_timeout_s=0.2)
+
+    with robot:
+        original_read = robot.read_can_diagnostics
+
+        def failed_window():
+            current = original_read()
+            transport._mode = ControlMode.HOLD
+            transport._hold_reason_bits |= int(HoldReasonBits.RUNTIME_LIMIT)
+            transport._emit_state(0)
+            return replace(
+                current,
+                session_epoch=0,
+                motor_marker_mask=0,
+                window_flags=0,
+            )
+
+        robot.read_can_diagnostics = failed_window  # type: ignore[method-assign]
+        with pytest.raises(RobotError, match="CAN stream transition"):
             robot.acquire_control(ControlMode.TELEOP)
         assert robot.read_state().mode == ControlMode.HOLD
         assert not transport._lease

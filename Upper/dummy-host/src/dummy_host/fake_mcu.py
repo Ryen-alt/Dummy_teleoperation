@@ -120,6 +120,7 @@ class FakeMcuTransport:
         self._lease_deadline_ns: int | None = None
         self._target_deadline_ns: int | None = None
         self._target_last_refresh_ns: int | None = None
+        self._stream_transition_feedback_pending = False
         self._state_period_ns = max(1, int(1e9 / config.control_rate_hz))
         self._next_state_ns: int | None = None
 
@@ -199,6 +200,7 @@ class FakeMcuTransport:
             self._has_received_target = False
             self._last_control_tick_id = 0
             self._progress.clear()
+            self._stream_transition_feedback_pending = False
             self._next_state_ns = self.clock_ns() + self._state_period_ns
             self._rx.put(
                 self._response(
@@ -237,7 +239,7 @@ class FakeMcuTransport:
                         CanDiagnostics(
                             format_version=CAN_DIAGNOSTICS_FORMAT_VERSION,
                             payload_size=CAN_DIAGNOSTICS_PAYLOAD_SIZE,
-                            session_epoch=1,
+                            session_epoch=self._session,
                             motor_marker_mask=0x7F,
                             window_flags=(
                                 CAN_DIAGNOSTICS_WINDOW_ACTIVE
@@ -282,6 +284,9 @@ class FakeMcuTransport:
                     ),
                 )
             )
+            if self._stream_transition_feedback_pending:
+                self._stream_transition_feedback_pending = False
+                self._emit_state(packet.sequence)
             return
         if packet.message_type == MessageType.GET_CAN_TIMING_PROFILE:
             now_us = self.clock_ns() // 1_000
@@ -293,7 +298,7 @@ class FakeMcuTransport:
                         CanTimingProfile(
                             format_version=CAN_TIMING_PROFILE_FORMAT_VERSION,
                             payload_size=CAN_TIMING_PROFILE_PAYLOAD_SIZE,
-                            session_epoch=1,
+                            session_epoch=self._session,
                             window_reset_count=1,
                             window_start_us=max(0, now_us - 10_000_000),
                             window_duration_us=min(now_us, 10_000_000),
@@ -358,6 +363,7 @@ class FakeMcuTransport:
             self._hold_reason_bits = 0
             self._target_deadline_ns = None
             self._target_last_refresh_ns = None
+            self._stream_transition_feedback_pending = False
             self._extend_lease()
             self._ack(packet)
             self._emit_state(packet.sequence)
@@ -385,6 +391,10 @@ class FakeMcuTransport:
             )
             self._target_deadline_ns = None
             self._target_last_refresh_ns = None
+            self._stream_transition_feedback_pending = requested_mode in (
+                ControlMode.TELEOP,
+                ControlMode.POLICY,
+            )
             self._extend_lease()
             self._ack(packet)
             self._emit_state(packet.sequence)

@@ -302,12 +302,21 @@ class DummyRobot:
             self._request(MessageType.ACQUIRE_CONTROL, ACQUIRE_CONTROL.pack(self.config.lease_timeout_ms)),
             MessageType.ACQUIRE_CONTROL,
         )
-        self._expect_ack(
-            self._request(MessageType.SET_MODE, SET_MODE.pack(int(target_mode))),
-            MessageType.SET_MODE,
-        )
-        self._wait_for_mode(target_mode)
+        # The lease exists as soon as ACQUIRE_CONTROL is acknowledged. Mark it
+        # locally before SET_MODE so the transition wait can refresh the lease,
+        # and so every failure path actively returns the firmware to HOLD and
+        # releases the lease instead of waiting for its watchdog to expire.
         self._control_acquired = True
+        try:
+            self._expect_ack(
+                self._request(MessageType.SET_MODE, SET_MODE.pack(int(target_mode))),
+                MessageType.SET_MODE,
+            )
+            self._wait_for_mode(target_mode)
+            self._wait_for_can_stream_ready(target_mode)
+        except BaseException:
+            self._abort_control_acquisition()
+            raise
         self._active_action_sequence = None
         self._clear_action_credit()
         self.action_gateway.reset()
@@ -1372,6 +1381,125 @@ class DummyRobot:
                 if remaining <= 0:
                     raise RobotError(f"timeout waiting for STATE mode {expected.name}")
                 self._state_condition.wait(remaining)
+
+    def _wait_for_can_stream_ready(self, expected_mode: ControlMode) -> None:
+        """Wait until the firmware's current-session CAN stream is measurable.
+
+        SET_MODE is acknowledged before the CAN dispatch task has finished its
+        HoldTargets/Diagnostics/Enable transition. Sending the first target as
+        soon as STATE reports TELEOP can therefore race that transition. The
+        diagnostics validity contract is the authoritative readiness barrier.
+        """
+
+        deadline = time.monotonic() + self.connect_timeout_s
+        heartbeat_interval_s = max(0.01, self.config.lease_timeout_ms / 3_000.0)
+        next_heartbeat = time.monotonic() + heartbeat_interval_s
+        last_diagnostics: CanDiagnostics | None = None
+
+        while True:
+            state = self.read_state()
+            if state.mode != expected_mode:
+                raise RobotError(
+                    "CAN stream transition failed: firmware left "
+                    f"{expected_mode.name} for {state.mode.name} "
+                    f"(hold_reason_bits=0x{state.hold_reason_bits:04x}, "
+                    f"fault_bits=0x{state.fault_bits:04x})"
+                )
+
+            now = time.monotonic()
+            if now >= next_heartbeat:
+                self.heartbeat()
+                next_heartbeat = time.monotonic() + heartbeat_interval_s
+
+            last_diagnostics = self.read_can_diagnostics()
+            if (
+                last_diagnostics.session_epoch == self.session_id
+                and last_diagnostics.window_valid
+                and last_diagnostics.motor_marker_mask == 0x7F
+            ):
+                self._wait_for_post_transition_feedback(
+                    expected_mode,
+                    previous_sweep_id=state.coherent_sweep_id,
+                    deadline=deadline,
+                    heartbeat_interval_s=heartbeat_interval_s,
+                    next_heartbeat=next_heartbeat,
+                )
+                return
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RobotError(
+                    "timeout waiting for CAN stream transition readiness: "
+                    f"session_epoch={last_diagnostics.session_epoch} "
+                    f"expected_epoch={self.session_id} "
+                    f"window_flags=0x{last_diagnostics.window_flags:02x} "
+                    f"motor_marker_mask=0x{last_diagnostics.motor_marker_mask:02x}"
+                )
+            time.sleep(min(0.02, remaining))
+
+    def _wait_for_post_transition_feedback(
+        self,
+        expected_mode: ControlMode,
+        *,
+        previous_sweep_id: int,
+        deadline: float,
+        heartbeat_interval_s: float,
+        next_heartbeat: float,
+    ) -> None:
+        """Anchor the first command to feedback produced after CAN enable."""
+
+        while True:
+            with self._state_condition:
+                self._raise_reader_error()
+                state = self._state
+                if state is not None and state.mode != expected_mode:
+                    raise RobotError(
+                        "CAN stream transition failed before fresh feedback: "
+                        f"firmware entered {state.mode.name} "
+                        f"(hold_reason_bits=0x{state.hold_reason_bits:04x}, "
+                        f"fault_bits=0x{state.fault_bits:04x})"
+                    )
+                if (
+                    state is not None
+                    and state.coherent
+                    and state.coherent_sweep_id != previous_sweep_id
+                ):
+                    return
+
+                now = time.monotonic()
+                remaining = deadline - now
+                if remaining <= 0:
+                    latest_sweep = 0 if state is None else state.coherent_sweep_id
+                    raise RobotError(
+                        "timeout waiting for post-transition coherent feedback: "
+                        f"previous_sweep={previous_sweep_id} latest_sweep={latest_sweep}"
+                    )
+                until_heartbeat = max(0.0, next_heartbeat - now)
+                self._state_condition.wait(min(remaining, until_heartbeat, 0.05))
+
+            if time.monotonic() >= next_heartbeat:
+                self.heartbeat()
+                next_heartbeat = time.monotonic() + heartbeat_interval_s
+
+    def _abort_control_acquisition(self) -> None:
+        """Best-effort fail-closed cleanup after ACQUIRE_CONTROL succeeded."""
+
+        try:
+            self.hold()
+        except BaseException:
+            try:
+                self._enqueue_priority_hold()
+            except BaseException:
+                pass
+        try:
+            self.release_control()
+        except BaseException:
+            pass
+        finally:
+            self._control_acquired = False
+            self._active_action_sequence = None
+            self._clear_action_credit()
+            self.action_gateway.reset()
 
     def _next_sequence(self) -> int:
         with self._sequence_lock:
