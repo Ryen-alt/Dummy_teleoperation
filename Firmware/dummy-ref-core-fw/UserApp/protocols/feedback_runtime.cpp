@@ -129,6 +129,15 @@ void RecordTemperatureFeedbackTimeout(uint8_t node_id)
     can_timing_profiler.RecordTemperatureTimeout(node_id);
 }
 
+void RecordMotorDiagnosticsTimeout(uint8_t node_id)
+{
+    feedback_monitor.OnTemperatureTimeout(node_id);
+    // The fail-closed transition has already rejected this response. Keep the
+    // TX-complete timestamp only for A9 so a late RX ISR can still measure the
+    // true tail latency instead of clipping the evidence at the timeout.
+    can_timing_profiler.RecordTemperatureTimeout(node_id, true);
+}
+
 bool RecordMotorTimingProfile(uint8_t node_id, const uint8_t* data,
                               uint32_t length)
 {

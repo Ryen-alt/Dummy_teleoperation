@@ -40,6 +40,10 @@ def evaluate_can_a9(profile: CanTimingProfile) -> CanA9Evaluation:
     samples_valid = bool(
         profile.window_flags & CAN_TIMING_PROFILE_LATENCY_SAMPLES_VALID
     )
+    if profile.session_epoch == 0:
+        failures.append(
+            "maintenance timing window is measurement-only and cannot pass the formal Stream gate"
+        )
     if not collecting:
         failures.append("timing window is not currently active; capture during Stream")
     if not epoch_stable:

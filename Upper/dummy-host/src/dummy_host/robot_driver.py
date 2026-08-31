@@ -1423,6 +1423,7 @@ class DummyRobot:
 
         if failed_state is not None:
             diagnostics_detail = "CAN diagnostics unavailable"
+            timing_detail = "CAN timing profile unavailable"
             try:
                 diagnostics = self.read_can_diagnostics()
                 diagnostics_detail = (
@@ -1435,12 +1436,23 @@ class DummyRobot:
                 )
             except BaseException as exc:
                 diagnostics_detail = f"CAN diagnostics unavailable: {exc}"
+            try:
+                timing = self.read_can_timing_profile()
+                timing_detail = (
+                    f"timing_session_epoch={timing.session_epoch} "
+                    f"timing_window_flags=0x{timing.window_flags:02x} "
+                    f"timing_temperature_samples={timing.temperature_samples} "
+                    f"timing_temperature_p999_us={timing.temperature_p999_us} "
+                    f"timing_temperature_max_us={timing.temperature_max_us}"
+                )
+            except BaseException as exc:
+                timing_detail = f"CAN timing profile unavailable: {exc}"
             raise RobotError(
                 f"CAN stream transition failed before {expected.name}: "
                 f"firmware entered {failed_state.mode.name} "
                 f"(hold_reason_bits=0x{failed_state.hold_reason_bits:04x}, "
                 f"fault_bits=0x{failed_state.fault_bits:04x}); "
-                f"{diagnostics_detail}"
+                f"{diagnostics_detail}; {timing_detail}"
             )
 
     def _wait_for_can_stream_ready(self, expected_mode: ControlMode) -> None:

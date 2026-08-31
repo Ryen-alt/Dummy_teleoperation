@@ -239,6 +239,7 @@ def test_runtime_hold_during_set_mode_fails_early_with_can_markers(config) -> No
 
     with robot:
         original_read = robot.read_can_diagnostics
+        original_timing_read = robot.read_can_timing_profile
 
         def failed_transition():
             return replace(
@@ -250,13 +251,29 @@ def test_runtime_hold_during_set_mode_fails_early_with_can_markers(config) -> No
             )
 
         robot.read_can_diagnostics = failed_transition  # type: ignore[method-assign]
+
+        def failed_timing_profile():
+            return replace(
+                original_timing_read(),
+                session_epoch=0,
+                temperature_samples=(10, 10, 11, 10, 10, 10, 10),
+                temperature_p999_us=(900, 950, 4300, 910, 920, 930, 940),
+                temperature_max_us=(1100, 1200, 4500, 1150, 1160, 1170, 1180),
+            )
+
+        robot.read_can_timing_profile = (  # type: ignore[method-assign]
+            failed_timing_profile
+        )
         started = time.monotonic()
         with pytest.raises(
             RobotError,
             match=(
                 r"CAN stream transition failed before TELEOP.*"
                 r"motor_marker_mask=0x7f.*"
-                r"failure=MOTOR_DIAGNOSTICS_TIMEOUT node=4 detail=4000"
+                r"failure=MOTOR_DIAGNOSTICS_TIMEOUT node=4 detail=4000.*"
+                r"timing_temperature_samples=.*11.*"
+                r"timing_temperature_p999_us=.*4300.*"
+                r"timing_temperature_max_us=.*4500"
             ),
         ):
             robot.acquire_control(ControlMode.TELEOP)

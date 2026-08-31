@@ -22,7 +22,10 @@ public:
     uint32_t Percentile(uint32_t numerator, uint32_t denominator) const;
 
 private:
-    static constexpr uint32_t kBinWidthUs = 8U;
+    // Keep the fixed RAM footprint while covering the pre-Stream response
+    // timeout tail. Percentiles are conservative upper bounds in 64 us bins;
+    // 128 bins cover 0..8192 us and maximum_us remains exact beyond that.
+    static constexpr uint32_t kBinWidthUs = 64U;
     static constexpr size_t kBinCount = 128U;
     std::array<uint32_t, kBinCount> bins_{};
     uint32_t samples_ = 0U;
@@ -41,7 +44,8 @@ public:
     void RecordPositionTimeout(uint8_t node_id);
     void RecordTemperatureRequest(uint8_t node_id, uint32_t now_us);
     void RecordTemperatureResponse(uint8_t node_id, uint32_t received_us);
-    void RecordTemperatureTimeout(uint8_t node_id);
+    void RecordTemperatureTimeout(uint8_t node_id,
+                                  bool preserve_pending = false);
     bool RecordMotorPage(uint8_t node_id, const uint8_t* data,
                          uint32_t length, uint32_t received_us = 0U);
     CanTimingProfilePayload MakePayload(

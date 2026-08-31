@@ -75,6 +75,15 @@ def test_a9_evaluator_applies_margin_and_schema_invariant() -> None:
     }
 
 
+def test_a9_maintenance_window_cannot_pass_formal_stream_gate() -> None:
+    evaluation = evaluate_can_a9(replace(_profile(), session_epoch=0))
+
+    assert not evaluation.passed
+    assert evaluation.evidence_complete
+    assert evaluation.recommended_response_timeout_us == 500
+    assert any("maintenance" in failure for failure in evaluation.failures)
+
+
 def test_a9_evaluator_rejects_missed_tick_and_relaxed_threshold() -> None:
     profile = replace(
         _profile(),

@@ -32,6 +32,7 @@ void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c,
 void RecordMotorTransportDiagnostics(uint8_t node_id, const uint8_t* data,
                                      uint32_t length);
 void RecordTemperatureFeedbackTimeout(uint8_t node_id);
+void RecordMotorDiagnosticsTimeout(uint8_t node_id);
 bool RecordMotorTimingProfile(uint8_t node_id, const uint8_t* data,
                               uint32_t length);
 bool AcceptMotorTimingProfile(uint8_t node_id, uint8_t page,

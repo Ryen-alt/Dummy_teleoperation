@@ -1504,6 +1504,35 @@ void TestCanTimingProfilerBuildsFixedEvidencePayload()
             kCanTimingProfileMotorPagesComplete) == 0U);
 }
 
+void TestCanTimingProfilerMeasuresLatePreflightResponse()
+{
+    CanTimingProfiler profiler;
+    profiler.Reset(0U, 1000000U);
+    profiler.RecordTemperatureRequest(3U, 1000U);
+    profiler.RecordTemperatureTimeout(3U, true);
+    profiler.RecordTemperatureResponse(3U, 5500U);
+
+    const CanTimingProfilePayload payload = profiler.MakePayload(1005000U, {});
+    assert(payload.session_epoch == 0U);
+    assert(payload.temperature_samples[2] == 1U);
+    // Percentiles are conservative 64 us bin upper bounds; max stays exact.
+    assert(payload.temperature_p999_us[2] == 4544U);
+    assert(payload.temperature_max_us[2] == 4500U);
+
+    profiler.RecordTemperatureRequest(4U, 6000U);
+    profiler.RecordTemperatureTimeout(4U);
+    profiler.RecordTemperatureResponse(4U, 10500U);
+    const CanTimingProfilePayload cleared = profiler.MakePayload(1010000U, {});
+    assert(cleared.temperature_samples[3] == 0U);
+
+    profiler.RecordTemperatureRequest(5U, 11000U);
+    profiler.RecordTemperatureResponse(5U, 20000U);
+    const CanTimingProfilePayload overflow = profiler.MakePayload(1020000U, {});
+    assert(overflow.temperature_samples[4] == 1U);
+    assert(overflow.temperature_p999_us[4] == 8192U);
+    assert(overflow.temperature_max_us[4] == 9000U);
+}
+
 void TestCanDispatcherPreflightTimeoutStopsEnable()
 {
     CanDispatchConfig config{};
@@ -2013,6 +2042,7 @@ int main()
     TestCanTimingProfileSchedulerPagesAndTimeouts();
     TestCanTimingProfileRejectsLateWrongPage();
     TestCanTimingProfilerBuildsFixedEvidencePayload();
+    TestCanTimingProfilerMeasuresLatePreflightResponse();
     TestCanDispatcherDoesNotBurstAfterDeferredDeadline();
     TestCanDispatcherRejectsInvalidRatePlanWithoutFallback();
     TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery();

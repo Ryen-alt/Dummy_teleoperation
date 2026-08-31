@@ -148,12 +148,13 @@ void CanTimingProfiler::RecordTemperatureResponse(uint8_t node_id,
                    temperature_histograms_);
 }
 
-void CanTimingProfiler::RecordTemperatureTimeout(uint8_t node_id)
+void CanTimingProfiler::RecordTemperatureTimeout(uint8_t node_id,
+                                                 bool preserve_pending)
 {
     if (!active_)
         return;
     const size_t index = NodeIndex(node_id);
-    if (index < temperature_requests_.size())
+    if (index < temperature_requests_.size() && !preserve_pending)
         temperature_requests_[index].pending = false;
 }
 

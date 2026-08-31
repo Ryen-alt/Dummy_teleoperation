@@ -151,7 +151,16 @@ temperature TX-complete→RX-ISR histograms, motor DWT P99.9/max values, windowe
 0x05 sample/missed-tick counters, and timing-query request/response/timeout
 counters. Every 0x26 request also carries a per-Stream window token so a motor's
 old uptime counters cannot contaminate the current acceptance window. This is the
-canonical A9 measurement path; an external CAN analyzer is optional.
+canonical A9 measurement path; an external CAN analyzer is optional. Main-
+controller latency percentiles are conservative 64 us bin upper bounds over
+0..8192 us; the maximum field remains exact beyond that range.
+
+At boot, firmware opens a measurement-only maintenance window with
+`session_epoch=0`. It includes Stream-transition motor-diagnostics requests and
+late responses after a fail-closed timeout, so pre-Stream tails can be diagnosed
+without enabling motion. The host must never accept epoch zero as a formal R5
+pass. A successful Stream transition resets all timing evidence into its non-zero
+session epoch.
 `window_duration_us` is conservatively capped at the earliest latest-counts-page
 timestamp across all seven nodes, so an uncovered tail cannot satisfy a duration
 gate.

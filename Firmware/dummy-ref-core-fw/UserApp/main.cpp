@@ -402,6 +402,12 @@ void ThreadCanDispatch(void* argument)
                 last_transition_failure_detail = detail;
             }
         };
+    // A session_epoch=0 maintenance window runs in non-motion modes. It makes
+    // A9 response tails measurable before Stream is able to open its formal
+    // session-bound window; the host never accepts epoch zero as an R5 pass.
+    dummy::protocol::ResetCanTimingProfile(
+        0U, dummy::protocol::BinaryControlMonotonicMicros(),
+        can_dispatch_scheduler.diagnostics());
     for (;;)
     {
         // TX-complete, RX-response and the 1 kHz watchdog all wake this task.
@@ -461,7 +467,13 @@ void ThreadCanDispatch(void* argument)
                 last_transition_failure_node_id = 0U;
                 last_transition_failure_detail = 0U;
                 dummy::protocol::ResetMotorTransportDiagnostics();
-                dummy::protocol::SetCanTimingProfileActive(false);
+                // A completed prior Stream leaves its formal snapshot inactive
+                // for end-of-session collection. Start a fresh epoch-zero
+                // window for every new preflight so repeated transitions still
+                // measure their diagnostics tail before enable completes.
+                dummy::protocol::ResetCanTimingProfile(
+                    0U, dispatch_now_us,
+                    can_dispatch_scheduler.diagnostics());
             }
             else if (diagnostics_window.active)
             {
@@ -722,7 +734,8 @@ void ThreadCanDispatch(void* argument)
                         static_cast<uint32_t>(completed_us));
                 else if (
                     completion.status == CanTxCompletionStatus::Complete &&
-                    completion.metadata.channel == CanTxChannel::Temperature)
+                    (completion.metadata.channel == CanTxChannel::Temperature ||
+                     completion.metadata.channel == CanTxChannel::Diagnostics))
                     dummy::protocol::RecordTemperatureTimingStart(
                         completion.metadata.node_id,
                         static_cast<uint32_t>(completed_us));
@@ -837,11 +850,15 @@ void ThreadCanDispatch(void* argument)
                     step.timed_out_node_id);
             }
             else if (step.timed_out_action ==
-                         dummy::protocol::CanDispatchAction::TemperatureRequest ||
-                     step.timed_out_action ==
-                         dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
+                     dummy::protocol::CanDispatchAction::TemperatureRequest)
             {
                 dummy::protocol::RecordTemperatureFeedbackTimeout(
+                    step.timed_out_node_id);
+            }
+            else if (step.timed_out_action ==
+                     dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
+            {
+                dummy::protocol::RecordMotorDiagnosticsTimeout(
                     step.timed_out_node_id);
             }
             if (step.timed_out_action ==
