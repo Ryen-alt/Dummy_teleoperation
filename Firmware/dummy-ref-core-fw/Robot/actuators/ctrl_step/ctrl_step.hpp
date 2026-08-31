@@ -64,6 +64,8 @@ public:
     void Reboot();
     float GetTemp();
     bool TryGetTemp(const CanTxMetadata* metadata = nullptr);
+    bool TryGetTimingProfile(
+        uint8_t page, const CanTxMetadata* metadata = nullptr);
     void EraseConfigs();
 
     void UpdateAngle();

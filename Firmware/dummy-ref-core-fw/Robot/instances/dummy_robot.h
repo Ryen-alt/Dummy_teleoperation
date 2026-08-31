@@ -193,6 +193,9 @@ public:
         uint8_t node_id, const CanTxMetadata* metadata = nullptr);
     bool TryRequestTemperatureFeedback(
         uint8_t node_id, const CanTxMetadata* metadata = nullptr);
+    bool TryRequestTimingProfile(
+        uint8_t node_id, uint8_t page,
+        const CanTxMetadata* metadata = nullptr);
     // Realtime binary control uses a single non-blocking broadcast after its
     // per-node hold targets have been admitted by the CAN dispatcher.
     bool TrySetExternalEnable(

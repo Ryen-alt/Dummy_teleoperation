@@ -24,6 +24,7 @@ enum class CanDispatchAction : uint8_t
     PositionRequest,
     TemperatureRequest,
     MotorDiagnosticsRequest,
+    MotorTimingRequest,
     ConfigureGripperVelocity,
     EnableBroadcast,
     DisableBroadcast,
@@ -33,17 +34,23 @@ struct FeedbackResponseEvents
 {
     uint8_t position_mask = 0;
     uint8_t temperature_mask = 0;
+    uint8_t timing_profile_mask = 0;
+    std::array<uint8_t, kActuatorNodeCount> timing_profile_page{};
     uint32_t unexpected_position_count = 0;
     uint32_t unexpected_temperature_count = 0;
+    uint32_t unexpected_timing_profile_count = 0;
 };
 
 struct CanDispatchStep
 {
     CanDispatchAction action = CanDispatchAction::None;
     uint8_t node_id = 0;
+    uint8_t timing_profile_page = 0;
     uint32_t feedback_sweep_id = 0;
     CanDispatchAction timed_out_action = CanDispatchAction::None;
     uint8_t timed_out_node_id = 0;
+    uint8_t accepted_timing_profile_node_id = 0;
+    uint8_t accepted_timing_profile_page = 0;
     bool timed_out_final = false;
     bool transition = false;
 };
@@ -56,6 +63,7 @@ struct CanDispatchConfig
     uint32_t target_hz_per_node = 50U;
     uint32_t position_hz_per_node = 40U;
     uint32_t temperature_hz_per_node = 1U;
+    uint32_t timing_profile_hz_per_node = 0U;
 };
 
 struct CanDispatchDiagnostics
@@ -73,6 +81,9 @@ struct CanDispatchDiagnostics
     std::array<uint32_t, kActuatorNodeCount> temperature_requested{};
     std::array<uint32_t, kActuatorNodeCount> temperature_responded{};
     std::array<uint32_t, kActuatorNodeCount> temperature_timed_out{};
+    std::array<uint32_t, kActuatorNodeCount> timing_profile_requested{};
+    std::array<uint32_t, kActuatorNodeCount> timing_profile_responded{};
+    std::array<uint32_t, kActuatorNodeCount> timing_profile_timed_out{};
     bool query_pending = false;
     CanDispatchAction pending_action = CanDispatchAction::None;
     uint8_t pending_node_id = 0;
@@ -118,8 +129,9 @@ private:
     uint8_t SelectTargetNode(uint32_t now_us) const;
     uint8_t SelectPositionNode(uint32_t now_us) const;
     uint8_t SelectTemperatureNode(uint32_t now_us) const;
+    uint8_t SelectTimingProfileNode(uint32_t now_us) const;
     void ConsumeResponses(const FeedbackResponseEvents& responses,
-                          uint32_t now_us);
+                          uint32_t now_us, CanDispatchStep& step);
     void AdvancePositionSweep(uint32_t now_us);
     void FinishPositionSweep(uint32_t now_us);
     uint8_t SelectPositionRetryNode() const;
@@ -139,9 +151,12 @@ private:
     uint32_t next_target_deadline_us_ = 0U;
     uint32_t next_position_deadline_us_ = 0U;
     uint32_t next_temperature_deadline_us_ = 0U;
+    uint32_t next_timing_profile_deadline_us_ = 0U;
     uint8_t next_target_node_ = 1U;
     uint8_t next_position_node_ = 1U;
     uint8_t next_temperature_node_ = 1U;
+    uint8_t next_timing_profile_node_ = 1U;
+    std::array<uint8_t, kActuatorNodeCount> timing_profile_page_{};
     bool target_fanout_active_ = false;
     uint8_t target_fanout_node_ = 1U;
     uint32_t target_fanout_started_us_ = 0U;

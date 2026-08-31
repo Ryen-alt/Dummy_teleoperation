@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict
 
 from dummy_host.cameras import CameraManager
-from dummy_host.protocol import PROTOCOL_VERSION
+from dummy_host.protocol import CAPABILITY_CAN_TIMING_PROFILE, PROTOCOL_VERSION
 from dummy_host.robot_driver import DummyRobot
 from dummy_host.schema import load_robot_config
 from dummy_host.transport_serial import SerialTransport
@@ -52,6 +52,15 @@ def main() -> None:
                     separators=(",", ":"),
                 )
             )
+            if robot.firmware_capabilities & CAPABILITY_CAN_TIMING_PROFILE:
+                print(
+                    "can_timing_profile_start="
+                    + json.dumps(
+                        asdict(robot.read_can_timing_profile()),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
             started = time.monotonic()
             while args.duration is None or time.monotonic() - started < args.duration:
                 state = robot.read_state()
@@ -96,6 +105,15 @@ def main() -> None:
                     separators=(",", ":"),
                 )
             )
+            if robot.firmware_capabilities & CAPABILITY_CAN_TIMING_PROFILE:
+                print(
+                    "can_timing_profile_end="
+                    + json.dumps(
+                        asdict(robot.read_can_timing_profile()),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
     except KeyboardInterrupt:
         pass
 

@@ -23,6 +23,7 @@
 /* USER CODE BEGIN 0 */
 #include "common_inc.h"
 #include "configurations.h"
+#include "protocols/timing_profiler.h"
 #include "../../../can_transport_contract.h"
 
 CAN_TxHeaderTypeDef TxHeader;
@@ -219,7 +220,10 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* CanHandle)
     uint8_t cmd = RxHeader.StdId & 0x7F; // 4Bits ID & 7Bits Msg
     if (id == 0 || id == boardConfig.canNodeId)
     {
+        const uint32_t timing_start = MotorTimingProfilerCanBegin();
         OnCanCmd(cmd, RxData, RxHeader.DLC);
+        if (cmd == 0x05U)
+            MotorTimingProfilerRecordCan05(timing_start);
     }
 }
 

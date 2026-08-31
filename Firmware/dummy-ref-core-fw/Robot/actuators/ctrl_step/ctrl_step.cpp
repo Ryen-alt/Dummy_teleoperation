@@ -1,6 +1,7 @@
 #include "ctrl_step.hpp"
 #include "communication.hpp"
 #include "protocols/feedback_runtime.hpp"
+#include "../../../../can_transport_contract.h"
 
 namespace
 {
@@ -339,6 +340,18 @@ bool CtrlStepMotor::TryGetTemp(const CanTxMetadata* metadata)
     return CanTrySendMessage(get_can_ctx(hcan), request_data, &request_header,
                              RecordTemperatureRequest, &nodeID, metadata) ==
         CanTxStatus::Queued;
+}
+
+bool CtrlStepMotor::TryGetTimingProfile(
+    uint8_t page, const CanTxMetadata* metadata)
+{
+    CAN_TxHeaderTypeDef request_header = txHeader;
+    request_header.StdId = nodeID << 7 | DUMMY_MOTOR_TIMING_COMMAND;
+    uint8_t request_data[8] = {};
+    request_data[0] = page;
+    return CanTrySendMessage(
+        get_can_ctx(hcan), request_data, &request_header,
+        nullptr, nullptr, metadata) == CanTxStatus::Queued;
 }
 
 void CtrlStepMotor::EraseConfigs()

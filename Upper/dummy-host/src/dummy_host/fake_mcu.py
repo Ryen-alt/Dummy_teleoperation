@@ -14,6 +14,7 @@ from .protocol import (
     CAPABILITY_TIME_SYNC,
     CAPABILITY_CAN_DIAGNOSTICS,
     CAPABILITY_CAN_DIAGNOSTICS_V2,
+    CAPABILITY_CAN_TIMING_PROFILE,
     CAN_DIAGNOSTICS_FORMAT_VERSION,
     CAN_DIAGNOSTICS_MARKERS_COMPLETE,
     CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC,
@@ -22,6 +23,10 @@ from .protocol import (
     CAN_DIAGNOSTICS_WINDOW_ACTIVE,
     ACQUIRE_CONTROL,
     CanDiagnostics,
+    CAN_TIMING_PROFILE_FORMAT_VERSION,
+    CAN_TIMING_PROFILE_PAYLOAD_SIZE,
+    CAN_TIMING_PROFILE_WINDOW_VALID,
+    CanTimingProfile,
     SET_MODE,
     MessageType,
     Packet,
@@ -29,6 +34,7 @@ from .protocol import (
     StreamDecoder,
     pack_ack,
     pack_can_diagnostics,
+    pack_can_timing_profile,
     pack_hello_ack,
     pack_state,
     pack_time_sync_ack,
@@ -72,6 +78,7 @@ class FakeMcuTransport:
         | CAPABILITY_TIME_SYNC
         | CAPABILITY_CAN_DIAGNOSTICS
         | CAPABILITY_CAN_DIAGNOSTICS_V2
+        | CAPABILITY_CAN_TIMING_PROFILE
     )
 
     def __init__(
@@ -271,6 +278,49 @@ class FakeMcuTransport:
                             main_can_rx_frame=(0,) * 2,
                             main_can_tx_busy=(0,) * 2,
                             transition_failure_count=0,
+                        )
+                    ),
+                )
+            )
+            return
+        if packet.message_type == MessageType.GET_CAN_TIMING_PROFILE:
+            now_us = self.clock_ns() // 1_000
+            self._rx.put(
+                self._response(
+                    packet,
+                    MessageType.CAN_TIMING_PROFILE,
+                    pack_can_timing_profile(
+                        CanTimingProfile(
+                            format_version=CAN_TIMING_PROFILE_FORMAT_VERSION,
+                            payload_size=CAN_TIMING_PROFILE_PAYLOAD_SIZE,
+                            session_epoch=1,
+                            window_reset_count=1,
+                            window_start_us=max(0, now_us - 10_000_000),
+                            window_duration_us=min(now_us, 10_000_000),
+                            motor_page_valid_mask=(0x7F,) * 4,
+                            window_flags=CAN_TIMING_PROFILE_WINDOW_VALID,
+                            position_samples=(1000,) * 7,
+                            position_p50_us=(100,) * 7,
+                            position_p99_us=(200,) * 7,
+                            position_p999_us=(300,) * 7,
+                            position_max_us=(400,) * 7,
+                            temperature_samples=(100,) * 7,
+                            temperature_p50_us=(100,) * 7,
+                            temperature_p99_us=(200,) * 7,
+                            temperature_p999_us=(300,) * 7,
+                            temperature_max_us=(400,) * 7,
+                            motor_flags=(0x0F,) * 7,
+                            motor_can_samples=(1000,) * 7,
+                            motor_can_p999_x10_us=(1000,) * 7,
+                            motor_can_max_x10_us=(1500,) * 7,
+                            motor_jitter_p999_x10_us=(100,) * 7,
+                            motor_jitter_max_x10_us=(200,) * 7,
+                            motor_control_p999_x10_us=(200,) * 7,
+                            motor_control_max_x10_us=(300,) * 7,
+                            motor_missed_ticks=(0,) * 7,
+                            timing_request=(4,) * 7,
+                            timing_response=(4,) * 7,
+                            timing_timeout=(0,) * 7,
                         )
                     ),
                 )

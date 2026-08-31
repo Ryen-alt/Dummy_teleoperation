@@ -32,6 +32,12 @@ CAN_DIAGNOSTICS = struct.Struct(
     + "6I" + "2I" * 4 + "4I" + "2I2I" + "I3I"
 )
 assert CAN_DIAGNOSTICS.size == CAN_DIAGNOSTICS_PAYLOAD_SIZE
+CAN_TIMING_PROFILE_FORMAT_VERSION = 1
+CAN_TIMING_PROFILE_PAYLOAD_SIZE = 520
+CAN_TIMING_PROFILE = struct.Struct(
+    "<HHIIQQ4BB3x" + "7I" * 10 + "7BB" + "7H" * 8 + "7I" * 3
+)
+assert CAN_TIMING_PROFILE.size == CAN_TIMING_PROFILE_PAYLOAD_SIZE
 ACTION_PROGRESS_CAPACITY = 6
 STATE = struct.Struct(
     "<Q7f7fIBBHI32s7f7I7I7I7H7H7BBHH7Q7IIIQ4B"
@@ -56,6 +62,7 @@ class MessageType(enum.IntEnum):
     TARGET_KEEPALIVE = 0x0A
     TIME_SYNC = 0x0B
     GET_CAN_DIAGNOSTICS = 0x0C
+    GET_CAN_TIMING_PROFILE = 0x0D
     HELLO_ACK = 0x81
     STATE = 0x82
     ACK = 0x83
@@ -64,6 +71,7 @@ class MessageType(enum.IntEnum):
     EVENT = 0x86
     TIME_SYNC_ACK = 0x87
     CAN_DIAGNOSTICS = 0x88
+    CAN_TIMING_PROFILE = 0x89
 
 
 class ResultCode(enum.IntEnum):
@@ -100,6 +108,7 @@ CAPABILITY_CONTROL_FRESHNESS_TOKEN = 1 << 3
 CAPABILITY_TIME_SYNC = 1 << 4
 CAPABILITY_CAN_DIAGNOSTICS = 1 << 5
 CAPABILITY_CAN_DIAGNOSTICS_V2 = 1 << 6
+CAPABILITY_CAN_TIMING_PROFILE = 1 << 7
 CAN_DIAGNOSTICS_WINDOW_ACTIVE = 1 << 0
 CAN_DIAGNOSTICS_EPOCH_STABLE = 1 << 1
 CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC = 1 << 2
@@ -109,6 +118,16 @@ CAN_DIAGNOSTICS_WINDOW_VALID = (
     | CAN_DIAGNOSTICS_EPOCH_STABLE
     | CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC
     | CAN_DIAGNOSTICS_MARKERS_COMPLETE
+)
+CAN_TIMING_PROFILE_WINDOW_ACTIVE = 1 << 0
+CAN_TIMING_PROFILE_EPOCH_STABLE = 1 << 1
+CAN_TIMING_PROFILE_MOTOR_PAGES_COMPLETE = 1 << 2
+CAN_TIMING_PROFILE_LATENCY_SAMPLES_VALID = 1 << 3
+CAN_TIMING_PROFILE_WINDOW_VALID = (
+    CAN_TIMING_PROFILE_WINDOW_ACTIVE
+    | CAN_TIMING_PROFILE_EPOCH_STABLE
+    | CAN_TIMING_PROFILE_MOTOR_PAGES_COMPLETE
+    | CAN_TIMING_PROFILE_LATENCY_SAMPLES_VALID
 )
 
 
@@ -257,6 +276,83 @@ class CanDiagnostics:
     @property
     def tx_recovery_count(self) -> int:
         return sum(self.main_can_tx_recovery)
+
+
+@dataclass(frozen=True)
+class CanTimingProfile:
+    format_version: int
+    payload_size: int
+    session_epoch: int
+    window_reset_count: int
+    window_start_us: int
+    window_duration_us: int
+    motor_page_valid_mask: tuple[int, ...]
+    window_flags: int
+    position_samples: tuple[int, ...]
+    position_p50_us: tuple[int, ...]
+    position_p99_us: tuple[int, ...]
+    position_p999_us: tuple[int, ...]
+    position_max_us: tuple[int, ...]
+    temperature_samples: tuple[int, ...]
+    temperature_p50_us: tuple[int, ...]
+    temperature_p99_us: tuple[int, ...]
+    temperature_p999_us: tuple[int, ...]
+    temperature_max_us: tuple[int, ...]
+    motor_flags: tuple[int, ...]
+    motor_can_samples: tuple[int, ...]
+    motor_can_p999_x10_us: tuple[int, ...]
+    motor_can_max_x10_us: tuple[int, ...]
+    motor_jitter_p999_x10_us: tuple[int, ...]
+    motor_jitter_max_x10_us: tuple[int, ...]
+    motor_control_p999_x10_us: tuple[int, ...]
+    motor_control_max_x10_us: tuple[int, ...]
+    motor_missed_ticks: tuple[int, ...]
+    timing_request: tuple[int, ...]
+    timing_response: tuple[int, ...]
+    timing_timeout: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.format_version != CAN_TIMING_PROFILE_FORMAT_VERSION:
+            raise ValueError("CAN timing profile format version must be 1")
+        if self.payload_size != CAN_TIMING_PROFILE_PAYLOAD_SIZE:
+            raise ValueError("CAN timing profile payload size must be 520")
+        if len(self.motor_page_valid_mask) != 4:
+            raise ValueError("CAN timing profile requires four motor page masks")
+        node_arrays = (
+            self.position_samples,
+            self.position_p50_us,
+            self.position_p99_us,
+            self.position_p999_us,
+            self.position_max_us,
+            self.temperature_samples,
+            self.temperature_p50_us,
+            self.temperature_p99_us,
+            self.temperature_p999_us,
+            self.temperature_max_us,
+            self.motor_flags,
+            self.motor_can_samples,
+            self.motor_can_p999_x10_us,
+            self.motor_can_max_x10_us,
+            self.motor_jitter_p999_x10_us,
+            self.motor_jitter_max_x10_us,
+            self.motor_control_p999_x10_us,
+            self.motor_control_max_x10_us,
+            self.motor_missed_ticks,
+            self.timing_request,
+            self.timing_response,
+            self.timing_timeout,
+        )
+        if any(len(values) != 7 for values in node_arrays):
+            raise ValueError("CAN timing profile node arrays must contain seven values")
+        if any(value < 0 for values in node_arrays for value in values):
+            raise ValueError("CAN timing profile values must be non-negative")
+
+    @property
+    def window_valid(self) -> bool:
+        return (
+            self.window_flags & CAN_TIMING_PROFILE_WINDOW_VALID
+            == CAN_TIMING_PROFILE_WINDOW_VALID
+        )
 
 
 def crc32c(data: bytes, initial: int = 0) -> int:
@@ -610,6 +706,118 @@ def unpack_can_diagnostics(payload: bytes) -> CanDiagnostics:
         main_can_rx_frame=tuple(values[103:105]),
         main_can_tx_busy=tuple(values[105:107]),
         transition_failure_count=values[107],
+    )
+
+
+def pack_can_timing_profile(value: CanTimingProfile) -> bytes:
+    return CAN_TIMING_PROFILE.pack(
+        value.format_version,
+        value.payload_size,
+        value.session_epoch,
+        value.window_reset_count,
+        value.window_start_us,
+        value.window_duration_us,
+        *value.motor_page_valid_mask,
+        value.window_flags,
+        *value.position_samples,
+        *value.position_p50_us,
+        *value.position_p99_us,
+        *value.position_p999_us,
+        *value.position_max_us,
+        *value.temperature_samples,
+        *value.temperature_p50_us,
+        *value.temperature_p99_us,
+        *value.temperature_p999_us,
+        *value.temperature_max_us,
+        *value.motor_flags,
+        0,
+        *value.motor_can_samples,
+        *value.motor_can_p999_x10_us,
+        *value.motor_can_max_x10_us,
+        *value.motor_jitter_p999_x10_us,
+        *value.motor_jitter_max_x10_us,
+        *value.motor_control_p999_x10_us,
+        *value.motor_control_max_x10_us,
+        *value.motor_missed_ticks,
+        *value.timing_request,
+        *value.timing_response,
+        *value.timing_timeout,
+    )
+
+
+def unpack_can_timing_profile(payload: bytes) -> CanTimingProfile:
+    if len(payload) != CAN_TIMING_PROFILE.size:
+        raise ProtocolError("invalid CAN_TIMING_PROFILE payload length")
+    values = CAN_TIMING_PROFILE.unpack(payload)
+    if (
+        values[0] != CAN_TIMING_PROFILE_FORMAT_VERSION
+        or values[1] != CAN_TIMING_PROFILE_PAYLOAD_SIZE
+    ):
+        raise ProtocolError("unsupported CAN_TIMING_PROFILE format")
+    offset = 11
+
+    def take(count: int) -> tuple[int, ...]:
+        nonlocal offset
+        result = tuple(values[offset : offset + count])
+        offset += count
+        return result
+
+    position_samples = take(7)
+    position_p50_us = take(7)
+    position_p99_us = take(7)
+    position_p999_us = take(7)
+    position_max_us = take(7)
+    temperature_samples = take(7)
+    temperature_p50_us = take(7)
+    temperature_p99_us = take(7)
+    temperature_p999_us = take(7)
+    temperature_max_us = take(7)
+    motor_flags = take(7)
+    offset += 1  # reserved motor byte
+    motor_can_samples = take(7)
+    motor_can_p999_x10_us = take(7)
+    motor_can_max_x10_us = take(7)
+    motor_jitter_p999_x10_us = take(7)
+    motor_jitter_max_x10_us = take(7)
+    motor_control_p999_x10_us = take(7)
+    motor_control_max_x10_us = take(7)
+    motor_missed_ticks = take(7)
+    timing_request = take(7)
+    timing_response = take(7)
+    timing_timeout = take(7)
+    if offset != len(values):
+        raise ProtocolError("CAN_TIMING_PROFILE layout mismatch")
+    return CanTimingProfile(
+        format_version=values[0],
+        payload_size=values[1],
+        session_epoch=values[2],
+        window_reset_count=values[3],
+        window_start_us=values[4],
+        window_duration_us=values[5],
+        motor_page_valid_mask=tuple(values[6:10]),
+        window_flags=values[10],
+        position_samples=position_samples,
+        position_p50_us=position_p50_us,
+        position_p99_us=position_p99_us,
+        position_p999_us=position_p999_us,
+        position_max_us=position_max_us,
+        temperature_samples=temperature_samples,
+        temperature_p50_us=temperature_p50_us,
+        temperature_p99_us=temperature_p99_us,
+        temperature_p999_us=temperature_p999_us,
+        temperature_max_us=temperature_max_us,
+        motor_flags=motor_flags,
+        motor_can_samples=motor_can_samples,
+        motor_can_p999_x10_us=motor_can_p999_x10_us,
+        motor_can_max_x10_us=motor_can_max_x10_us,
+        motor_jitter_p999_x10_us=motor_jitter_p999_x10_us,
+        motor_jitter_max_x10_us=motor_jitter_max_x10_us,
+        motor_control_p999_x10_us=motor_control_p999_x10_us,
+        motor_control_max_x10_us=motor_control_max_x10_us,
+        motor_missed_ticks=motor_missed_ticks,
+        timing_request=timing_request,
+        timing_response=timing_response,
+        timing_timeout=timing_timeout,
     )
 
 

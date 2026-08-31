@@ -602,7 +602,11 @@ def test_cartesian_fake_mcu_reuses_joint_gateway_and_records_semantics(
 ) -> None:
     profile = _profile()
     kinematics = _kinematics(config, profile)
-    source = _ScriptedCartesianGamepad(CartesianGamepadMapper(profile))
+    # Keep the synthetic dead-man asserted long enough for the asynchronous
+    # lease thread to acquire control even under a loaded full-suite runner.
+    source = _ScriptedCartesianGamepad(
+        CartesianGamepadMapper(profile), deadman_until_poll=40
+    )
     robot = DummyRobot(config, FakeMcuTransport(config))
     recorder = SessionRecorder(
         tmp_path,

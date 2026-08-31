@@ -15,6 +15,8 @@ CAN_CRITICAL_FILES = (
     "Port/Platform/retarget.c",
     "UserApp/common_inc.h",
     "UserApp/protocols/interface_can.cpp",
+    "UserApp/protocols/timing_profiler.cpp",
+    "UserApp/protocols/timing_profiler.h",
 )
 
 

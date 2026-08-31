@@ -1,4 +1,5 @@
 #include "feedback_poll_scheduler.hpp"
+#include "../../../can_transport_contract.h"
 
 #include <algorithm>
 #include <limits>
@@ -77,6 +78,10 @@ void CanDispatchScheduler::InitializeDeadlines(uint32_t now_us)
         config_.temperature_hz_per_node);
     next_temperature_deadline_us_ = temperature_period == 0U
         ? 0U : now_us + temperature_period;
+    const uint32_t timing_profile_period = PeriodUs(
+        config_.timing_profile_hz_per_node);
+    next_timing_profile_deadline_us_ = timing_profile_period == 0U
+        ? 0U : now_us + timing_profile_period;
     deadlines_initialized_ = true;
 }
 
@@ -177,6 +182,25 @@ uint8_t CanDispatchScheduler::SelectTemperatureNode(uint32_t now_us) const
     return selected;
 }
 
+uint8_t CanDispatchScheduler::SelectTimingProfileNode(uint32_t now_us) const
+{
+    uint8_t selected = 0U;
+    uint32_t minimum_count = std::numeric_limits<uint32_t>::max();
+    uint8_t node_id = next_timing_profile_node_;
+    for (size_t attempt = 0; attempt < kActuatorNodeCount; ++attempt)
+    {
+        const uint32_t count =
+            diagnostics_.timing_profile_requested[node_id - 1U];
+        if (NodeQuiet(node_id, now_us) && count < minimum_count)
+        {
+            selected = node_id;
+            minimum_count = count;
+        }
+        node_id = NextNode(node_id);
+    }
+    return selected;
+}
+
 uint8_t CanDispatchScheduler::SelectPositionRetryNode() const
 {
     uint8_t node_id = position_sweep_start_node_;
@@ -240,17 +264,13 @@ void CanDispatchScheduler::AdvancePositionSweep(uint32_t now_us)
 }
 
 void CanDispatchScheduler::ConsumeResponses(
-    const FeedbackResponseEvents& responses, uint32_t now_us)
+    const FeedbackResponseEvents& responses, uint32_t now_us,
+    CanDispatchStep& step)
 {
-    const uint32_t unexpected = SaturatingAdd(
-        responses.unexpected_position_count,
-        responses.unexpected_temperature_count);
-    if (mode_ == CanDispatchMode::Stream)
-        diagnostics_.unexpected_response_count = SaturatingAdd(
-            diagnostics_.unexpected_response_count, unexpected);
-    else
-        diagnostics_.maintenance_response_count = SaturatingAdd(
-            diagnostics_.maintenance_response_count, unexpected);
+    uint32_t unexpected = SaturatingAdd(
+        SaturatingAdd(responses.unexpected_position_count,
+                      responses.unexpected_temperature_count),
+        responses.unexpected_timing_profile_count);
 
     const bool current_position_matched = query_pending_ &&
         pending_action_ == CanDispatchAction::PositionRequest &&
@@ -259,6 +279,23 @@ void CanDispatchScheduler::ConsumeResponses(
         (pending_action_ == CanDispatchAction::TemperatureRequest ||
          pending_action_ == CanDispatchAction::MotorDiagnosticsRequest) &&
         (responses.temperature_mask & NodeMask(pending_node_id_)) != 0U;
+    const bool current_timing_profile_matched = query_pending_ &&
+        pending_action_ == CanDispatchAction::MotorTimingRequest &&
+        (responses.timing_profile_mask & NodeMask(pending_node_id_)) != 0U &&
+        responses.timing_profile_page[pending_node_id_ - 1U] ==
+            timing_profile_page_[pending_node_id_ - 1U];
+    for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
+    {
+        if ((responses.timing_profile_mask & NodeMask(node_id)) != 0U &&
+            !(current_timing_profile_matched && node_id == pending_node_id_))
+            unexpected = SaturatingIncrement(unexpected);
+    }
+    if (mode_ == CanDispatchMode::Stream)
+        diagnostics_.unexpected_response_count = SaturatingAdd(
+            diagnostics_.unexpected_response_count, unexpected);
+    else
+        diagnostics_.maintenance_response_count = SaturatingAdd(
+            diagnostics_.maintenance_response_count, unexpected);
 
     for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
     {
@@ -276,9 +313,21 @@ void CanDispatchScheduler::ConsumeResponses(
                 diagnostics_.temperature_responded[node_id - 1U]);
     }
 
-    if (current_position_matched || current_temperature_matched)
+    if (current_position_matched || current_temperature_matched ||
+        current_timing_profile_matched)
     {
         const CanDispatchAction completed_action = pending_action_;
+        const uint8_t completed_node_id = pending_node_id_;
+        if (current_timing_profile_matched)
+        {
+            diagnostics_.timing_profile_responded[completed_node_id - 1U] =
+                SaturatingIncrement(
+                    diagnostics_.timing_profile_responded[
+                        completed_node_id - 1U]);
+            step.accepted_timing_profile_node_id = completed_node_id;
+            step.accepted_timing_profile_page =
+                responses.timing_profile_page[completed_node_id - 1U];
+        }
         query_pending_ = false;
         pending_action_ = CanDispatchAction::None;
         pending_node_id_ = 0U;
@@ -296,6 +345,12 @@ void CanDispatchScheduler::ConsumeResponses(
                 transition_node_ = 1U;
                 transition_ = Transition::ConfigureGripper;
             }
+        }
+        else if (completed_action == CanDispatchAction::MotorTimingRequest)
+        {
+            uint8_t& page = timing_profile_page_[completed_node_id - 1U];
+            page = static_cast<uint8_t>(
+                (page + 1U) % DUMMY_MOTOR_TIMING_PAGE_COUNT);
         }
     }
 
@@ -322,6 +377,7 @@ void CanDispatchScheduler::SetMode(CanDispatchMode mode)
     position_retry_phase_ = false;
     position_pending_.fill(false);
     position_attempts_.fill(0U);
+    timing_profile_page_.fill(0U);
     query_pending_ = false;
     pending_action_ = CanDispatchAction::None;
     pending_node_id_ = 0U;
@@ -336,6 +392,7 @@ void CanDispatchScheduler::SetMode(CanDispatchMode mode)
 CanDispatchStep CanDispatchScheduler::Next(
     uint32_t now_us, const FeedbackResponseEvents& responses)
 {
+    CanDispatchStep step{};
     diagnostics_.tick_count = SaturatingIncrement(diagnostics_.tick_count);
     if (!config_valid_)
     {
@@ -343,11 +400,10 @@ CanDispatchStep CanDispatchScheduler::Next(
             diagnostics_.idle_slot_count);
         return {};
     }
-    ConsumeResponses(responses, now_us);
+    ConsumeResponses(responses, now_us, step);
     if (transition_ == Transition::None && !deadlines_initialized_)
         InitializeDeadlines(now_us);
 
-    CanDispatchStep step{};
     if (query_pending_ &&
         now_us - pending_since_us_ >= config_.response_timeout_us)
     {
@@ -375,11 +431,17 @@ CanDispatchStep CanDispatchScheduler::Next(
         }
         else if (pending_action_ == CanDispatchAction::TemperatureRequest ||
                  pending_action_ ==
-                     CanDispatchAction::MotorDiagnosticsRequest)
+                     CanDispatchAction::MotorDiagnosticsRequest ||
+                 pending_action_ == CanDispatchAction::MotorTimingRequest)
         {
             step.timed_out_final = true;
-            diagnostics_.temperature_timed_out[index] = SaturatingIncrement(
-                diagnostics_.temperature_timed_out[index]);
+            if (pending_action_ == CanDispatchAction::MotorTimingRequest)
+                diagnostics_.timing_profile_timed_out[index] =
+                    SaturatingIncrement(
+                        diagnostics_.timing_profile_timed_out[index]);
+            else
+                diagnostics_.temperature_timed_out[index] = SaturatingIncrement(
+                    diagnostics_.temperature_timed_out[index]);
             if (pending_action_ == CanDispatchAction::TemperatureRequest)
             {
                 const uint32_t period_us = PeriodUs(
@@ -389,7 +451,9 @@ CanDispatchStep CanDispatchScheduler::Next(
             }
             else
             {
-                transition_ = Transition::None;
+                if (pending_action_ ==
+                    CanDispatchAction::MotorDiagnosticsRequest)
+                    transition_ = Transition::None;
             }
         }
         query_pending_ = false;
@@ -551,6 +615,19 @@ CanDispatchStep CanDispatchScheduler::Next(
         return step;
     }
 
+    if (next_timing_profile_deadline_us_ != 0U &&
+        DeadlineDue(now_us, next_timing_profile_deadline_us_))
+    {
+        const uint8_t node_id = SelectTimingProfileNode(now_us);
+        if (node_id != 0U)
+        {
+            step.action = CanDispatchAction::MotorTimingRequest;
+            step.node_id = node_id;
+            step.timing_profile_page = timing_profile_page_[node_id - 1U];
+            return step;
+        }
+    }
+
     diagnostics_.idle_slot_count = SaturatingIncrement(diagnostics_.idle_slot_count);
     return step;
 }
@@ -635,6 +712,19 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
         pending_node_id_ = step.node_id;
         pending_since_us_ = now_us;
     }
+    else if (step.action == CanDispatchAction::MotorTimingRequest)
+    {
+        AdvanceDeadline(next_timing_profile_deadline_us_,
+                        config_.timing_profile_hz_per_node, now_us);
+        diagnostics_.timing_profile_requested[step.node_id - 1U] =
+            SaturatingIncrement(
+                diagnostics_.timing_profile_requested[step.node_id - 1U]);
+        next_timing_profile_node_ = NextNode(step.node_id);
+        query_pending_ = true;
+        pending_action_ = step.action;
+        pending_node_id_ = step.node_id;
+        pending_since_us_ = now_us;
+    }
 
     if (!step.transition)
         return;
@@ -677,9 +767,12 @@ void CanDispatchScheduler::Reset()
     next_target_deadline_us_ = 0U;
     next_position_deadline_us_ = 0U;
     next_temperature_deadline_us_ = 0U;
+    next_timing_profile_deadline_us_ = 0U;
     next_target_node_ = 1U;
     next_position_node_ = 1U;
     next_temperature_node_ = 1U;
+    next_timing_profile_node_ = 1U;
+    timing_profile_page_.fill(0U);
     target_fanout_active_ = false;
     target_fanout_node_ = 1U;
     target_fanout_started_us_ = 0U;

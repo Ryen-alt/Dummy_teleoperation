@@ -1,8 +1,8 @@
 # LeRobot adapter for Dummy
 
 This package is the only layer allowed to depend on LeRobot. The control and
-recording package writes lossless Raw Session v2 data; this package verifies and
-converts accepted episodes offline. `lerobot==0.4.0` is intentionally pinned so
+recording package writes lossless Raw Session schema v4 data; this package verifies
+and converts accepted episodes offline. `lerobot==0.4.0` is intentionally pinned so
 an upstream dataset API change cannot affect robot control or collection.
 
 Install both local packages in a dedicated export environment:
@@ -24,8 +24,10 @@ dummy-export-lerobot-v3 \
 ```
 
 The adapter infers camera feature shapes from the first validated frame, uses
-`applied_action` as the training label, preserves raw sample/tick provenance,
-and writes `dummy_export_metadata.json` with source config hashes and episode IDs.
+`applied_action` as the training label only after ACK, exact seven-node CAN
+queueing and post-command coherent feedback are all present. It preserves raw
+sample/tick/control-time provenance and writes `dummy_export_metadata.json` with
+source config hashes and episode IDs.
 
 `constraints-lerobot.txt` pins the API boundary. Generate the full transitive
 lock in the target Linux/CUDA environment, because Torch/video wheels are

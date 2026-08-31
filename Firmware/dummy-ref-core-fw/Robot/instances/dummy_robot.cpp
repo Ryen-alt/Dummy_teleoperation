@@ -294,6 +294,16 @@ bool DummyRobot::TryRequestTemperatureFeedback(
     return false;
 }
 
+bool DummyRobot::TryRequestTimingProfile(
+    uint8_t node_id, uint8_t page, const CanTxMetadata* metadata)
+{
+    if (node_id >= 1U && node_id <= 6U)
+        return motorJ[node_id]->TryGetTimingProfile(page, metadata);
+    if (hand != nullptr && node_id == hand->nodeID)
+        return hand->TryGetTimingProfile(page, metadata);
+    return false;
+}
+
 
 bool DummyRobot::TrySetExternalEnable(
     bool enable, const CanTxMetadata* metadata)

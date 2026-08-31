@@ -20,6 +20,7 @@ constexpr uint32_t kCapabilityControlFreshnessToken = 1U << 3U;
 constexpr uint32_t kCapabilityTimeSync = 1U << 4U;
 constexpr uint32_t kCapabilityCanDiagnostics = 1U << 5U;
 constexpr uint32_t kCapabilityCanDiagnosticsV2 = 1U << 6U;
+constexpr uint32_t kCapabilityCanTimingProfile = 1U << 7U;
 constexpr uint16_t kCanDiagnosticsFormatVersion = 2U;
 constexpr uint16_t kCanDiagnosticsPayloadSize = 380U;
 constexpr uint8_t kCanDiagnosticsWindowActive = 1U << 0U;
@@ -30,6 +31,16 @@ constexpr uint8_t kCanDiagnosticsWindowValid =
     kCanDiagnosticsWindowActive | kCanDiagnosticsEpochStable |
     kCanDiagnosticsMotorCountersMonotonic |
     kCanDiagnosticsMarkersComplete;
+constexpr uint16_t kCanTimingProfileFormatVersion = 1U;
+constexpr uint16_t kCanTimingProfilePayloadSize = 520U;
+constexpr uint8_t kCanTimingProfileWindowActive = 1U << 0U;
+constexpr uint8_t kCanTimingProfileEpochStable = 1U << 1U;
+constexpr uint8_t kCanTimingProfileMotorPagesComplete = 1U << 2U;
+constexpr uint8_t kCanTimingProfileLatencySamplesValid = 1U << 3U;
+constexpr uint8_t kCanTimingProfileWindowValid =
+    kCanTimingProfileWindowActive | kCanTimingProfileEpochStable |
+    kCanTimingProfileMotorPagesComplete |
+    kCanTimingProfileLatencySamplesValid;
 
 enum class MessageType : uint8_t
 {
@@ -45,6 +56,7 @@ enum class MessageType : uint8_t
     TargetKeepalive = 0x0A,
     TimeSync = 0x0B,
     GetCanDiagnostics = 0x0C,
+    GetCanTimingProfile = 0x0D,
     HelloAck = 0x81,
     State = 0x82,
     Ack = 0x83,
@@ -53,6 +65,7 @@ enum class MessageType : uint8_t
     Event = 0x86,
     TimeSyncAck = 0x87,
     CanDiagnostics = 0x88,
+    CanTimingProfile = 0x89,
 };
 
 enum class ControlMode : uint8_t
@@ -252,6 +265,45 @@ struct CanDiagnosticsPayload
     uint32_t reserved1[3];
 };
 
+// Independent A9 timing evidence. Keeping this separate from the fixed
+// diagnostics-v2 payload preserves binary protocol v5 and Raw Session v6.
+// Motor timing values use 0.1 us units; main-controller latency values use us.
+struct CanTimingProfilePayload
+{
+    uint16_t format_version;
+    uint16_t payload_size;
+    uint32_t session_epoch;
+    uint32_t window_reset_count;
+    uint64_t window_start_us;
+    uint64_t window_duration_us;
+    uint8_t motor_page_valid_mask[4];
+    uint8_t window_flags;
+    uint8_t reserved0[3];
+    uint32_t position_samples[7];
+    uint32_t position_p50_us[7];
+    uint32_t position_p99_us[7];
+    uint32_t position_p999_us[7];
+    uint32_t position_max_us[7];
+    uint32_t temperature_samples[7];
+    uint32_t temperature_p50_us[7];
+    uint32_t temperature_p99_us[7];
+    uint32_t temperature_p999_us[7];
+    uint32_t temperature_max_us[7];
+    uint8_t motor_flags[7];
+    uint8_t reserved_motor;
+    uint16_t motor_can_samples[7];
+    uint16_t motor_can_p999_x10_us[7];
+    uint16_t motor_can_max_x10_us[7];
+    uint16_t motor_jitter_p999_x10_us[7];
+    uint16_t motor_jitter_max_x10_us[7];
+    uint16_t motor_control_p999_x10_us[7];
+    uint16_t motor_control_max_x10_us[7];
+    uint16_t motor_missed_ticks[7];
+    uint32_t timing_request[7];
+    uint32_t timing_response[7];
+    uint32_t timing_timeout[7];
+};
+
 struct StatePayload
 {
     uint64_t mcu_time_us;
@@ -296,6 +348,8 @@ static_assert(sizeof(ActionProgressPayload) == 20, "ActionProgressPayload layout
 static_assert(sizeof(ActionProgressRecord) == 24, "ActionProgressRecord layout changed");
 static_assert(sizeof(CanDiagnosticsPayload) == kCanDiagnosticsPayloadSize,
               "CanDiagnosticsPayload layout changed");
+static_assert(sizeof(CanTimingProfilePayload) == kCanTimingProfilePayloadSize,
+              "CanTimingProfilePayload layout changed");
 static_assert(sizeof(StatePayload) == 508, "StatePayload layout changed");
 
 constexpr size_t kMaxPayload = kMaxDecodedFrame - sizeof(PacketHeader) - kCrcSize;

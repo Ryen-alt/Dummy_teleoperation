@@ -1,6 +1,7 @@
 #include "common_inc.h"
 #include "configurations.h"
 #include <can.h>
+#include "timing_profiler.h"
 #include "../../../can_transport_contract.h"
 
 
@@ -239,6 +240,18 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             _data[DUMMY_MOTOR_BUSOFF_OFFSET] = can_busoff_count;
             txHeader.StdId = (boardConfig.canNodeId << 7) | 0x25;
             CAN_Send(&txHeader, _data);
+        }
+            break;
+
+        case DUMMY_MOTOR_TIMING_COMMAND: // Get internal timing profile page
+        {
+            const uint8_t page = _len == 0U ? UINT8_MAX : _data[0];
+            if (MotorTimingProfilerEncodePage(page, _data))
+            {
+                txHeader.StdId = (boardConfig.canNodeId << 7) |
+                                 DUMMY_MOTOR_TIMING_COMMAND;
+                CAN_Send(&txHeader, _data);
+            }
         }
             break;
 

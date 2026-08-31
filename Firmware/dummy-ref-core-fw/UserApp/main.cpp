@@ -134,6 +134,10 @@ dummy::protocol::CanDispatchConfig MakeCanDispatchConfig()
     config.position_hz_per_node = dummy::generated_config::kCanPositionHzPerNode;
     config.temperature_hz_per_node =
         dummy::generated_config::kCanTemperatureHzPerNode;
+    // A9 internal profiler traffic is diagnostic-only and intentionally
+    // excluded from the robot configuration hash. One request per node per
+    // second refreshes all four motor pages every four seconds.
+    config.timing_profile_hz_per_node = 1U;
     config.response_timeout_us =
         dummy::generated_config::kCanResponseTimeoutUs;
     config.node_quiet_us = dummy::generated_config::kCanNodeQuietUs;
@@ -414,9 +418,15 @@ void ThreadCanDispatch(void* argument)
             stream_fail_closed = false;
             dummy::protocol::CancelPendingFeedbackRequests();
             if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
+            {
                 dummy::protocol::ResetMotorTransportDiagnostics();
+                dummy::protocol::SetCanTimingProfileActive(false);
+            }
             else if (diagnostics_window.active)
+            {
                 diagnostics_window.active = false;
+                dummy::protocol::SetCanTimingProfileActive(false);
+            }
             can_dispatch_scheduler.SetMode(dispatch_mode);
         }
 
@@ -424,6 +434,7 @@ void ThreadCanDispatch(void* argument)
             control_snapshot.session_epoch != diagnostics_window.session_epoch)
         {
             diagnostics_window.epoch_stable = false;
+            dummy::protocol::SetCanTimingProfileEpochStable(false);
             stream_fail_closed = true;
             dummy::protocol::RequestBinaryRuntimeHold();
         }
@@ -563,6 +574,8 @@ void ThreadCanDispatch(void* argument)
                     diagnostics_window.session_epoch =
                         control_snapshot.session_epoch;
                     diagnostics_window.start_us = completed_us;
+                    dummy::protocol::ResetCanTimingProfile(
+                        control_snapshot.session_epoch, completed_us);
                     diagnostics_window.motor_marker_mask =
                         motor_diagnostics.valid_mask;
                     diagnostics_window.scheduler =
@@ -607,6 +620,17 @@ void ThreadCanDispatch(void* argument)
                     max_rx_dispatch_latency_us = 0U;
                     continue;
                 }
+                if (completion.status == CanTxCompletionStatus::Complete &&
+                    completion.metadata.channel == CanTxChannel::Position)
+                    dummy::protocol::RecordPositionTimingStart(
+                        completion.metadata.node_id,
+                        static_cast<uint32_t>(completed_us));
+                else if (
+                    completion.status == CanTxCompletionStatus::Complete &&
+                    completion.metadata.channel == CanTxChannel::Temperature)
+                    dummy::protocol::RecordTemperatureTimingStart(
+                        completion.metadata.node_id,
+                        static_cast<uint32_t>(completed_us));
                 if (completion.metadata.channel != CanTxChannel::Target ||
                     completion.metadata.action_sequence == 0U)
                     continue;
@@ -704,6 +728,10 @@ void ThreadCanDispatch(void* argument)
                 coherent.sweep_id, coherent_now_us, earliest_sample_us);
         }
         const auto step = can_dispatch_scheduler.Next(now_us, responses);
+        if (step.accepted_timing_profile_node_id != 0U)
+            (void) dummy::protocol::AcceptMotorTimingProfile(
+                step.accepted_timing_profile_node_id,
+                step.accepted_timing_profile_page);
         if (step.timed_out_final)
         {
             if (step.timed_out_action ==
@@ -760,6 +788,9 @@ void ThreadCanDispatch(void* argument)
             tx_metadata.channel = CanTxChannel::Position;
         else if (step.action == dummy::protocol::CanDispatchAction::TemperatureRequest)
             tx_metadata.channel = CanTxChannel::Temperature;
+        else if (step.action ==
+                 dummy::protocol::CanDispatchAction::MotorTimingRequest)
+            tx_metadata.channel = CanTxChannel::TimingProfile;
         else if (step.action ==
                  dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest)
             tx_metadata.channel = CanTxChannel::Diagnostics;
@@ -839,6 +870,10 @@ void ThreadCanDispatch(void* argument)
             case dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest:
                 queued = robot.TryRequestTemperatureFeedback(
                     step.node_id, &tx_metadata);
+                break;
+            case dummy::protocol::CanDispatchAction::MotorTimingRequest:
+                queued = robot.TryRequestTimingProfile(
+                    step.node_id, step.timing_profile_page, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::ConfigureGripperVelocity:
                 if (dummy::protocol::ReadMotorTransportDiagnostics().valid_mask !=
@@ -1179,6 +1214,8 @@ void ThreadCanDispatch(void* argument)
             dummy::protocol::RequestBinaryRuntimeHold();
         }
         dummy::protocol::PublishCanDiagnostics(can_diagnostics);
+        dummy::protocol::PublishCanTimingProfile(
+            dummy::protocol::BinaryControlMonotonicMicros(), diagnostics);
     }
 }
 

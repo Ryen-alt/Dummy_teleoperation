@@ -3,6 +3,7 @@
 #include "Platform/Utils/st_hardware.h"
 #include <can.h>
 #include <tim.h>
+#include "protocols/timing_profiler.h"
 
 
 /* Component Definitions -----------------------------------------------------*/
@@ -18,6 +19,7 @@ Led statusLed;
 /* Main Entry ----------------------------------------------------------------*/
 void Main()
 {
+    MotorTimingProfilerInit();
     uint64_t serialNum = GetSerialNumber();
     uint16_t defaultNodeID = 0;
     //ID0 is PA8 -->  Switch 4
@@ -113,6 +115,7 @@ void Main()
             eeprom.put(0, boardConfig);
             HAL_NVIC_SystemReset();
         }
+        MotorTimingProfilerRefresh();
     }
 }
 
@@ -150,12 +153,14 @@ extern "C" void Tim1Callback100Hz()
 
 extern "C" void Tim4Callback20kHz()
 {
+    const uint32_t timing_start = MotorTimingProfilerControlBegin();
     __HAL_TIM_CLEAR_IT(&htim4, TIM_IT_UPDATE);
 
     if (encoderCalibrator.isTriggered)
         encoderCalibrator.Tick20kHz();
     else
         motor.Tick20kHz();
+    MotorTimingProfilerControlEnd(timing_start);
 }
 
 

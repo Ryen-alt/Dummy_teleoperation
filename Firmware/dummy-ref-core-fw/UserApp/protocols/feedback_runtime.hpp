@@ -22,14 +22,19 @@ struct MotorTransportDiagnostics
 // Firmware-only bridge around the pure C++ monitor. The CAN dispatcher is the
 // sole writer; RX timestamps are captured in the ISR and parsed in task context.
 void RecordPositionFeedbackRequest(uint8_t node_id, uint32_t sweep_id = 0U);
+void RecordPositionTimingStart(uint8_t node_id, uint32_t completed_us);
 bool RecordPositionFeedbackResponse(uint8_t node_id, uint32_t received_us);
 void RecordPositionFeedbackTimeout(uint8_t node_id);
 void RecordTemperatureFeedbackRequest(uint8_t node_id);
+void RecordTemperatureTimingStart(uint8_t node_id, uint32_t completed_us);
 void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c,
                                        uint32_t received_us);
 void RecordMotorTransportDiagnostics(uint8_t node_id, const uint8_t* data,
                                      uint32_t length);
 void RecordTemperatureFeedbackTimeout(uint8_t node_id);
+bool RecordMotorTimingProfile(uint8_t node_id, const uint8_t* data,
+                              uint32_t length);
+bool AcceptMotorTimingProfile(uint8_t node_id, uint8_t page);
 FeedbackResponseEvents ConsumeFeedbackResponseEvents();
 void CancelPendingFeedbackRequests();
 void PublishFeedbackSnapshot(uint32_t now_us);
@@ -56,6 +61,12 @@ void PublishCanFeedbackReady(bool ready);
 bool ReadCanFeedbackReady();
 void PublishCanDiagnostics(const CanDiagnosticsPayload& diagnostics);
 CanDiagnosticsPayload ReadCanDiagnostics();
+void ResetCanTimingProfile(uint32_t session_epoch, uint64_t start_us);
+void SetCanTimingProfileActive(bool active);
+void SetCanTimingProfileEpochStable(bool stable);
+void PublishCanTimingProfile(uint64_t now_us,
+                             const CanDispatchDiagnostics& scheduler);
+CanTimingProfilePayload ReadCanTimingProfile();
 
 } // namespace dummy::protocol
 

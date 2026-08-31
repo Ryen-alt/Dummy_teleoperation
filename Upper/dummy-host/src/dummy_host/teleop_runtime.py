@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from threading import Condition, Event, Lock, Thread
 from typing import Callable, Protocol
 
@@ -14,6 +14,7 @@ from .domain import ActionLifecycleUpdate, ActionStage, EpisodeError, EpisodeMan
 from .kinematics.calibration import CartesianCalibration
 from .kinematics.contracts import KinematicsBackend, KinematicsError
 from .recording import ControlTickTiming, RecorderBackpressure, SessionRecorder
+from .protocol import CAPABILITY_CAN_TIMING_PROFILE
 from .robot_driver import ActionCredit, DummyRobot, RobotError
 from .scheduler import FixedRateScheduler, ScheduledTick, SchedulerStats
 from .schema import ControlMode, RobotState
@@ -144,6 +145,11 @@ class _EvidenceTelemetryWorker:
     def _run(self) -> None:
         next_sync = 0.0
         next_diagnostics = 0.0
+        next_timing_profile = (
+            time.monotonic() + 5.0
+            if self.robot.firmware_capabilities & CAPABILITY_CAN_TIMING_PROFILE
+            else float("inf")
+        )
         try:
             while not self.stop.is_set():
                 now = time.monotonic()
@@ -159,9 +165,21 @@ class _EvidenceTelemetryWorker:
                         host_time_ns=self.clock_ns(),
                     )
                     next_diagnostics = now + 1.0
+                if (
+                    self.robot.firmware_capabilities
+                    & CAPABILITY_CAN_TIMING_PROFILE
+                    and now >= next_timing_profile
+                ):
+                    self.recorder.record_event(
+                        "can_timing_profile",
+                        monotonic_ns=self.clock_ns(),
+                        payload=asdict(self.robot.read_can_timing_profile()),
+                    )
+                    next_timing_profile = now + 5.0
                 wait_s = max(
                     0.001,
-                    min(next_sync, next_diagnostics) - time.monotonic(),
+                    min(next_sync, next_diagnostics, next_timing_profile)
+                    - time.monotonic(),
                 )
                 self.stop.wait(wait_s)
         except BaseException as exc:

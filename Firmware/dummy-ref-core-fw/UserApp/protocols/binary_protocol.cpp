@@ -192,6 +192,7 @@ bool IsKnownMessage(uint8_t raw_type)
         case MessageType::TargetKeepalive:
         case MessageType::TimeSync:
         case MessageType::GetCanDiagnostics:
+        case MessageType::GetCanTimingProfile:
         case MessageType::HelloAck:
         case MessageType::State:
         case MessageType::Ack:
@@ -200,6 +201,7 @@ bool IsKnownMessage(uint8_t raw_type)
         case MessageType::Event:
         case MessageType::TimeSyncAck:
         case MessageType::CanDiagnostics:
+        case MessageType::CanTimingProfile:
             return true;
     }
     return false;

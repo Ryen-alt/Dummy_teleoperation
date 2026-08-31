@@ -1,6 +1,7 @@
 ﻿#include "common_inc.h"
 
 #include "feedback_runtime.hpp"
+#include "../../../can_transport_contract.h"
 
 extern DummyRobot robot;
 
@@ -57,6 +58,10 @@ void OnCanMessage(CAN_context* canCtx, const CAN_RxHeaderTypeDef* rxHeader,
                 dummy::protocol::RecordMotorTransportDiagnostics(
                     id, data, rxHeader->DLC);
             }
+            break;
+        case DUMMY_MOTOR_TIMING_COMMAND:
+            dummy::protocol::RecordMotorTimingProfile(
+                id, data, rxHeader->DLC);
             break;
         default:
             break;

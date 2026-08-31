@@ -283,6 +283,22 @@ def test_multi_usb_packet_diagnostics_does_not_hide_reliable_event() -> None:
     assert decoded_diagnostics.payload == b"d" * 380
 
 
+def test_fixed_520_byte_can_timing_profile_decodes_across_usb_packets() -> None:
+    transport = SerialTransport("unused")
+    profile = encode_packet(
+        Packet(MessageType.CAN_TIMING_PROFILE, 1, 42, 3, b"t" * 520)
+    )
+    chunks = [profile[index : index + 64] for index in range(0, len(profile), 64)]
+    transport._serial = _ChunkSerial(transport, chunks)
+
+    transport._read_loop()
+
+    decoded = transport.receive(timeout=0)
+    assert decoded is not None
+    assert decoded.message_type is MessageType.CAN_TIMING_PROFILE
+    assert decoded.payload == b"t" * 520
+
+
 def _opened_transport(**kwargs) -> SerialTransport:
     transport = SerialTransport("unused", **kwargs)
     transport._serial = object()
@@ -342,21 +358,26 @@ def test_motion_target_precedes_thirty_two_pending_diagnostics_requests() -> Non
     assert queued.message_type is MessageType.SET_JOINT_TARGET
 
 
-def test_time_sync_and_diagnostics_each_allow_only_one_pending_request() -> None:
+def test_each_maintenance_type_allows_only_one_pending_request() -> None:
     transport = _opened_transport()
     transport.send(Packet(MessageType.TIME_SYNC, 1, 1, 1))
     transport.send(Packet(MessageType.GET_CAN_DIAGNOSTICS, 1, 2, 2))
+    transport.send(Packet(MessageType.GET_CAN_TIMING_PROFILE, 1, 3, 3))
 
     with pytest.raises(TransportError, match="TIME_SYNC is already pending"):
-        transport.send(Packet(MessageType.TIME_SYNC, 1, 3, 3))
+        transport.send(Packet(MessageType.TIME_SYNC, 1, 4, 4))
     with pytest.raises(
         TransportError, match="GET_CAN_DIAGNOSTICS is already pending"
     ):
-        transport.send(Packet(MessageType.GET_CAN_DIAGNOSTICS, 1, 4, 4))
+        transport.send(Packet(MessageType.GET_CAN_DIAGNOSTICS, 1, 5, 5))
+    with pytest.raises(
+        TransportError, match="GET_CAN_TIMING_PROFILE is already pending"
+    ):
+        transport.send(Packet(MessageType.GET_CAN_TIMING_PROFILE, 1, 6, 6))
 
     diagnostics = transport.diagnostics()
-    assert diagnostics.maintenance_tx_depth == 2
-    assert diagnostics.maintenance_duplicate_rejected == 2
+    assert diagnostics.maintenance_tx_depth == 3
+    assert diagnostics.maintenance_duplicate_rejected == 3
 
 
 def test_target_is_not_infinitely_starved_by_lease_heartbeats() -> None:

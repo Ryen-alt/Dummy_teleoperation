@@ -8,6 +8,8 @@
 #include "can_feedback_monitor.hpp"
 #include "feedback_safety_supervisor.hpp"
 #include "feedback_poll_scheduler.hpp"
+#include "can_timing_profiler.hpp"
+#include "../../../can_transport_contract.h"
 #include "published_double_buffer.hpp"
 #include "robot_config_generated.hpp"
 #include "spsc_ring.hpp"
@@ -579,6 +581,34 @@ void TestCanDiagnosticsAreReadOnlyAfterConfiguredHello()
            ResultCode::NoLease);
 }
 
+void TestCanTimingProfileIsReadOnlyAfterConfiguredHello()
+{
+    ControlSession session(MakeConfig(false), "test-fw");
+    Packet request = MakePacket(MessageType::GetCanTimingProfile,
+                                0x11223344U, 2U);
+    ProcessResult result = session.Process(request, 500U);
+    assert(ResponseCode(result) == ResultCode::BadSession);
+    assert(!result.can_timing_profile_requested);
+
+    const Packet hello = MakeConfiguredHello();
+    const ProcessResult hello_result = session.Process(hello, 1000U);
+    HelloAckPayload hello_ack{};
+    std::memcpy(&hello_ack, hello_result.response.payload.data(),
+                sizeof(hello_ack));
+    assert((hello_ack.capabilities & kCapabilityCanTimingProfile) != 0U);
+    request.header.session_id = hello.header.session_id;
+    request.header.sequence = hello.header.sequence + 1U;
+    result = session.Process(request, 2000U);
+    assert(ResponseCode(result) == ResultCode::Ok);
+    assert(result.can_timing_profile_requested);
+    assert(!session.lease_active());
+
+    request.header.payload_length = 1U;
+    result = session.Process(request, 3000U);
+    assert(ResponseCode(result) == ResultCode::BadLength);
+    assert(!result.can_timing_profile_requested);
+}
+
 void TestSessionTargetAndTimeout()
 {
     ControlSession session(MakeConfig(true), "test-fw");
@@ -594,6 +624,7 @@ void TestSessionTargetAndTimeout()
     assert((hello_ack.capabilities & kCapabilityTimeSync) != 0U);
     assert((hello_ack.capabilities & kCapabilityCanDiagnostics) != 0U);
     assert((hello_ack.capabilities & kCapabilityCanDiagnosticsV2) != 0U);
+    assert((hello_ack.capabilities & kCapabilityCanTimingProfile) != 0U);
 
     Packet acquire = MakePacket(MessageType::AcquireControl, hello.header.session_id,
                                 hello.header.sequence + 1);
@@ -1220,6 +1251,232 @@ uint32_t CompleteStreamTransition(CanDispatchScheduler& scheduler)
     return now_us;
 }
 
+void TestCanTimingProfileSchedulerPagesAndTimeouts()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.position_hz_per_node = 0U;
+    config.temperature_hz_per_node = 0U;
+    config.timing_profile_hz_per_node = 1U;
+    config.response_timeout_us = 1000U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    FeedbackResponseEvents responses{};
+    std::vector<uint8_t> nodes;
+    std::vector<uint8_t> pages;
+    for (size_t attempt = 0U; attempt < 20000U && pages.size() < 8U;
+         ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, now_us);
+            if (step.action == CanDispatchAction::MotorTimingRequest)
+            {
+                nodes.push_back(step.node_id);
+                pages.push_back(step.timing_profile_page);
+                responses.timing_profile_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+                responses.timing_profile_page[step.node_id - 1U] =
+                    step.timing_profile_page;
+            }
+        }
+        now_us += 1000U;
+    }
+    assert((nodes == std::vector<uint8_t>{1U, 2U, 3U, 4U, 5U, 6U, 7U, 1U}));
+    assert((pages == std::vector<uint8_t>{0U, 0U, 0U, 0U, 0U, 0U, 0U, 1U}));
+    const auto completed = scheduler.diagnostics();
+    assert(completed.timing_profile_requested[0] == 2U);
+    assert(completed.timing_profile_responded[0] == 1U);
+
+    CanDispatchStep pending{};
+    for (size_t attempt = 0U; attempt < 2000U; ++attempt)
+    {
+        pending = scheduler.Next(now_us);
+        if (pending.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(pending, now_us);
+            if (pending.action == CanDispatchAction::MotorTimingRequest)
+                break;
+        }
+        now_us += 1000U;
+    }
+    assert(pending.action == CanDispatchAction::MotorTimingRequest);
+    const CanDispatchStep timeout = scheduler.Next(
+        now_us + config.response_timeout_us);
+    assert(timeout.timed_out_final);
+    assert(timeout.timed_out_action == CanDispatchAction::MotorTimingRequest);
+    assert(scheduler.diagnostics().timing_profile_timed_out[
+        pending.node_id - 1U] == 1U);
+}
+
+void TestCanTimingProfileRejectsLateWrongPage()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.position_hz_per_node = 0U;
+    config.temperature_hz_per_node = 0U;
+    config.timing_profile_hz_per_node = 1U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    CanDispatchStep request{};
+    for (size_t attempt = 0U; attempt < 2000U; ++attempt)
+    {
+        request = scheduler.Next(now_us);
+        if (request.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(request, now_us);
+            if (request.action == CanDispatchAction::MotorTimingRequest)
+                break;
+        }
+        now_us += 1000U;
+    }
+    assert(request.action == CanDispatchAction::MotorTimingRequest);
+    assert(request.timing_profile_page == 0U);
+
+    FeedbackResponseEvents stale{};
+    stale.timing_profile_mask = static_cast<uint8_t>(
+        1U << (request.node_id - 1U));
+    stale.timing_profile_page[request.node_id - 1U] = 1U;
+    const CanDispatchStep wrong_page = scheduler.Next(now_us + 1U, stale);
+    assert(wrong_page.accepted_timing_profile_node_id == 0U);
+    assert(scheduler.diagnostics().query_pending);
+    assert(scheduler.diagnostics().unexpected_response_count == 1U);
+
+    FeedbackResponseEvents wrong_node{};
+    const uint8_t other_node = request.node_id == kActuatorNodeCount
+        ? 1U : static_cast<uint8_t>(request.node_id + 1U);
+    wrong_node.timing_profile_mask = static_cast<uint8_t>(
+        1U << (other_node - 1U));
+    wrong_node.timing_profile_page[other_node - 1U] = 0U;
+    const CanDispatchStep rejected_node = scheduler.Next(
+        now_us + 2U, wrong_node);
+    assert(rejected_node.accepted_timing_profile_node_id == 0U);
+    assert(scheduler.diagnostics().query_pending);
+    assert(scheduler.diagnostics().unexpected_response_count == 2U);
+
+    FeedbackResponseEvents matched{};
+    matched.timing_profile_mask = stale.timing_profile_mask;
+    matched.timing_profile_page[request.node_id - 1U] = 0U;
+    const CanDispatchStep accepted = scheduler.Next(now_us + 3U, matched);
+    assert(accepted.accepted_timing_profile_node_id == request.node_id);
+    assert(accepted.accepted_timing_profile_page == 0U);
+    assert(!scheduler.diagnostics().query_pending);
+
+    CanDispatchConfig late_config = config;
+    late_config.response_timeout_us = 10U;
+    CanDispatchScheduler late_scheduler(late_config);
+    uint32_t late_now_us = CompleteStreamTransition(late_scheduler);
+    CanDispatchStep late_request{};
+    for (size_t attempt = 0U; attempt < 2000U; ++attempt)
+    {
+        late_request = late_scheduler.Next(late_now_us);
+        if (late_request.action != CanDispatchAction::None)
+        {
+            late_scheduler.OnQueued(late_request, late_now_us);
+            if (late_request.action == CanDispatchAction::MotorTimingRequest)
+                break;
+        }
+        late_now_us += 1000U;
+    }
+    assert(late_request.action == CanDispatchAction::MotorTimingRequest);
+    const CanDispatchStep timeout = late_scheduler.Next(late_now_us + 10U);
+    assert(timeout.timed_out_action == CanDispatchAction::MotorTimingRequest);
+    FeedbackResponseEvents late{};
+    late.timing_profile_mask = static_cast<uint8_t>(
+        1U << (late_request.node_id - 1U));
+    late.timing_profile_page[late_request.node_id - 1U] =
+        late_request.timing_profile_page;
+    const CanDispatchStep rejected_late = late_scheduler.Next(
+        late_now_us + 11U, late);
+    assert(rejected_late.accepted_timing_profile_node_id == 0U);
+    assert(late_scheduler.diagnostics().unexpected_response_count == 1U);
+}
+
+void TestCanTimingProfilerBuildsFixedEvidencePayload()
+{
+    CanTimingProfiler profiler;
+    profiler.Reset(77U, 1000000U);
+    uint32_t now_us = 10U;
+    for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
+    {
+        for (uint32_t sample = 0U; sample < 1000U; ++sample)
+        {
+            profiler.RecordPositionRequest(node_id, now_us);
+            profiler.RecordPositionResponse(
+                node_id, now_us + 100U + node_id);
+            now_us += 200U;
+        }
+        for (uint32_t sample = 0U; sample < 100U; ++sample)
+        {
+            profiler.RecordTemperatureRequest(node_id, now_us);
+            profiler.RecordTemperatureResponse(
+                node_id, now_us + 200U + node_id);
+            now_us += 300U;
+        }
+        constexpr std::array<uint8_t, 4U> kOutOfOrderPages{2U, 0U, 3U, 1U};
+        for (const uint8_t page : kOutOfOrderPages)
+        {
+            const uint16_t first = static_cast<uint16_t>(100U + page);
+            const uint16_t second = static_cast<uint16_t>(200U + page);
+            const uint8_t data[8]{
+                0xA9U, page, 0x0FU, 0U,
+                static_cast<uint8_t>(first),
+                static_cast<uint8_t>(first >> 8U),
+                static_cast<uint8_t>(second),
+                static_cast<uint8_t>(second >> 8U)};
+            assert(profiler.RecordMotorPage(node_id, data, sizeof(data)));
+        }
+    }
+    CanDispatchDiagnostics scheduler{};
+    scheduler.timing_profile_requested.fill(4U);
+    scheduler.timing_profile_responded.fill(4U);
+    const CanTimingProfilePayload payload = profiler.MakePayload(
+        2000000U, scheduler);
+    assert(payload.format_version == kCanTimingProfileFormatVersion);
+    assert(payload.payload_size == sizeof(CanTimingProfilePayload));
+    assert(payload.session_epoch == 77U);
+    assert(payload.window_flags == kCanTimingProfileWindowValid);
+    for (size_t index = 0U; index < kActuatorNodeCount; ++index)
+    {
+        assert(payload.position_samples[index] == 1000U);
+        assert(payload.temperature_samples[index] == 100U);
+        assert(payload.position_p999_us[index] >= 101U);
+        assert(payload.temperature_p999_us[index] >= 201U);
+        assert(payload.motor_flags[index] == 0x0FU);
+        assert(payload.motor_can_samples[index] == 103U);
+        assert(payload.motor_missed_ticks[index] == 203U);
+        assert(payload.timing_request[index] == 4U);
+        assert(payload.timing_response[index] == 4U);
+        assert(payload.timing_timeout[index] == 0U);
+    }
+
+    CanTimingProfiler incomplete;
+    incomplete.Reset(78U, 1000000U);
+    for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
+    {
+        for (uint8_t page = 0U; page < DUMMY_MOTOR_TIMING_PAGE_COUNT; ++page)
+        {
+            if (node_id == kActuatorNodeCount &&
+                page == DUMMY_MOTOR_TIMING_PAGE_COUNTS)
+                continue;
+            const uint8_t data[8]{0xA9U, page, 0x0FU, 0U, 1U, 0U, 2U, 0U};
+            assert(incomplete.RecordMotorPage(node_id, data, sizeof(data)));
+        }
+    }
+    const uint8_t valid_data[8]{0xA9U, 0U, 0x0FU, 0U, 1U, 0U, 2U, 0U};
+    assert(!incomplete.RecordMotorPage(0U, valid_data, sizeof(valid_data)));
+    assert(!incomplete.RecordMotorPage(
+        kActuatorNodeCount + 1U, valid_data, sizeof(valid_data)));
+    const CanTimingProfilePayload incomplete_payload = incomplete.MakePayload(
+        2000000U, scheduler);
+    assert(incomplete_payload.motor_page_valid_mask[
+        DUMMY_MOTOR_TIMING_PAGE_COUNTS] == 0x3FU);
+    assert((incomplete_payload.window_flags &
+            kCanTimingProfileMotorPagesComplete) == 0U);
+}
+
 void TestCanDispatcherPreflightTimeoutStopsEnable()
 {
     CanDispatchConfig config{};
@@ -1692,6 +1949,9 @@ int main()
     TestCanDispatcherSweepIdentityAdvancesPastObservedHardwareBoundary();
     TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion();
     TestCanDispatcherPreflightTimeoutStopsEnable();
+    TestCanTimingProfileSchedulerPagesAndTimeouts();
+    TestCanTimingProfileRejectsLateWrongPage();
+    TestCanTimingProfilerBuildsFixedEvidencePayload();
     TestCanDispatcherDoesNotBurstAfterDeferredDeadline();
     TestCanDispatcherRejectsInvalidRatePlanWithoutFallback();
     TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery();
@@ -1706,6 +1966,7 @@ int main()
     TestAcceptanceConfigurationAllowsOnlyTeleop();
     TestConfiguredButExecutionLockedCannotAcquire();
     TestCanDiagnosticsAreReadOnlyAfterConfiguredHello();
+    TestCanTimingProfileIsReadOnlyAfterConfiguredHello();
     TestSessionTargetAndTimeout();
     TestTargetKeepaliveIsExactAndControlBound();
     TestTelemetryMovesToLatestHelloAfterRelease();

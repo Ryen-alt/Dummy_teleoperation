@@ -17,6 +17,7 @@ enum class CanTxChannel : uint8_t
     Diagnostics = 6,
     Configuration = 7,
     EnableTransition = 8,
+    TimingProfile = 9,
 };
 
 enum class CanTxCompletionStatus : uint8_t

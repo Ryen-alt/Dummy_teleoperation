@@ -81,6 +81,16 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
         result.can_diagnostics_requested = true;
         return result;
     }
+    if (message_type == MessageType::GetCanTimingProfile)
+    {
+        if (!hello_valid_ || request.header.session_id != hello_session_id_)
+            return Ack(request, ResultCode::BadSession);
+        if (request.header.payload_length != 0U)
+            return Ack(request, ResultCode::BadLength);
+        ProcessResult result = Ack(request);
+        result.can_timing_profile_requested = true;
+        return result;
+    }
     if (message_type == MessageType::EmergencyStop)
     {
         SetFault(kFaultEmergencyStop);
@@ -403,7 +413,8 @@ ProcessResult ControlSession::Hello(const Packet& request)
         kCapabilityMultiChannelSequence | kCapabilityTargetKeepalive |
         kCapabilityCanTxCompleteExact |
         kCapabilityControlFreshnessToken | kCapabilityTimeSync |
-        kCapabilityCanDiagnostics | kCapabilityCanDiagnosticsV2;
+        kCapabilityCanDiagnostics | kCapabilityCanDiagnosticsV2 |
+        kCapabilityCanTimingProfile;
     std::copy(firmware_version_.begin(), firmware_version_.end(), response.firmware_version);
     WritePayload(output.response, response);
     return output;

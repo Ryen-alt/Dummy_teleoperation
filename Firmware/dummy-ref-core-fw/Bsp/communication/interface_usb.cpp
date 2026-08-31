@@ -527,6 +527,17 @@ void ProcessBinaryBytes(const uint8_t* data, size_t length, uint64_t now_us)
                 result.response.payload.data(), &diagnostics,
                 sizeof(diagnostics));
         }
+        if (result.can_timing_profile_requested)
+        {
+            const auto timing_profile =
+                dummy::protocol::ReadCanTimingProfile();
+            result.response.header.message_type = static_cast<uint8_t>(
+                dummy::protocol::MessageType::CanTimingProfile);
+            result.response.header.payload_length = sizeof(timing_profile);
+            std::memcpy(
+                result.response.payload.data(), &timing_profile,
+                sizeof(timing_profile));
+        }
         SendBinaryPacket(result.response, now_us);
     }
     binary_state_stream_enabled = binary_session.hello_valid();

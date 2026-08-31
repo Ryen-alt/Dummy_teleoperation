@@ -28,10 +28,12 @@ from .protocol import (
     CAPABILITY_TIME_SYNC,
     CAPABILITY_CAN_DIAGNOSTICS,
     CAPABILITY_CAN_DIAGNOSTICS_V2,
+    CAPABILITY_CAN_TIMING_PROFILE,
     ACK_DETAIL_FEEDBACK_NOT_READY,
     ACQUIRE_CONTROL,
     ActionProgressStage,
     CanDiagnostics,
+    CanTimingProfile,
     SET_MODE,
     MessageType,
     Packet,
@@ -44,6 +46,7 @@ from .protocol import (
     unpack_ack,
     unpack_action_progress,
     unpack_can_diagnostics,
+    unpack_can_timing_profile,
     unpack_hello_ack,
     unpack_state,
     unpack_time_sync_ack,
@@ -224,6 +227,7 @@ class DummyRobot:
                     | CAPABILITY_TIME_SYNC
                     | CAPABILITY_CAN_DIAGNOSTICS
                     | CAPABILITY_CAN_DIAGNOSTICS_V2
+                    | CAPABILITY_CAN_TIMING_PROFILE
                 )
                 != (
                     CAPABILITY_MULTI_CHANNEL_SEQUENCE
@@ -233,6 +237,7 @@ class DummyRobot:
                     | CAPABILITY_TIME_SYNC
                     | CAPABILITY_CAN_DIAGNOSTICS
                     | CAPABILITY_CAN_DIAGNOSTICS_V2
+                    | CAPABILITY_CAN_TIMING_PROFILE
                 )
             ):
                 raise ConfigError(
@@ -585,6 +590,17 @@ class DummyRobot:
             )
         return unpack_can_diagnostics(response.payload)
 
+    def read_can_timing_profile(self) -> CanTimingProfile:
+        self._require_connected()
+        if not self.firmware_capabilities & CAPABILITY_CAN_TIMING_PROFILE:
+            raise RobotError("firmware does not advertise CAN timing profile v1")
+        response = self._request(MessageType.GET_CAN_TIMING_PROFILE)
+        if response.message_type != MessageType.CAN_TIMING_PROFILE:
+            raise RobotError(
+                f"expected CAN_TIMING_PROFILE, received {response.message_type.name}"
+            )
+        return unpack_can_timing_profile(response.payload)
+
     def heartbeat(self) -> None:
         self._require_control()
         self._expect_ack(self._request(MessageType.HEARTBEAT), MessageType.HEARTBEAT)
@@ -713,7 +729,8 @@ class DummyRobot:
             | CAPABILITY_CONTROL_FRESHNESS_TOKEN
             | CAPABILITY_TIME_SYNC
             | CAPABILITY_CAN_DIAGNOSTICS
-            | CAPABILITY_CAN_DIAGNOSTICS_V2,
+            | CAPABILITY_CAN_DIAGNOSTICS_V2
+            | CAPABILITY_CAN_TIMING_PROFILE,
         )
         last_timeout: RobotError | None = None
         while True:

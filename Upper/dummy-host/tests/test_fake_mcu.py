@@ -10,6 +10,7 @@ from dummy_host.fake_mcu import FakeMcuTransport
 from dummy_host.protocol import (
     ACTION_PROGRESS,
     CAPABILITY_CAN_DIAGNOSTICS_V2,
+    CAPABILITY_CAN_TIMING_PROFILE,
     ActionProgressStage,
     MessageType,
     Packet,
@@ -109,6 +110,15 @@ class V222WithoutCanDiagnosticsV2(FakeMcuTransport):
 class CurrentV222RealTransport(FakeMcuTransport):
     is_simulated = False
     firmware_version = "dummy-ref-v2.2.2"
+
+
+class V222WithoutCanTimingProfile(FakeMcuTransport):
+    is_simulated = False
+    firmware_version = "dummy-ref-v2.2.2"
+    firmware_capabilities = (
+        FakeMcuTransport.firmware_capabilities
+        & ~CAPABILITY_CAN_TIMING_PROFILE
+    )
 
 
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
@@ -252,6 +262,13 @@ def test_v22_firmware_is_rejected_by_v222_host(config) -> None:
 
 def test_v222_firmware_without_diagnostics_v2_is_rejected(config) -> None:
     robot = DummyRobot(config, V222WithoutCanDiagnosticsV2(config))
+    with pytest.raises(ConfigError, match="missing required protocol-v5"):
+        robot.connect()
+    assert not robot.is_connected
+
+
+def test_v222_firmware_without_can_timing_profile_is_rejected(config) -> None:
+    robot = DummyRobot(config, V222WithoutCanTimingProfile(config))
     with pytest.raises(ConfigError, match="missing required protocol-v5"):
         robot.connect()
     assert not robot.is_connected
