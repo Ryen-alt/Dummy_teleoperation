@@ -285,7 +285,19 @@ class DummyRobot:
                     "real TELEOP execution requires the production gate or an "
                     "explicit acceptance session"
                 )
-        self.wait_for_feedback_ready()
+        try:
+            self.wait_for_feedback_ready(
+                state_validator=lambda state: not self._execution_bounds_violations(state)
+            )
+        except RobotError as exc:
+            state = self.read_state()
+            violations = self._execution_bounds_violations(state)
+            if violations:
+                raise RobotError(
+                    "cannot acquire control: feedback outside configured hard limits: "
+                    + "; ".join(violations)
+                ) from exc
+            raise
         self._expect_ack(
             self._request(MessageType.ACQUIRE_CONTROL, ACQUIRE_CONTROL.pack(self.config.lease_timeout_ms)),
             MessageType.ACQUIRE_CONTROL,
@@ -299,6 +311,38 @@ class DummyRobot:
         self._active_action_sequence = None
         self._clear_action_credit()
         self.action_gateway.reset()
+
+    def _execution_bounds_violations(self, state: RobotState) -> tuple[str, ...]:
+        violations: list[str] = []
+        if not state.position_valid or state.position.shape != (7,):
+            violations.append("joint position feedback is invalid")
+            return tuple(violations)
+
+        for index, (value, lower, upper) in enumerate(
+            zip(
+                state.position[:6],
+                self.config.joint_limit_min_rad,
+                self.config.joint_limit_max_rad,
+                strict=True,
+            ),
+            1,
+        ):
+            if value < lower or value > upper:
+                violations.append(
+                    f"joint{index}={float(value):.6f} outside "
+                    f"[{float(lower):.6f}, {float(upper):.6f}]"
+                )
+
+        gripper_min, gripper_max = self.config.gripper_range
+        gripper = state.position[6]
+        if not state.gripper_valid:
+            violations.append("gripper position feedback is invalid")
+        elif gripper < gripper_min or gripper > gripper_max:
+            violations.append(
+                f"gripper={float(gripper):.6f} outside "
+                f"[{float(gripper_min):.6f}, {float(gripper_max):.6f}]"
+            )
+        return tuple(violations)
 
     def wait_for_feedback_ready(
         self,

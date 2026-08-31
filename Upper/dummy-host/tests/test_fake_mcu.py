@@ -150,6 +150,18 @@ def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
         assert robot.read_state().mode == ControlMode.HOLD
 
 
+def test_control_acquire_rejects_feedback_outside_hard_limits(config) -> None:
+    transport = FakeMcuTransport(config)
+    transport._position[1] = np.float32(config.joint_limit_min_rad[1] - 0.01)
+    robot = DummyRobot(config, transport, connect_timeout_s=0.1)
+
+    with robot:
+        with pytest.raises(RobotError, match=r"joint2=.*outside"):
+            robot.acquire_control(ControlMode.TELEOP)
+        assert robot.read_state().mode == ControlMode.HOLD
+        assert not transport._lease
+
+
 def test_protocol_v5_time_sync_and_can_diagnostics(config) -> None:
     robot = DummyRobot(config, FakeMcuTransport(config))
     with robot:
