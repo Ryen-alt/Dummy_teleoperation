@@ -68,6 +68,7 @@ void PushTxCompletion(CAN_context* ctx, CanTxCompletionStatus status,
 {
     if (ctx == nullptr)
         return;
+    const uint32_t completed_us = micros();
     const uint8_t write = ctx->tx_completion_write;
     const uint8_t next = static_cast<uint8_t>(
         (write + 1U) % kCanTxCompletionCapacity);
@@ -81,6 +82,7 @@ void PushTxCompletion(CAN_context* ctx, CanTxCompletionStatus status,
         completion = {};
         if (ctx->active_tx_metadata_valid)
             completion.metadata = ctx->active_tx_metadata;
+        completion.completed_us = completed_us;
         completion.status = status;
         completion.mailbox_index = mailbox_idx;
         ctx->tx_completion_write = next;

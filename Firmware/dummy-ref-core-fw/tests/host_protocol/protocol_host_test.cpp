@@ -1531,6 +1531,15 @@ void TestCanTimingProfilerMeasuresLatePreflightResponse()
     assert(overflow.temperature_samples[4] == 1U);
     assert(overflow.temperature_p999_us[4] == 8192U);
     assert(overflow.temperature_max_us[4] == 9000U);
+
+    // Adjacent micros() samples can regress slightly at a timer boundary.
+    // Never turn that ordering race into a latency near 2^32 us.
+    profiler.RecordTemperatureRequest(6U, 30001U);
+    profiler.RecordTemperatureResponse(6U, 30000U);
+    const CanTimingProfilePayload regressed = profiler.MakePayload(1030000U, {});
+    assert(regressed.temperature_samples[5] == 1U);
+    assert(regressed.temperature_p999_us[5] == 64U);
+    assert(regressed.temperature_max_us[5] == 0U);
 }
 
 void TestCanDispatcherPreflightTimeoutStopsEnable()

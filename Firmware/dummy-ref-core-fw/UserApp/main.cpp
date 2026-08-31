@@ -586,8 +586,11 @@ void ThreadCanDispatch(void* argument)
         {
             while (CanTakeTxCompletion(completion_context, completion))
             {
-                const uint64_t completed_us =
+                const uint64_t observed_us =
                     dummy::protocol::BinaryControlMonotonicMicros();
+                const uint64_t completed_us =
+                    dummy::protocol::ExtendRecentMicros32(
+                        observed_us, completion.completed_us);
                 if ((completion.metadata.channel == CanTxChannel::Safety ||
                      completion.metadata.channel ==
                          CanTxChannel::EnableTransition) &&
@@ -595,7 +598,8 @@ void ThreadCanDispatch(void* argument)
                 {
                     max_safety_wait_us = std::max(
                         max_safety_wait_us,
-                        static_cast<uint32_t>(completed_us -
+                        dummy::protocol::RecentElapsedMicros32(
+                            completion.completed_us,
                             completion.metadata.enqueued_time_us));
                 }
                 if (completion.metadata.channel == CanTxChannel::Safety &&
@@ -731,14 +735,14 @@ void ThreadCanDispatch(void* argument)
                     completion.metadata.channel == CanTxChannel::Position)
                     dummy::protocol::RecordPositionTimingStart(
                         completion.metadata.node_id,
-                        static_cast<uint32_t>(completed_us));
+                        completion.completed_us);
                 else if (
                     completion.status == CanTxCompletionStatus::Complete &&
                     (completion.metadata.channel == CanTxChannel::Temperature ||
                      completion.metadata.channel == CanTxChannel::Diagnostics))
                     dummy::protocol::RecordTemperatureTimingStart(
                         completion.metadata.node_id,
-                        static_cast<uint32_t>(completed_us));
+                        completion.completed_us);
                 if (completion.metadata.channel != CanTxChannel::Target ||
                     completion.metadata.action_sequence == 0U)
                     continue;
@@ -750,7 +754,7 @@ void ThreadCanDispatch(void* argument)
                     completion_tracker.RecordCompletion(
                         completion_key, completion.metadata.node_id,
                         completion.status == CanTxCompletionStatus::Complete,
-                        static_cast<uint32_t>(completed_us));
+                        completion.completed_us);
                 if (completion_result !=
                         dummy::protocol::TargetCompletionResult::Ignored &&
                     completion.metadata.node_id >= 1U &&

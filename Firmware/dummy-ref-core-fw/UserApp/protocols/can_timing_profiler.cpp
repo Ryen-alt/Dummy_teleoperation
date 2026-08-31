@@ -1,6 +1,7 @@
 #include "can_timing_profiler.hpp"
 
 #include "../../../can_transport_contract.h"
+#include "monotonic_micros.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -111,7 +112,8 @@ void CanTimingProfiler::RecordResponse(
     const size_t index = NodeIndex(node_id);
     if (index >= requests.size() || !requests[index].pending)
         return;
-    histograms[index].Record(received_us - requests[index].started_us);
+    histograms[index].Record(RecentElapsedMicros32(
+        received_us, requests[index].started_us));
     requests[index].pending = false;
 }
 

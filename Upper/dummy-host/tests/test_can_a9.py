@@ -84,6 +84,18 @@ def test_a9_maintenance_window_cannot_pass_formal_stream_gate() -> None:
     assert any("maintenance" in failure for failure in evaluation.failures)
 
 
+def test_a9_evaluator_rejects_wrapped_latency_maximum() -> None:
+    evaluation = evaluate_can_a9(
+        replace(
+            _profile(),
+            position_max_us=(0xFFFF_FFE2, 450, 450, 450, 450, 450, 450),
+        )
+    )
+
+    assert not evaluation.passed
+    assert any("timestamp ordering" in failure for failure in evaluation.failures)
+
+
 def test_a9_evaluator_rejects_missed_tick_and_relaxed_threshold() -> None:
     profile = replace(
         _profile(),

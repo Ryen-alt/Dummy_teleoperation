@@ -153,7 +153,11 @@ counters. Every 0x26 request also carries a per-Stream window token so a motor's
 old uptime counters cannot contaminate the current acceptance window. This is the
 canonical A9 measurement path; an external CAN analyzer is optional. Main-
 controller latency percentiles are conservative 64 us bin upper bounds over
-0..8192 us; the maximum field remains exact beyond that range.
+0..8192 us; the maximum field remains exact beyond that range. Both endpoints
+are captured in their respective CAN TX-complete and RX ISRs on the same
+wrapping microsecond clock; dispatcher wake latency is not part of the sample.
+Small timer-boundary regressions are clamped to zero, and the host rejects any
+wrap-shaped maximum at or above half the 32-bit clock range.
 
 At boot, firmware opens a measurement-only maintenance window with
 `session_epoch=0`. It includes Stream-transition motor-diagnostics requests and

@@ -48,6 +48,9 @@ struct CanTxMetadata
 struct CanTxCompletion
 {
     CanTxMetadata metadata{};
+    // Captured in the mailbox-complete/abort ISR on the same wrapping micros()
+    // clock used by CanRxFrame::received_us.
+    uint32_t completed_us = 0U;
     CanTxCompletionStatus status = CanTxCompletionStatus::Complete;
     uint8_t mailbox_index = 0;
 };

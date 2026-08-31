@@ -61,6 +61,20 @@ def evaluate_can_a9(profile: CanTimingProfile) -> CanA9Evaluation:
     if any(count < 100 for count in profile.motor_can_samples):
         failures.append("motor 0x05 profiler has fewer than 100 samples on a node")
 
+    wrapped_latency_nodes = sorted(
+        {
+            index + 1
+            for values in (profile.position_max_us, profile.temperature_max_us)
+            for index, value in enumerate(values)
+            if value >= 1 << 31
+        }
+    )
+    if wrapped_latency_nodes:
+        failures.append(
+            "response latency timestamp ordering is invalid on nodes "
+            f"{wrapped_latency_nodes}"
+        )
+
     required_motor_flags = 0x0F
     invalid_nodes = [
         index + 1
