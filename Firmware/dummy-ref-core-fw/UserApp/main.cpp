@@ -591,6 +591,27 @@ void ThreadCanDispatch(void* argument)
                 const uint64_t completed_us =
                     dummy::protocol::ExtendRecentMicros32(
                         observed_us, completion.completed_us);
+                dummy::protocol::CanDispatchAction completed_query =
+                    dummy::protocol::CanDispatchAction::None;
+                if (completion.metadata.channel == CanTxChannel::Position)
+                    completed_query =
+                        dummy::protocol::CanDispatchAction::PositionRequest;
+                else if (completion.metadata.channel == CanTxChannel::Temperature)
+                    completed_query =
+                        dummy::protocol::CanDispatchAction::TemperatureRequest;
+                else if (completion.metadata.channel == CanTxChannel::Diagnostics)
+                    completed_query = dummy::protocol::CanDispatchAction::
+                        MotorDiagnosticsRequest;
+                else if (completion.metadata.channel == CanTxChannel::TimingProfile)
+                    completed_query =
+                        dummy::protocol::CanDispatchAction::MotorTimingRequest;
+                if (completed_query != dummy::protocol::CanDispatchAction::None)
+                {
+                    can_dispatch_scheduler.OnTransmissionCompleted(
+                        completed_query, completion.metadata.node_id,
+                        completion.completed_us,
+                        completion.status == CanTxCompletionStatus::Complete);
+                }
                 if ((completion.metadata.channel == CanTxChannel::Safety ||
                      completion.metadata.channel ==
                          CanTxChannel::EnableTransition) &&

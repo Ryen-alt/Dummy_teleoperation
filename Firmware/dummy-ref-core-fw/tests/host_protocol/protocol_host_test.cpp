@@ -1189,17 +1189,49 @@ void TestCanDispatcherWaitsForResponseAndTimesOut()
     assert(request.action == CanDispatchAction::PositionRequest);
     scheduler.OnQueued(request, now_us);
 
-    CanDispatchStep waiting = scheduler.Next(now_us + 1000U);
+    // Mailbox admission is not the response-clock origin. A high-ID request
+    // may wait through lower-ID arbitration without manufacturing a timeout.
+    CanDispatchStep waiting = scheduler.Next(now_us + 4000U);
+    assert(waiting.action == CanDispatchAction::None);
+    assert(waiting.timed_out_action == CanDispatchAction::None);
+    const uint32_t tx_completed_us = now_us + 4000U;
+    scheduler.OnTransmissionCompleted(
+        request.action, request.node_id, tx_completed_us, true);
+
+    waiting = scheduler.Next(tx_completed_us + 3999U);
     assert(waiting.action == CanDispatchAction::None);
     assert(waiting.timed_out_action == CanDispatchAction::None);
 
-    CanDispatchStep timeout = scheduler.Next(now_us + 4000U);
+    CanDispatchStep timeout = scheduler.Next(tx_completed_us + 4000U);
     assert(timeout.timed_out_action == CanDispatchAction::PositionRequest);
     assert(timeout.timed_out_node_id == request.node_id);
     assert(!timeout.timed_out_final);
     assert(timeout.action == CanDispatchAction::PositionRequest);
     assert(timeout.node_id != request.node_id);
     assert(scheduler.diagnostics().position_timed_out[request.node_id - 1U] == 1U);
+}
+
+void TestCanDispatcherFailedQueryTransmissionIsImmediatelyDue()
+{
+    CanDispatchScheduler scheduler;
+    uint32_t now_us = 0U;
+    CanDispatchStep request{};
+    for (size_t tick = 0; tick < 20U; ++tick)
+    {
+        request = scheduler.Next(now_us);
+        if (request.action == CanDispatchAction::PositionRequest)
+            break;
+        now_us += 1429U;
+    }
+    assert(request.action == CanDispatchAction::PositionRequest);
+    scheduler.OnQueued(request, now_us);
+    scheduler.OnTransmissionCompleted(
+        request.action, request.node_id, now_us + 100U, false);
+
+    const CanDispatchStep timeout = scheduler.Next(now_us + 100U);
+    assert(timeout.timed_out_action == CanDispatchAction::PositionRequest);
+    assert(timeout.timed_out_node_id == request.node_id);
+    assert(!scheduler.diagnostics().query_pending);
 }
 
 void TestCanDispatcherContinuesSweepAndRetriesOnlyMissingNode()
@@ -1216,6 +1248,7 @@ void TestCanDispatcherContinuesSweepAndRetriesOnlyMissingNode()
     const uint8_t missing_node = step.node_id;
     const uint32_t sweep_id = step.feedback_sweep_id;
     scheduler.OnQueued(step, now_us);
+    scheduler.OnTransmissionCompleted(step.action, step.node_id, now_us, true);
 
     // The first timeout continues with the next node while preserving the
     // missing node's sweep identity for one tail retry.
@@ -1288,6 +1321,8 @@ void TestCanDispatcherSweepIdentityAdvancesPastObservedHardwareBoundary()
             ++completed_sweeps;
         }
         scheduler.OnQueued(step, now_us);
+        scheduler.OnTransmissionCompleted(step.action, step.node_id, now_us,
+                                          true);
 
         // Exercise the exact 0x44ff -> 0x4500 transition observed on hardware,
         // including the bounded skip-and-retry path immediately before it.
@@ -1320,6 +1355,8 @@ void TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion()
     CanDispatchStep step = late_scheduler.Next(now_us);
     const uint8_t late_node = step.node_id;
     late_scheduler.OnQueued(step, now_us);
+    late_scheduler.OnTransmissionCompleted(
+        step.action, step.node_id, now_us, true);
     now_us += config.response_timeout_us;
     step = late_scheduler.Next(now_us);
     assert(!step.timed_out_final);
@@ -1345,6 +1382,8 @@ void TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion()
     step = exhausted_scheduler.Next(now_us);
     const uint8_t missing_node = step.node_id;
     exhausted_scheduler.OnQueued(step, now_us);
+    exhausted_scheduler.OnTransmissionCompleted(
+        step.action, step.node_id, now_us, true);
     now_us += config.response_timeout_us;
     step = exhausted_scheduler.Next(now_us);
     for (size_t completed = 1U; completed < kActuatorNodeCount; ++completed)
@@ -1358,6 +1397,8 @@ void TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion()
     }
     assert(step.node_id == missing_node);
     exhausted_scheduler.OnQueued(step, now_us);
+    exhausted_scheduler.OnTransmissionCompleted(
+        step.action, step.node_id, now_us, true);
     const CanDispatchStep exhausted = exhausted_scheduler.Next(
         now_us + config.response_timeout_us);
     assert(exhausted.timed_out_action == CanDispatchAction::PositionRequest);
@@ -1440,6 +1481,8 @@ void TestCanTimingProfileSchedulerPagesAndTimeouts()
             scheduler.OnQueued(step, now_us);
             if (step.action == CanDispatchAction::MotorTimingRequest)
             {
+                scheduler.OnTransmissionCompleted(
+                    step.action, step.node_id, now_us, true);
                 nodes.push_back(step.node_id);
                 pages.push_back(step.timing_profile_page);
                 responses.timing_profile_mask = static_cast<uint8_t>(
@@ -1464,7 +1507,11 @@ void TestCanTimingProfileSchedulerPagesAndTimeouts()
         {
             scheduler.OnQueued(pending, now_us);
             if (pending.action == CanDispatchAction::MotorTimingRequest)
+            {
+                scheduler.OnTransmissionCompleted(
+                    pending.action, pending.node_id, now_us, true);
                 break;
+            }
         }
         now_us += 1000U;
     }
@@ -1542,7 +1589,12 @@ void TestCanTimingProfileRejectsLateWrongPage()
         {
             late_scheduler.OnQueued(late_request, late_now_us);
             if (late_request.action == CanDispatchAction::MotorTimingRequest)
+            {
+                late_scheduler.OnTransmissionCompleted(
+                    late_request.action, late_request.node_id, late_now_us,
+                    true);
                 break;
+            }
         }
         late_now_us += 1000U;
     }
@@ -1713,6 +1765,8 @@ void TestCanDispatcherPreflightTimeoutStopsEnable()
     assert(request.action == CanDispatchAction::MotorDiagnosticsRequest);
     assert(request.node_id == 1U);
     scheduler.OnQueued(request, now_us);
+    scheduler.OnTransmissionCompleted(
+        request.action, request.node_id, now_us, true);
     now_us += config.response_timeout_us;
     const CanDispatchStep timeout = scheduler.Next(now_us);
     assert(timeout.timed_out_final);
@@ -2194,6 +2248,7 @@ int main()
     TestControlAcquisitionRequiresFeedbackBootstrap();
     TestCanDispatcherTransitionsAndFrequencyPlan();
     TestCanDispatcherWaitsForResponseAndTimesOut();
+    TestCanDispatcherFailedQueryTransmissionIsImmediatelyDue();
     TestCanDispatcherContinuesSweepAndRetriesOnlyMissingNode();
     TestCanDispatcherSweepIdentityAdvancesPastObservedHardwareBoundary();
     TestCanDispatcherAcceptsLateSweepResponseAndReportsRetryExhaustion();

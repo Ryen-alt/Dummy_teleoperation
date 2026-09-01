@@ -106,6 +106,8 @@ public:
     CanDispatchStep Next(uint32_t now_us,
                          const FeedbackResponseEvents& responses = {});
     void OnQueued(const CanDispatchStep& step, uint32_t now_us);
+    void OnTransmissionCompleted(CanDispatchAction action, uint8_t node_id,
+                                 uint32_t completed_us, bool successful);
     void OnDeferred();
     void Reset();
 
@@ -176,6 +178,7 @@ private:
     CanDispatchAction pending_action_ = CanDispatchAction::None;
     uint8_t pending_node_id_ = 0U;
     uint32_t pending_since_us_ = 0U;
+    bool pending_transmitted_ = false;
     CanDispatchDiagnostics diagnostics_{};
 };
 

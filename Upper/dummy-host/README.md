@@ -198,8 +198,9 @@ dummy-host-session-qa --session /path/to/session_dir \
 
 v2.2.2 不要求外置 CAN 分析仪。主控以 CAN 请求帧实际 TX-complete 到 RX ISR 的时间戳
 统计响应直方图，42/35 电机通过 DWT 和 `0x26` 四页报告 0x05 ISR、20 kHz jitter/
-执行时间和窗口内 missed tick。遥操作 session 每 5 秒记录 `can_timing_profile`，并在
-collection 停止前记录最终 snapshot。先读取内部 A9 证据：
+执行时间和窗口内 missed tick。运行时 response timeout 也从实际 TX-complete 起算，
+CAN 仲裁等待只受独立 TX abort 门禁约束。遥操作 session 每 5 秒记录
+`can_timing_profile`，并在 collection 停止前记录最终 snapshot。先读取内部 A9 证据：
 
 ```bash
 dummy-host-can-a9-profile \

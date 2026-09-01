@@ -331,6 +331,7 @@ void CanDispatchScheduler::ConsumeResponses(
         query_pending_ = false;
         pending_action_ = CanDispatchAction::None;
         pending_node_id_ = 0U;
+        pending_transmitted_ = false;
         if (completed_action == CanDispatchAction::PositionRequest &&
             position_sweep_active_)
             AdvancePositionSweep(now_us);
@@ -381,6 +382,7 @@ void CanDispatchScheduler::SetMode(CanDispatchMode mode)
     query_pending_ = false;
     pending_action_ = CanDispatchAction::None;
     pending_node_id_ = 0U;
+    pending_transmitted_ = false;
     if (mode == CanDispatchMode::Stream || mode == CanDispatchMode::Hold)
         transition_ = Transition::HoldTargets;
     else if (mode == CanDispatchMode::Fault)
@@ -404,7 +406,7 @@ CanDispatchStep CanDispatchScheduler::Next(
     if (transition_ == Transition::None && !deadlines_initialized_)
         InitializeDeadlines(now_us);
 
-    if (query_pending_ &&
+    if (query_pending_ && pending_transmitted_ &&
         now_us - pending_since_us_ >= config_.response_timeout_us)
     {
         step.timed_out_action = pending_action_;
@@ -459,6 +461,7 @@ CanDispatchStep CanDispatchScheduler::Next(
         query_pending_ = false;
         pending_action_ = CanDispatchAction::None;
         pending_node_id_ = 0U;
+        pending_transmitted_ = false;
         if (step.timed_out_action == CanDispatchAction::PositionRequest &&
             position_sweep_active_)
             AdvancePositionSweep(now_us);
@@ -688,7 +691,8 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
         query_pending_ = true;
         pending_action_ = step.action;
         pending_node_id_ = step.node_id;
-        pending_since_us_ = now_us;
+        pending_since_us_ = 0U;
+        pending_transmitted_ = false;
     }
     else if (step.action == CanDispatchAction::TemperatureRequest)
     {
@@ -700,7 +704,8 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
         query_pending_ = true;
         pending_action_ = step.action;
         pending_node_id_ = step.node_id;
-        pending_since_us_ = now_us;
+        pending_since_us_ = 0U;
+        pending_transmitted_ = false;
     }
     else if (step.action == CanDispatchAction::MotorDiagnosticsRequest)
     {
@@ -710,7 +715,8 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
         query_pending_ = true;
         pending_action_ = step.action;
         pending_node_id_ = step.node_id;
-        pending_since_us_ = now_us;
+        pending_since_us_ = 0U;
+        pending_transmitted_ = false;
     }
     else if (step.action == CanDispatchAction::MotorTimingRequest)
     {
@@ -723,7 +729,8 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
         query_pending_ = true;
         pending_action_ = step.action;
         pending_node_id_ = step.node_id;
-        pending_since_us_ = now_us;
+        pending_since_us_ = 0U;
+        pending_transmitted_ = false;
     }
 
     if (!step.transition)
@@ -750,6 +757,22 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
     }
     if (transition_ == Transition::None && !deadlines_initialized_)
         InitializeDeadlines(now_us);
+}
+
+void CanDispatchScheduler::OnTransmissionCompleted(
+    CanDispatchAction action, uint8_t node_id, uint32_t completed_us,
+    bool successful)
+{
+    if (!query_pending_ || action != pending_action_ ||
+        node_id != pending_node_id_)
+        return;
+
+    // The response budget starts when the request has actually won CAN
+    // arbitration, not when it entered the hardware mailbox.  A failed TX is
+    // made immediately due so the normal bounded timeout path clears it.
+    pending_since_us_ = successful
+        ? completed_us : completed_us - config_.response_timeout_us;
+    pending_transmitted_ = true;
 }
 
 void CanDispatchScheduler::OnDeferred()
@@ -792,6 +815,7 @@ void CanDispatchScheduler::Reset()
     pending_action_ = CanDispatchAction::None;
     pending_node_id_ = 0U;
     pending_since_us_ = 0U;
+    pending_transmitted_ = false;
     diagnostics_ = {};
     diagnostics_.config_valid = config_valid_;
 }
