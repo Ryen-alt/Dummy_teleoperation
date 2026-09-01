@@ -105,7 +105,10 @@ void DummyRobot::MoveJoints(DOF6Kinematic::Joint6D_t _joints)
 {
     for (int j = 1; j <= 6; j++)
     {
-        motorJ[j]->SetAngleWithVelocityLimit(_joints.a[j - 1] - initPose.a[j - 1],
+        const size_t index = static_cast<size_t>(j - 1);
+        motorJ[j]->SetAngleWithVelocityLimit(
+            absoluteJointPosition.MotorLocalTargetDegrees(
+                _joints.a[index], initPose.a[index], index),
                                              dynamicJointSpeeds.a[j - 1]);
     }
 }
@@ -124,7 +127,8 @@ bool DummyRobot::ApplyExternalUrdfTargetNodeRad(
             kRadiansToDegrees;
         targetJoints.a[index] = target_degrees;
         return motorJ[node_id]->SetStreamingAngle(
-            target_degrees - initPose.a[index], metadata);
+            absoluteJointPosition.MotorLocalTargetDegrees(
+                target_degrees, initPose.a[index], index), metadata);
     }
     if (node_id == 7U && hand != nullptr)
         return hand->SetStreamingNormalizedPosition(
@@ -138,7 +142,9 @@ void DummyRobot::HoldCurrentPosition()
 {
     targetJoints = currentJoints;
     for (int index = 0; index < 6; ++index)
-        motorJ[index + 1]->SetAngle(currentJoints.a[index] - initPose.a[index]);
+        // The motor-local angle is the only representation that cannot jump
+        // while an absolute branch is being selected.
+        motorJ[index + 1]->SetAngle(motorJ[index + 1]->angle);
     if (hand != nullptr)
     {
         const float travel = hand->closedAngle - hand->openedAngle;
@@ -150,6 +156,34 @@ void DummyRobot::HoldCurrentPosition()
                 normalized, dummy::generated_config::kGripperVelocityLimitPerS);
         }
     }
+}
+
+
+dummy::protocol::AbsoluteJointSeedResult
+DummyRobot::SeedAbsoluteJointPosition(
+    const std::array<float, 6>& reference_urdf_rad)
+{
+    std::array<float, 6> raw_legacy_degrees{};
+    for (size_t index = 0; index < raw_legacy_degrees.size(); ++index)
+        raw_legacy_degrees[index] =
+            motorJ[index + 1U]->angle + initPose.a[index];
+
+    const auto result = absoluteJointPosition.Seed(
+        raw_legacy_degrees, reference_urdf_rad);
+    if (result != dummy::protocol::AbsoluteJointSeedResult::Ok)
+        return result;
+
+    // Publish the corrected legacy coordinates atomically with the seed.  CAN
+    // targets continue to subtract the same integer branch at the motor
+    // boundary, so selecting a branch never commands motion.
+    for (size_t index = 0; index < raw_legacy_degrees.size(); ++index)
+    {
+        const float resolved = absoluteJointPosition.ResolveLegacyDegrees(
+            raw_legacy_degrees[index], index);
+        currentJoints.a[index] = resolved;
+        targetJoints.a[index] = resolved;
+    }
+    return result;
 }
 
 
@@ -329,7 +363,9 @@ void DummyRobot::UpdateJointAnglesCallback()
 {
     for (int i = 1; i <= 6; i++)
     {
-        currentJoints.a[i - 1] = motorJ[i]->angle + initPose.a[i - 1];
+        const size_t index = static_cast<size_t>(i - 1);
+        currentJoints.a[index] = absoluteJointPosition.ResolveLegacyDegrees(
+            motorJ[i]->angle + initPose.a[index], index);
 
         if (motorJ[i]->state == CtrlStepMotor::FINISH)
             jointsStateFlag |= (1 << i);

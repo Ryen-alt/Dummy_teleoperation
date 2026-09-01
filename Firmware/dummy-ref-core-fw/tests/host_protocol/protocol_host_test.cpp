@@ -907,6 +907,156 @@ void TestUrdfJointSpaceMapping()
                      (dummy::generated_config::kJointZeroOffsetRad[5] - kProbe)) < 1e-6F);
 }
 
+void TestAbsoluteJointPositionResolverRestoresPowerCycleBranch()
+{
+    AbsoluteJointPositionResolver resolver;
+    const std::array<float, 6> reference_urdf = {
+        -0.04396757F, 0.72043073F, -0.05282092F,
+        -0.06074073F, -0.02640411F, -0.00405953F,
+    };
+    const std::array<int, 6> lost_motor_turns = {0, 6, -4, 7, -3, 11};
+    std::array<float, 6> raw_legacy_degrees{};
+    constexpr float kRadiansToDegrees = 57.295779513082320876F;
+    for (size_t index = 0; index < raw_legacy_degrees.size(); ++index)
+    {
+        const float expected_legacy_rad =
+            UrdfRadiansToLegacyFirmwareRadians(reference_urdf[index], index);
+        const float alias_period_rad =
+            6.2831853071795864769F /
+            dummy::generated_config::kJointReduction[index];
+        // A small physical/residual difference is allowed, but the resolver
+        // may only restore an integer number of motor-turn aliases.
+        raw_legacy_degrees[index] =
+            (expected_legacy_rad -
+             static_cast<float>(lost_motor_turns[index]) * alias_period_rad -
+             0.005F) * kRadiansToDegrees;
+    }
+
+    assert(resolver.Seed(raw_legacy_degrees, reference_urdf) ==
+           AbsoluteJointSeedResult::Ok);
+    assert(resolver.valid());
+    assert(resolver.generation() == 1U);
+    for (size_t index = 0; index < raw_legacy_degrees.size(); ++index)
+    {
+        const float resolved = LegacyFirmwareDegreesToUrdfRadians(
+            resolver.ResolveLegacyDegrees(raw_legacy_degrees[index], index),
+            index);
+        assert(std::fabs(resolved - reference_urdf[index]) < 0.006F);
+
+        const float target_legacy_degrees =
+            UrdfRadiansToLegacyFirmwareRadians(reference_urdf[index], index) *
+            kRadiansToDegrees;
+        const float motor_local = resolver.MotorLocalTargetDegrees(
+            target_legacy_degrees, -73.0F, index);
+        const float reconstructed_target = motor_local - 73.0F +
+            resolver.ResolveLegacyDegrees(raw_legacy_degrees[index], index) -
+            raw_legacy_degrees[index];
+        assert(std::fabs(reconstructed_target - target_legacy_degrees) < 1e-4F);
+    }
+    assert(resolver.Seed(raw_legacy_degrees, reference_urdf) ==
+           AbsoluteJointSeedResult::AlreadySeeded);
+}
+
+void TestAbsoluteJointPositionResolverRejectsUnsafeSeeds()
+{
+    std::array<float, 6> reference =
+        dummy::generated_config::kInitialPoseRad;
+    std::array<float, 6> raw{};
+    constexpr float kRadiansToDegrees = 57.295779513082320876F;
+    for (size_t index = 0; index < raw.size(); ++index)
+        raw[index] = UrdfRadiansToLegacyFirmwareRadians(
+            reference[index], index) * kRadiansToDegrees;
+
+    AbsoluteJointPositionResolver non_finite;
+    auto invalid_reference = reference;
+    invalid_reference[2] = std::numeric_limits<float>::quiet_NaN();
+    assert(non_finite.Seed(raw, invalid_reference) ==
+           AbsoluteJointSeedResult::NonFinite);
+    assert(!non_finite.valid());
+
+    AbsoluteJointPositionResolver outside_limits;
+    invalid_reference = reference;
+    invalid_reference[1] = dummy::generated_config::kJointMaxRad[1] + 0.1F;
+    assert(outside_limits.Seed(raw, invalid_reference) ==
+           AbsoluteJointSeedResult::OutOfRange);
+    assert(!outside_limits.valid());
+
+    AbsoluteJointPositionResolver modulo_mismatch;
+    raw[3] += 0.03F * kRadiansToDegrees;
+    assert(modulo_mismatch.Seed(raw, reference) ==
+           AbsoluteJointSeedResult::ModuloMismatch);
+    assert(!modulo_mismatch.valid());
+}
+
+void TestAbsoluteJointSeedProtocolIsPreLeaseAndExplicit()
+{
+    ControlSession session(MakeConfig(true), "test-fw");
+    Packet request = MakePacket(
+        MessageType::SeedJointPosition, 0x11223344U, 2U);
+    JointPositionSeedPayload payload{};
+    std::copy(dummy::generated_config::kInitialPoseRad.begin(),
+              dummy::generated_config::kInitialPoseRad.end(),
+              payload.position);
+    payload.confirmation = kJointPositionSeedConfirmation;
+    SetPayload(request, payload);
+
+    ProcessResult result = session.Process(request, 500U);
+    assert(ResponseCode(result) == ResultCode::BadSession);
+    assert(!result.joint_position_seed_requested);
+
+    const Packet hello = MakeConfiguredHello();
+    const ProcessResult hello_result = session.Process(hello, 1000U);
+    HelloAckPayload hello_ack{};
+    std::memcpy(&hello_ack, hello_result.response.payload.data(),
+                sizeof(hello_ack));
+    assert((hello_ack.capabilities & kCapabilityAbsoluteJointPositionSeed) != 0U);
+
+    request.header.session_id = hello.header.session_id;
+    request.header.sequence = hello.header.sequence + 1U;
+    result = session.Process(request, 2000U);
+    assert(ResponseCode(result) == ResultCode::Ok);
+    assert(result.joint_position_seed_requested);
+    for (size_t index = 0; index < 6U; ++index)
+        assert(result.joint_position_seed.position[index] == payload.position[index]);
+
+    Packet malformed = request;
+    malformed.header.sequence += 1U;
+    malformed.header.payload_length -= 1U;
+    result = session.Process(malformed, 3000U);
+    assert(ResponseCode(result) == ResultCode::BadLength);
+    assert(!result.joint_position_seed_requested);
+
+    Packet unconfirmed = request;
+    unconfirmed.header.sequence += 2U;
+    JointPositionSeedPayload bad_confirmation = payload;
+    bad_confirmation.confirmation ^= 1U;
+    SetPayload(unconfirmed, bad_confirmation);
+    result = session.Process(unconfirmed, 4000U);
+    assert(ResponseCode(result) == ResultCode::BadConfig);
+    assert(ResponseDetail(result) == kAckDetailAbsoluteSeedConfirmation);
+
+    Packet out_of_range = request;
+    out_of_range.header.sequence += 3U;
+    JointPositionSeedPayload invalid = payload;
+    invalid.position[1] = dummy::generated_config::kJointMaxRad[1] + 0.1F;
+    SetPayload(out_of_range, invalid);
+    result = session.Process(out_of_range, 5000U);
+    assert(ResponseCode(result) == ResultCode::OutOfRange);
+    assert(!result.joint_position_seed_requested);
+
+    session.SetControlReady(true);
+    Packet acquire = MakePacket(MessageType::AcquireControl,
+                                hello.header.session_id,
+                                hello.header.sequence + 5U);
+    SetPayload(acquire, AcquireControlPayload{500U});
+    assert(ResponseCode(session.Process(acquire, 6000U)) == ResultCode::Ok);
+    Packet while_leased = request;
+    while_leased.header.sequence = hello.header.sequence + 6U;
+    result = session.Process(while_leased, 7000U);
+    assert(ResponseCode(result) == ResultCode::BadMode);
+    assert(!result.joint_position_seed_requested);
+}
+
 void TestControlAcquisitionRequiresFeedbackBootstrap()
 {
     ControlSession session(MakeConfig(true), "test-fw");
@@ -2062,6 +2212,9 @@ int main()
     TestActuatorApplicationTrackerRequiresEverySuccessfulNode();
     TestActuatorApplicationTrackerRejectsAbortAtEveryNode();
     TestUrdfJointSpaceMapping();
+    TestAbsoluteJointPositionResolverRestoresPowerCycleBranch();
+    TestAbsoluteJointPositionResolverRejectsUnsafeSeeds();
+    TestAbsoluteJointSeedProtocolIsPreLeaseAndExplicit();
     TestUnverifiedConfigurationCannotAcquire();
     TestAcceptanceConfigurationAllowsOnlyTeleop();
     TestConfiguredButExecutionLockedCannotAcquire();

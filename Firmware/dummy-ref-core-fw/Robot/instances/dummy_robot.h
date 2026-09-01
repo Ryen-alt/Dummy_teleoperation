@@ -3,6 +3,7 @@
 
 #include "algorithms/kinematic/6dof_kinematic.h"
 #include "actuators/ctrl_step/ctrl_step.hpp"
+#include "protocols/joint_space_mapping.hpp"
 #include <array>
 #include "string"
 #define ALL 0
@@ -184,6 +185,12 @@ public:
     bool ApplyExternalUrdfTargetNodeRad(uint8_t node_id,
                                        const std::array<float, 7>& target,
                                        const CanTxMetadata* metadata = nullptr);
+    dummy::protocol::AbsoluteJointSeedResult SeedAbsoluteJointPosition(
+        const std::array<float, 6>& reference_urdf_rad);
+    bool AbsoluteJointPositionValid() const
+    { return absoluteJointPosition.valid(); }
+    uint32_t AbsoluteJointPositionGeneration() const
+    { return absoluteJointPosition.generation(); }
     void HoldCurrentPosition();
     void SetJointSpeed(float _speed);
     void SetJointAcceleration(float _acc);
@@ -281,6 +288,7 @@ private:
     bool isEnabled = false;
     bool isRGBEnabled = false;
     uint32_t rgbMode = 0;
+    dummy::protocol::AbsoluteJointPositionResolver absoluteJointPosition;
 };
 
 

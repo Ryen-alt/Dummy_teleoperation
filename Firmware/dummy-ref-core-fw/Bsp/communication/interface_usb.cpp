@@ -16,6 +16,8 @@
 #include <array>
 #include <cstring>
 
+extern DummyRobot robot;
+
 osThreadId_t usbServerTaskHandle;
 volatile USBStats_t usb_stats_ = {0};
 
@@ -429,7 +431,7 @@ void ApplyBinarySafetyOutcome(const FeedbackSafetyOutput& safety)
     binary_safety_telemetry = safety;
     binary_session.SetControlReady(
         safety.arm_position_valid && safety.gripper_position_valid &&
-        ReadCanFeedbackReady());
+        ReadCanFeedbackReady() && robot.AbsoluteJointPositionValid());
     if (safety.fault_bits != 0)
         binary_session.SetFault(safety.fault_bits);
     else if (safety.hold_reason_bits != 0)
@@ -465,6 +467,22 @@ bool SendBinaryPacket(dummy::protocol::Packet& packet, uint64_t now_us)
     const size_t length = dummy::protocol::EncodePacket(packet, encoded.data(), encoded.size());
     return length != 0 &&
         usb_stream_output.process_bytes(encoded.data(), length, nullptr) == 0;
+}
+
+void SetBinaryAckResult(dummy::protocol::ProcessResult& result,
+                        dummy::protocol::ResultCode code,
+                        uint16_t detail = 0U)
+{
+    dummy::protocol::AckPayload payload{};
+    std::memcpy(&payload, result.response.payload.data(), sizeof(payload));
+    payload.result = static_cast<uint8_t>(code);
+    payload.detail = detail;
+    result.response.header.message_type = static_cast<uint8_t>(
+        code == dummy::protocol::ResultCode::Ok
+            ? dummy::protocol::MessageType::Ack
+            : dummy::protocol::MessageType::Nack);
+    result.response.header.payload_length = sizeof(payload);
+    std::memcpy(result.response.payload.data(), &payload, sizeof(payload));
 }
 
 void MaybeSendBinaryProgressEvent(uint64_t now_us)
@@ -518,6 +536,50 @@ void ProcessBinaryBytes(const uint8_t* data, size_t length, uint64_t now_us)
         if (result.target_updated)
             dummy::protocol::RecordBinaryTargetAccepted(
                 request.header.sequence, now_us);
+        if (result.joint_position_seed_requested)
+        {
+            if (!dummy::protocol::ReadCanFeedbackReady())
+            {
+                SetBinaryAckResult(
+                    result, dummy::protocol::ResultCode::BadMode,
+                    dummy::protocol::kAckDetailFeedbackNotReady);
+            }
+            else
+            {
+                std::array<float, 6> reference_urdf_rad{};
+                std::copy(
+                    std::begin(result.joint_position_seed.position),
+                    std::end(result.joint_position_seed.position),
+                    reference_urdf_rad.begin());
+                taskENTER_CRITICAL();
+                const auto seed_result = robot.SeedAbsoluteJointPosition(
+                    reference_urdf_rad);
+                taskEXIT_CRITICAL();
+                switch (seed_result)
+                {
+                case dummy::protocol::AbsoluteJointSeedResult::Ok:
+                    break;
+                case dummy::protocol::AbsoluteJointSeedResult::NonFinite:
+                    SetBinaryAckResult(
+                        result, dummy::protocol::ResultCode::NonFinite);
+                    break;
+                case dummy::protocol::AbsoluteJointSeedResult::OutOfRange:
+                    SetBinaryAckResult(
+                        result, dummy::protocol::ResultCode::OutOfRange);
+                    break;
+                case dummy::protocol::AbsoluteJointSeedResult::ModuloMismatch:
+                    SetBinaryAckResult(
+                        result, dummy::protocol::ResultCode::BadConfig,
+                        dummy::protocol::kAckDetailAbsoluteSeedModuloMismatch);
+                    break;
+                case dummy::protocol::AbsoluteJointSeedResult::AlreadySeeded:
+                    SetBinaryAckResult(
+                        result, dummy::protocol::ResultCode::BadMode,
+                        dummy::protocol::kAckDetailAbsoluteSeedAlreadyApplied);
+                    break;
+                }
+            }
+        }
         if (result.can_diagnostics_requested)
         {
             const auto diagnostics =

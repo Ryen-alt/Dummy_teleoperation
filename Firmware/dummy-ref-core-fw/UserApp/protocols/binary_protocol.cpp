@@ -193,6 +193,7 @@ bool IsKnownMessage(uint8_t raw_type)
         case MessageType::TimeSync:
         case MessageType::GetCanDiagnostics:
         case MessageType::GetCanTimingProfile:
+        case MessageType::SeedJointPosition:
         case MessageType::HelloAck:
         case MessageType::State:
         case MessageType::Ack:

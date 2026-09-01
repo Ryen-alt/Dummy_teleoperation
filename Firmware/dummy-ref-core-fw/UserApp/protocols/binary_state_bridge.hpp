@@ -29,6 +29,7 @@ struct BinaryRobotMeasurement
     std::array<uint32_t, 7> position_sweep_id{};
     uint32_t coherent_sweep_id = 0;
     uint32_t max_skew_us = 0;
+    uint32_t absolute_position_generation = 0;
     bool repeated = false;
 };
 

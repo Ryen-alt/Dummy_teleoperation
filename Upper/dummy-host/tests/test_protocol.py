@@ -22,11 +22,13 @@ from dummy_host.protocol import (
     decode_packet,
     encode_packet,
     pack_joint_target,
+    pack_joint_position_seed,
     pack_can_diagnostics,
     pack_target_keepalive,
     pack_time_sync,
     pack_time_sync_ack,
     unpack_joint_target,
+    unpack_joint_position_seed,
     unpack_can_diagnostics,
     unpack_target_keepalive,
     unpack_time_sync,
@@ -78,6 +80,22 @@ def test_joint_target_payload() -> None:
     np.testing.assert_array_equal(restored_velocity, velocity)
     assert (ttl, flags) == (100, 3)
     assert tick_id == 0x10203040
+
+
+def test_absolute_joint_position_seed_payload_is_explicit_and_finite() -> None:
+    position = np.asarray([0.1, 0.2, -0.3, 0.4, -0.5, 0.6], dtype=np.float32)
+    np.testing.assert_array_equal(
+        unpack_joint_position_seed(pack_joint_position_seed(position)),
+        position,
+    )
+    with pytest.raises(ProtocolError, match="six"):
+        pack_joint_position_seed(position[:5])
+    with pytest.raises(ProtocolError, match="NaN"):
+        pack_joint_position_seed(np.asarray([0, 0, 0, 0, np.nan, 0]))
+    corrupted = bytearray(pack_joint_position_seed(position))
+    corrupted[-1] ^= 1
+    with pytest.raises(ProtocolError, match="confirmation"):
+        unpack_joint_position_seed(bytes(corrupted))
 
 
 def test_target_keepalive_references_one_exact_action_sequence() -> None:

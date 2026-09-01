@@ -20,6 +20,8 @@ ACQUIRE_CONTROL = struct.Struct("<I")
 SET_MODE = struct.Struct("<B")
 JOINT_TARGET = struct.Struct("<7f6fHHI")
 TARGET_KEEPALIVE = struct.Struct("<II")
+JOINT_POSITION_SEED = struct.Struct("<6fI")
+JOINT_POSITION_SEED_CONFIRMATION = 0x53454544
 ACK = struct.Struct("<BBH")
 ACTION_PROGRESS = struct.Struct("<IB3xQI")
 ACTION_PROGRESS_RECORD = struct.Struct("<IB3xIIII")
@@ -79,6 +81,7 @@ class MessageType(enum.IntEnum):
     TIME_SYNC = 0x0B
     GET_CAN_DIAGNOSTICS = 0x0C
     GET_CAN_TIMING_PROFILE = 0x0D
+    SEED_JOINT_POSITION = 0x0E
     HELLO_ACK = 0x81
     STATE = 0x82
     ACK = 0x83
@@ -125,6 +128,7 @@ CAPABILITY_TIME_SYNC = 1 << 4
 CAPABILITY_CAN_DIAGNOSTICS = 1 << 5
 CAPABILITY_CAN_DIAGNOSTICS_V2 = 1 << 6
 CAPABILITY_CAN_TIMING_PROFILE = 1 << 7
+CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED = 1 << 8
 CAN_DIAGNOSTICS_WINDOW_ACTIVE = 1 << 0
 CAN_DIAGNOSTICS_EPOCH_STABLE = 1 << 1
 CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC = 1 << 2
@@ -620,6 +624,29 @@ def unpack_joint_target(
     if values[15] == 0:
         raise ProtocolError("control tick ID must be non-zero")
     return action, velocity, values[13], values[14], values[15]
+
+
+def pack_joint_position_seed(position_rad: np.ndarray) -> bytes:
+    position = np.asarray(position_rad, dtype=np.float32)
+    if position.shape != (6,):
+        raise ProtocolError("absolute joint-position seed must contain six values")
+    if not np.isfinite(position).all():
+        raise ProtocolError("absolute joint-position seed contains NaN or Inf")
+    return JOINT_POSITION_SEED.pack(
+        *position, JOINT_POSITION_SEED_CONFIRMATION
+    )
+
+
+def unpack_joint_position_seed(payload: bytes) -> np.ndarray:
+    if len(payload) != JOINT_POSITION_SEED.size:
+        raise ProtocolError("invalid SEED_JOINT_POSITION payload length")
+    *raw_position, confirmation = JOINT_POSITION_SEED.unpack(payload)
+    if confirmation != JOINT_POSITION_SEED_CONFIRMATION:
+        raise ProtocolError("invalid SEED_JOINT_POSITION confirmation")
+    position = np.asarray(raw_position, dtype=np.float32)
+    if not np.isfinite(position).all():
+        raise ProtocolError("absolute joint-position seed contains NaN or Inf")
+    return position
 
 
 def pack_target_keepalive(action_sequence: int, control_tick_id: int) -> bytes:

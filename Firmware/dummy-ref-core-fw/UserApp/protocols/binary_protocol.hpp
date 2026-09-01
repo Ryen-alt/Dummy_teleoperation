@@ -21,6 +21,7 @@ constexpr uint32_t kCapabilityTimeSync = 1U << 4U;
 constexpr uint32_t kCapabilityCanDiagnostics = 1U << 5U;
 constexpr uint32_t kCapabilityCanDiagnosticsV2 = 1U << 6U;
 constexpr uint32_t kCapabilityCanTimingProfile = 1U << 7U;
+constexpr uint32_t kCapabilityAbsoluteJointPositionSeed = 1U << 8U;
 constexpr uint16_t kCanDiagnosticsFormatVersion = 2U;
 constexpr uint16_t kCanDiagnosticsPayloadSize = 380U;
 constexpr uint8_t kCanDiagnosticsWindowActive = 1U << 0U;
@@ -57,6 +58,7 @@ enum class MessageType : uint8_t
     TimeSync = 0x0B,
     GetCanDiagnostics = 0x0C,
     GetCanTimingProfile = 0x0D,
+    SeedJointPosition = 0x0E,
     HelloAck = 0x81,
     State = 0x82,
     Ack = 0x83,
@@ -97,6 +99,10 @@ enum class ResultCode : uint8_t
 };
 
 constexpr uint16_t kAckDetailFeedbackNotReady = 1U;
+constexpr uint16_t kAckDetailAbsoluteSeedConfirmation = 2U;
+constexpr uint16_t kAckDetailAbsoluteSeedModuloMismatch = 3U;
+constexpr uint16_t kAckDetailAbsoluteSeedAlreadyApplied = 4U;
+constexpr uint32_t kJointPositionSeedConfirmation = 0x53454544U; // "SEED"
 
 enum class DecodeStatus : uint8_t
 {
@@ -173,6 +179,12 @@ struct TimeSyncAckPayload
     uint64_t host_t0_ns;
     uint64_t mcu_rx_us;
     uint64_t mcu_tx_us;
+};
+
+struct JointPositionSeedPayload
+{
+    float position[6];
+    uint32_t confirmation;
 };
 
 struct AckPayload
@@ -364,6 +376,8 @@ static_assert(sizeof(JointTargetPayload) == 60, "JointTargetPayload layout chang
 static_assert(sizeof(TargetKeepalivePayload) == 8, "TargetKeepalivePayload layout changed");
 static_assert(sizeof(TimeSyncPayload) == 8, "TimeSyncPayload layout changed");
 static_assert(sizeof(TimeSyncAckPayload) == 24, "TimeSyncAckPayload layout changed");
+static_assert(sizeof(JointPositionSeedPayload) == 28,
+              "JointPositionSeedPayload layout changed");
 static_assert(sizeof(ActionProgressPayload) == 20, "ActionProgressPayload layout changed");
 static_assert(sizeof(ActionProgressRecord) == 24, "ActionProgressRecord layout changed");
 static_assert(sizeof(CanDiagnosticsPayload) == kCanDiagnosticsPayloadSize,

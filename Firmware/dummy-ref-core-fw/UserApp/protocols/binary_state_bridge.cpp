@@ -47,6 +47,8 @@ void LatchCoherentRobotMeasurement()
         coherent_measurement.position_sweep_id = coherence.position_sweep_id;
         coherent_measurement.coherent_sweep_id = coherence.sweep_id;
         coherent_measurement.max_skew_us = coherence.max_skew_us;
+        coherent_measurement.absolute_position_generation =
+            robot.AbsoluteJointPositionGeneration();
     }
     taskEXIT_CRITICAL();
 }
@@ -60,16 +62,22 @@ BinaryRobotMeasurement ReadRobotStateForBinaryProtocol(
     taskEXIT_CRITICAL();
     const bool coherent_valid = output.coherent_sweep_id != 0U &&
         output.max_skew_us <= dummy::generated_config::kCoherentMaxSkewUs;
+    const uint32_t absolute_position_generation =
+        robot.AbsoluteJointPositionGeneration();
+    const bool arm_absolute_valid = absolute_position_generation != 0U &&
+        output.absolute_position_generation == absolute_position_generation;
     const bool gripper_position_valid = coherent_valid &&
         robot.hand != nullptr && safety.gripper_position_valid;
     output.validity = PositionFeedbackValidityBits(
-        coherent_valid && safety.arm_position_valid, gripper_position_valid);
+        coherent_valid && arm_absolute_valid && safety.arm_position_valid,
+        gripper_position_valid);
 
     static MeasuredStateEstimator estimator;
     const auto estimate = estimator.Update(
         output.position, output.position_sample_us,
         output.coherent_sweep_id,
-        coherent_valid && safety.arm_position_valid && gripper_position_valid);
+        coherent_valid && arm_absolute_valid && safety.arm_position_valid &&
+            gripper_position_valid);
     output.velocity = estimate.velocity;
     output.repeated = estimate.repeated;
     if (estimate.valid)

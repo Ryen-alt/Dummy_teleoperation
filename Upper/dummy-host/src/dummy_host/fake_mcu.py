@@ -15,6 +15,7 @@ from .protocol import (
     CAPABILITY_CAN_DIAGNOSTICS,
     CAPABILITY_CAN_DIAGNOSTICS_V2,
     CAPABILITY_CAN_TIMING_PROFILE,
+    CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED,
     CAN_DIAGNOSTICS_FORMAT_VERSION,
     CAN_DIAGNOSTICS_MARKERS_COMPLETE,
     CAN_DIAGNOSTICS_MOTOR_COUNTERS_MONOTONIC,
@@ -40,6 +41,7 @@ from .protocol import (
     pack_time_sync_ack,
     unpack_hello,
     unpack_joint_target,
+    unpack_joint_position_seed,
     unpack_target_keepalive,
     unpack_time_sync,
 )
@@ -79,6 +81,7 @@ class FakeMcuTransport:
         | CAPABILITY_CAN_DIAGNOSTICS
         | CAPABILITY_CAN_DIAGNOSTICS_V2
         | CAPABILITY_CAN_TIMING_PROFILE
+        | CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED
     )
 
     def __init__(
@@ -86,6 +89,7 @@ class FakeMcuTransport:
         config: RobotConfig,
         *,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        absolute_position_seeded: bool = True,
     ) -> None:
         self.config = config
         self.clock_ns = clock_ns
@@ -96,6 +100,7 @@ class FakeMcuTransport:
         self._session = 0
         self._mode = ControlMode.HOLD
         self._fault_bits = 0
+        self._absolute_position_seeded = absolute_position_seeded
         self._hold_reason_bits = 0
         self._last_received = 0
         self._has_received_target = False
@@ -349,11 +354,36 @@ class FakeMcuTransport:
             self._ack(packet)
             self._emit_state(packet.sequence)
             return
+        if packet.message_type == MessageType.SEED_JOINT_POSITION:
+            if packet.session_id != self._session:
+                self._nack(packet, ResultCode.BAD_SESSION)
+                return
+            if self._lease or self._absolute_position_seeded:
+                self._nack(packet, ResultCode.BAD_MODE)
+                return
+            try:
+                reference = unpack_joint_position_seed(packet.payload)
+            except ValueError:
+                self._nack(packet, ResultCode.BAD_LENGTH)
+                return
+            if np.any(reference < self.config.joint_limit_min_rad) or np.any(
+                reference > self.config.joint_limit_max_rad
+            ):
+                self._nack(packet, ResultCode.OUT_OF_RANGE)
+                return
+            self._position[:6] = reference
+            self._absolute_position_seeded = True
+            self._ack(packet)
+            self._emit_state(packet.sequence)
+            return
         if packet.message_type == MessageType.ACQUIRE_CONTROL:
             if len(packet.payload) != ACQUIRE_CONTROL.size:
                 self._nack(packet, ResultCode.BAD_LENGTH)
                 return
             lease_ms = ACQUIRE_CONTROL.unpack(packet.payload)[0]
+            if not self._absolute_position_seeded:
+                self._nack(packet, ResultCode.BAD_MODE)
+                return
             if lease_ms == 0 or lease_ms > self.config.lease_timeout_ms:
                 self._nack(packet, ResultCode.OUT_OF_RANGE)
                 return
@@ -566,8 +596,8 @@ class FakeMcuTransport:
             mcu_time_us=now_ns // 1_000,
             mode=self._mode,
             fault_bits=self._fault_bits,
-            position_valid=True,
-            velocity_valid=True,
+            position_valid=self._absolute_position_seeded,
+            velocity_valid=self._absolute_position_seeded,
             gripper_valid=self.config.gripper_state_feedback,
             last_received_sequence=self._last_received,
             target_age_ms=0

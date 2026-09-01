@@ -12,6 +12,7 @@ from dummy_host.protocol import (
     ACTION_PROGRESS,
     CAPABILITY_CAN_DIAGNOSTICS_V2,
     CAPABILITY_CAN_TIMING_PROFILE,
+    CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED,
     CAN_DIAGNOSTICS_WINDOW_VALID,
     ActionProgressStage,
     MessageType,
@@ -135,6 +136,15 @@ class V222WithoutCanTimingProfile(FakeMcuTransport):
     )
 
 
+class V222WithoutAbsolutePositionSeed(FakeMcuTransport):
+    is_simulated = False
+    firmware_version = "dummy-ref-v2.2.2"
+    firmware_capabilities = (
+        FakeMcuTransport.firmware_capabilities
+        & ~CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED
+    )
+
+
 def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
     robot = DummyRobot(config, FakeMcuTransport(config))
     with robot:
@@ -162,6 +172,33 @@ def test_dummy_robot_fake_mcu_closed_loop(config) -> None:
         while robot.read_state().mode != ControlMode.HOLD and time.monotonic() < deadline:
             time.sleep(0.005)
         assert robot.read_state().mode == ControlMode.HOLD
+
+
+def test_absolute_joint_position_must_be_explicitly_seeded_before_control(config) -> None:
+    transport = FakeMcuTransport(config, absolute_position_seeded=False)
+    robot = DummyRobot(config, transport, connect_timeout_s=0.3)
+
+    with robot:
+        assert not robot.read_state().position_valid
+        with pytest.raises(RobotError, match="absolute arm position is unseeded"):
+            robot.acquire_control(ControlMode.TELEOP)
+        with pytest.raises(RobotError, match="stationary-reference confirmation"):
+            robot.seed_absolute_joint_position(config.initial_pose_rad)
+        assert not robot.read_state().position_valid
+
+        state = robot.seed_absolute_joint_position(
+            config.initial_pose_rad,
+            stationary_reference_confirmed=True,
+        )
+        assert state.position_valid
+        np.testing.assert_allclose(
+            state.position[:6], config.initial_pose_rad, atol=1e-6
+        )
+        with pytest.raises(RobotError, match="already valid"):
+            robot.seed_absolute_joint_position(
+                config.initial_pose_rad,
+                stationary_reference_confirmed=True,
+            )
 
 
 def test_control_acquire_rejects_feedback_outside_hard_limits(config) -> None:
@@ -453,6 +490,13 @@ def test_v222_firmware_without_diagnostics_v2_is_rejected(config) -> None:
 
 def test_v222_firmware_without_can_timing_profile_is_rejected(config) -> None:
     robot = DummyRobot(config, V222WithoutCanTimingProfile(config))
+    with pytest.raises(ConfigError, match="missing required protocol-v5"):
+        robot.connect()
+    assert not robot.is_connected
+
+
+def test_v222_firmware_without_absolute_position_seed_is_rejected(config) -> None:
+    robot = DummyRobot(config, V222WithoutAbsolutePositionSeed(config))
     with pytest.raises(ConfigError, match="missing required protocol-v5"):
         robot.connect()
     assert not robot.is_connected

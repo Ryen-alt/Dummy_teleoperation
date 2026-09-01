@@ -30,6 +30,7 @@ from .protocol import (
     CAPABILITY_CAN_DIAGNOSTICS,
     CAPABILITY_CAN_DIAGNOSTICS_V2,
     CAPABILITY_CAN_TIMING_PROFILE,
+    CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED,
     ACK_DETAIL_FEEDBACK_NOT_READY,
     ACQUIRE_CONTROL,
     ActionProgressStage,
@@ -42,6 +43,7 @@ from .protocol import (
     monotonic_us,
     pack_hello,
     pack_joint_target,
+    pack_joint_position_seed,
     pack_target_keepalive,
     pack_time_sync,
     unpack_ack,
@@ -231,6 +233,7 @@ class DummyRobot:
                     | CAPABILITY_CAN_DIAGNOSTICS
                     | CAPABILITY_CAN_DIAGNOSTICS_V2
                     | CAPABILITY_CAN_TIMING_PROFILE
+                    | CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED
                 )
                 != (
                     CAPABILITY_MULTI_CHANNEL_SEQUENCE
@@ -241,11 +244,13 @@ class DummyRobot:
                     | CAPABILITY_CAN_DIAGNOSTICS
                     | CAPABILITY_CAN_DIAGNOSTICS_V2
                     | CAPABILITY_CAN_TIMING_PROFILE
+                    | CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED
                 )
             ):
                 raise ConfigError(
                     "dummy-ref-v2.2.2 firmware is missing required protocol-v5 "
-                    "execution-evidence capabilities; rebuild and reflash v2.2.2"
+                    "execution-evidence or absolute-position capabilities; "
+                    "rebuild and reflash v2.2.2"
                 )
             self._wait_for_first_state(deadline)
             self._connected = True
@@ -268,11 +273,79 @@ class DummyRobot:
         self._stop_reader_and_transport()
         self._connected = False
 
+    def seed_absolute_joint_position(
+        self,
+        position_rad: np.ndarray,
+        *,
+        stationary_reference_confirmed: bool = False,
+    ) -> RobotState:
+        """Select the six arm multi-turn branches without commanding motion.
+
+        ``position_rad`` must describe the known physical URDF pose.  The
+        firmware accepts only integer motor-turn offsets congruent with its
+        current single-turn encoder readings, and deliberately forgets the
+        result on every main-controller reboot.
+        """
+
+        self._require_connected()
+        if not stationary_reference_confirmed:
+            raise RobotError(
+                "absolute joint-position seeding requires an explicit "
+                "stationary-reference confirmation"
+            )
+        if self._control_acquired:
+            raise RobotError(
+                "absolute joint-position seeding is forbidden while control is acquired"
+            )
+        if not self.firmware_capabilities & CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED:
+            raise ConfigError(
+                "firmware does not support fail-closed absolute joint-position seeding"
+            )
+
+        reference = np.asarray(position_rad, dtype=np.float32)
+        if reference.shape != (6,) or not np.isfinite(reference).all():
+            raise RobotError(
+                "absolute joint-position reference must contain six finite radians"
+            )
+        if np.any(reference < self.config.joint_limit_min_rad) or np.any(
+            reference > self.config.joint_limit_max_rad
+        ):
+            raise RobotError(
+                "absolute joint-position reference is outside configured hard limits"
+            )
+        if self.read_state().position_valid:
+            raise RobotError(
+                "absolute joint position is already valid; reboot before selecting another branch"
+            )
+
+        self._expect_ack(
+            self._request(
+                MessageType.SEED_JOINT_POSITION,
+                pack_joint_position_seed(reference),
+            ),
+            MessageType.SEED_JOINT_POSITION,
+        )
+        tolerance_rad = 0.021
+        return self.wait_for_feedback_ready(
+            state_validator=lambda state: bool(
+                np.all(np.abs(state.position[:6] - reference) <= tolerance_rad)
+            )
+        )
+
     def acquire_control(self, mode: str | ControlMode) -> None:
         self._require_connected()
         target_mode = ControlMode[mode.upper()] if isinstance(mode, str) else ControlMode(mode)
         if target_mode not in (ControlMode.TELEOP, ControlMode.POLICY):
             raise RobotError("control can only be acquired in TELEOP or POLICY mode")
+        if (
+            self.firmware_capabilities
+            & CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED
+            and not self.read_state().position_valid
+        ):
+            raise RobotError(
+                "cannot acquire control: absolute arm position is unseeded; "
+                "run dummy-host-seed-joints from a trusted stationary reference"
+            )
         if not self.transport.is_simulated and not self.allow_unverified_hardware:
             if not self.config.hardware_parameters_verified:
                 raise ConfigError("real external target execution hardware is not verified")
@@ -796,7 +869,8 @@ class DummyRobot:
             | CAPABILITY_TIME_SYNC
             | CAPABILITY_CAN_DIAGNOSTICS
             | CAPABILITY_CAN_DIAGNOSTICS_V2
-            | CAPABILITY_CAN_TIMING_PROFILE,
+            | CAPABILITY_CAN_TIMING_PROFILE
+            | CAPABILITY_ABSOLUTE_JOINT_POSITION_SEED,
         )
         last_timeout: RobotError | None = None
         while True:

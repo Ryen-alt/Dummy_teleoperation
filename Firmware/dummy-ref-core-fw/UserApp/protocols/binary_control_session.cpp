@@ -91,6 +91,40 @@ ProcessResult ControlSession::Process(const Packet& request, uint64_t now_us)
         result.can_timing_profile_requested = true;
         return result;
     }
+    // Selecting the post-reboot multi-turn branch is a no-motion maintenance
+    // operation.  It is deliberately restricted to the configured HELLO
+    // epoch before any control lease exists.  Hardware feedback congruence is
+    // checked by the robot bridge before this provisional ACK is transmitted.
+    if (message_type == MessageType::SeedJointPosition)
+    {
+        if (!hello_valid_ || request.header.session_id != hello_session_id_)
+            return Ack(request, ResultCode::BadSession);
+        if (lease_active_ || mode_ != ControlMode::Hold)
+            return Ack(request, ResultCode::BadMode);
+        if (fault_bits_ != 0U)
+            return Ack(request, ResultCode::FaultActive);
+        JointPositionSeedPayload payload{};
+        if (!ReadPayload(request, payload))
+            return Ack(request, ResultCode::BadLength);
+        if (payload.confirmation != kJointPositionSeedConfirmation)
+            return Ack(request, ResultCode::BadConfig,
+                       kAckDetailAbsoluteSeedConfirmation);
+        if (!IsNewerSequence(request.header.sequence, hello_sequence_))
+            return Ack(request, ResultCode::BadSequence);
+        for (size_t index = 0U; index < 6U; ++index)
+        {
+            if (!std::isfinite(payload.position[index]))
+                return Ack(request, ResultCode::NonFinite);
+            if (payload.position[index] < config_.joint_min_rad[index] ||
+                payload.position[index] > config_.joint_max_rad[index])
+                return Ack(request, ResultCode::OutOfRange);
+        }
+        hello_sequence_ = request.header.sequence;
+        ProcessResult result = Ack(request);
+        result.joint_position_seed_requested = true;
+        result.joint_position_seed = payload;
+        return result;
+    }
     if (message_type == MessageType::EmergencyStop)
     {
         SetFault(kFaultEmergencyStop);
@@ -414,7 +448,8 @@ ProcessResult ControlSession::Hello(const Packet& request)
         kCapabilityCanTxCompleteExact |
         kCapabilityControlFreshnessToken | kCapabilityTimeSync |
         kCapabilityCanDiagnostics | kCapabilityCanDiagnosticsV2 |
-        kCapabilityCanTimingProfile;
+        kCapabilityCanTimingProfile |
+        kCapabilityAbsoluteJointPositionSeed;
     std::copy(firmware_version_.begin(), firmware_version_.end(), response.firmware_version);
     WritePayload(output.response, response);
     return output;

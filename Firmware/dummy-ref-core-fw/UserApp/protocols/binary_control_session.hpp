@@ -45,6 +45,8 @@ struct ProcessResult
     bool emergency_stop_requested = false;
     bool can_diagnostics_requested = false;
     bool can_timing_profile_requested = false;
+    bool joint_position_seed_requested = false;
+    JointPositionSeedPayload joint_position_seed{};
 };
 
 class ControlSession
