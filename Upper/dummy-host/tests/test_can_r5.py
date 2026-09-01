@@ -107,6 +107,40 @@ def test_r5_selects_branch_b_without_increasing_retries() -> None:
     assert "do not increase" in decision.retry_policy
 
 
+def test_r5_a9_margin_miss_has_reachable_30_hz_fallback() -> None:
+    delayed_tail = replace(
+        _profile(),
+        position_p99_us=(1408,) * 7,
+        position_p999_us=(1408,) * 7,
+        position_max_us=(1412,) * 7,
+    )
+    first_pass = evaluate_can_r5(
+        delayed_tail,
+        _runtime(),
+        current_node_quiet_us=5000,
+        current_response_timeout_us=4000,
+        current_position_hz_per_node=40,
+    )
+
+    assert first_pass.result == "RETEST_B"
+    assert first_pass.branch == "B_REDUCE_TO_30_HZ"
+    assert first_pass.recommended_position_hz_per_node == 30
+    assert first_pass.recommended_node_quiet_us == 1608
+    assert first_pass.recommended_response_timeout_us == 1608
+
+    retest = evaluate_can_r5(
+        delayed_tail,
+        _runtime(),
+        current_node_quiet_us=1608,
+        current_response_timeout_us=1608,
+        current_position_hz_per_node=30,
+    )
+
+    assert retest.result == "PASS"
+    assert retest.branch == "B_VERIFY_30_HZ"
+    assert retest.configuration_ready
+
+
 def test_r5_branch_b_passes_after_measured_rate_and_timeout_are_retested() -> None:
     slow = replace(
         _profile(),

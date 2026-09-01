@@ -97,6 +97,16 @@ def evaluate_can_r5(
         (*profile.position_p99_us, *profile.temperature_p99_us), default=0
     )
     recommended_position_hz = current_position_hz_per_node
+    branch_a_margin_ok = (
+        a9.recommended_node_quiet_us <= 500
+        and a9.recommended_response_timeout_us <= 1000
+    )
+    # Branch A is defined by both 40 Hz transaction capacity and the A9
+    # 500/1000 us latency margins.  A margin miss must have a reachable,
+    # bounded fallback even when P99 is still well below the 3.57 ms slot;
+    # select the conservative 30 Hz branch, then use the measured timeout.
+    if current_position_hz_per_node == 40 and not branch_a_margin_ok:
+        recommended_position_hz = 30
     if transaction_p99_us >= thresholds.branch_b_limit_transaction_us:
         recommended_position_hz = 25
     elif transaction_p99_us >= thresholds.branch_b_warning_transaction_us:
@@ -262,7 +272,10 @@ def evaluate_can_r5(
         formulas={
             "node_quiet": "ceil(max motor 0x05 p99.9 + 100 us), then preserve response<=quiet",
             "response_timeout": "max(position/temperature p99.9) + 200 us",
-            "branch_b": "single-outstanding slot = floor(1e6/(position_hz*7)) us",
+            "branch_b": (
+                "select 30 Hz when A9 500/1000 us margins fail; otherwise "
+                "single-outstanding slot = floor(1e6/(position_hz*7)) us"
+            ),
         },
         current_configuration={
             "can_node_quiet_us": current_node_quiet_us,

@@ -224,8 +224,8 @@ drop/error、missed tick、deadline failure、action-credit miss/defer 全为零
 
 - `PASS`：当前配置与测量公式完全一致，可以冻结 R5；
 - `RECONFIGURE`：把 quiet/timeout 改为建议值，重新 codegen、构建、刷写并采全新 10 分钟；
-- `RETEST_B`：40 Hz 单事务预算不足，按建议降到 30/25 Hz，控制循环仍保持 20 Hz，
-  不增加重试，再采全新 10 分钟；
+- `RETEST_B`：40 Hz 不满足 A9 的 500/1000 us 裕量，或单事务预算不足；按建议降到
+  30/25 Hz，控制循环仍保持 20 Hz，不增加重试，再采全新 10 分钟；
 - `REVIEW_C`：只有单 outstanding 无法满足明确的更高反馈率需求时，进入有限并发专项
   评审；不允许无限 outstanding；
 - `FAIL`：证据或严格运行门失败，禁止用放宽阈值绕过。
