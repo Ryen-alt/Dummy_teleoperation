@@ -17,6 +17,7 @@ enum HoldReasonBits : uint16_t
     kHoldReasonFeedbackStale = 1U << 3U,
     kHoldReasonOperator = 1U << 4U,
     kHoldReasonRuntimeLimit = 1U << 5U,
+    kHoldReasonDispatcherStalled = 1U << 6U,
 };
 
 enum FaultBits : uint16_t
@@ -66,6 +67,10 @@ struct FeedbackSafetyConfig
     uint32_t temperature_max_age_ms = 2500;
     float temperature_fault_c = 75.0F;
     uint32_t temperature_fault_ms = 1000;
+    // Dispatcher liveness supervision (doc 05 section 10.3). The consumer
+    // measures the age of the last successful snapshot publish with its own
+    // clock; a stalled dispatcher must not leave "fresh" frozen samples.
+    uint32_t dispatcher_stall_hold_ms = 100;
 };
 
 struct FeedbackSafetyInput
@@ -73,6 +78,8 @@ struct FeedbackSafetyInput
     uint64_t now_us = 0;
     bool control_active = false;
     bool following_active = false;
+    bool dispatcher_published = false;
+    uint32_t dispatcher_progress_age_ms = 0U;
     std::array<float, kActuatorNodeCount> commanded_position{};
     std::array<float, kActuatorNodeCount> measured_position{};
     std::array<NodeFeedbackStatus, kActuatorNodeCount> feedback{};

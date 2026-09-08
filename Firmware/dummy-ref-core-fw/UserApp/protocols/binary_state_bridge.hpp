@@ -31,6 +31,10 @@ struct BinaryRobotMeasurement
     uint32_t max_skew_us = 0;
     uint32_t absolute_position_generation = 0;
     bool repeated = false;
+    // Every node of the coherent round contributed a sealed value-metadata
+    // pair; a false value must downgrade the published observation instead
+    // of silently mixing rounds (doc 05 section 10.2).
+    bool sealed = false;
 };
 
 // Called by the CAN dispatcher immediately after consuming a completed sweep.

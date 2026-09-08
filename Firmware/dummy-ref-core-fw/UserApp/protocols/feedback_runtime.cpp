@@ -3,9 +3,14 @@
 #include "configurations/robot_config_generated.hpp"
 #include "published_double_buffer.hpp"
 #include "can_timing_profiler.hpp"
+#include "joint_space_mapping.hpp"
+#include "monotonic_micros.hpp"
 #include "../../../can_transport_contract.h"
 
 #include <algorithm>
+#include <cmath>
+
+extern DummyRobot robot;
 
 namespace dummy::protocol
 {
@@ -28,10 +33,14 @@ uint32_t readiness_sweep_id = 0U;
 uint8_t consecutive_coherent_sweeps = 0U;
 MotorTransportDiagnostics motor_transport_diagnostics{};
 CanTimingProfiler can_timing_profiler{};
+std::array<SealedJointSample, kActuatorNodeCount> sealed_joint_samples{};
+uint32_t last_feedback_publish_us = 0U;
+uint32_t feedback_publish_failure_count = 0U;
 
 struct FeedbackPublishedSnapshot
 {
     std::array<NodeFeedbackStatus, kActuatorNodeCount> nodes{};
+    std::array<SealedJointSample, kActuatorNodeCount> sealed{};
     CoherentFeedbackStatus coherent{};
     MotorTransportDiagnostics motor_transport{};
 };
@@ -44,6 +53,26 @@ uint8_t NodeMask(uint8_t node_id)
 {
     return node_id >= 1U && node_id <= kActuatorNodeCount
         ? static_cast<uint8_t>(1U << (node_id - 1U)) : 0U;
+}
+
+float UrdfPositionForNode(uint8_t node_id)
+{
+    if (node_id >= 1U && node_id <= 6U)
+    {
+        const size_t index = node_id - 1U;
+        return LegacyFirmwareDegreesToUrdfRadians(
+            robot.currentJoints.a[index], index);
+    }
+    if (node_id == kActuatorNodeCount && robot.hand != nullptr)
+    {
+        const float travel =
+            robot.hand->closedAngle - robot.hand->openedAngle;
+        if (std::fabs(travel) > 1e-6F)
+            return std::clamp(
+                (robot.hand->angle - robot.hand->openedAngle) / travel,
+                0.0F, 1.0F);
+    }
+    return 0.0F;
 }
 }
 
@@ -72,10 +101,30 @@ bool RecordPositionFeedbackResponse(uint8_t node_id, uint32_t received_us)
     return true;
 }
 
+void SealJointPositionSample(uint8_t node_id, uint32_t received_us)
+{
+    if (node_id < 1U || node_id > kActuatorNodeCount)
+        return;
+    const uint32_t sweep_id = feedback_monitor.NodePositionSweepId(node_id);
+    if (sweep_id == 0U)
+        return;
+    SealedJointSample& sample = sealed_joint_samples[node_id - 1U];
+    sample.position = UrdfPositionForNode(node_id);
+    sample.received_us = received_us;
+    sample.sweep_id = sweep_id;
+    sample.valid = true;
+}
+
 void RecordPositionFeedbackTimeout(uint8_t node_id)
 {
     feedback_monitor.OnPositionTimeout(node_id);
     can_timing_profiler.RecordPositionTimeout(node_id);
+}
+
+void RecordFeedbackAdmissionOutcome(const CanDispatchStep& outcome)
+{
+    if (ApplyFeedbackAdmissionOutcome(feedback_monitor, outcome))
+        can_timing_profiler.RecordPositionTimeout(outcome.cancelled_position_node_id);
 }
 
 void RecordTemperatureFeedbackRequest(uint8_t node_id)
@@ -89,7 +138,7 @@ void RecordTemperatureTimingStart(uint8_t node_id, uint32_t completed_us)
     can_timing_profiler.RecordTemperatureRequest(node_id, completed_us);
 }
 
-void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c,
+bool RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c,
                                        uint32_t received_us)
 {
     can_timing_profiler.RecordTemperatureResponse(node_id, received_us);
@@ -98,10 +147,11 @@ void RecordTemperatureFeedbackResponse(uint8_t node_id, float temperature_c,
     {
         if (unexpected_temperature_response_count != UINT32_MAX)
             ++unexpected_temperature_response_count;
-        return;
+        return false;
     }
     temperature_response_mask = static_cast<uint8_t>(
         temperature_response_mask | NodeMask(node_id));
+    return true;
 }
 
 void RecordMotorTransportDiagnostics(uint8_t node_id, const uint8_t* data,
@@ -204,14 +254,48 @@ void PublishFeedbackSnapshot(uint32_t now_us)
     snapshot.nodes = feedback_monitor.Snapshot(now_us);
     snapshot.coherent = feedback_monitor.CoherentSnapshot();
     snapshot.motor_transport = motor_transport_diagnostics;
-    (void) feedback_snapshot.TryPublish(snapshot);
+    snapshot.sealed = sealed_joint_samples;
+    if (feedback_snapshot.TryPublish(snapshot))
+    {
+        last_feedback_publish_us = now_us;
+    }
+    else if (feedback_publish_failure_count != UINT32_MAX)
+    {
+        ++feedback_publish_failure_count;
+    }
 }
 
 std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(
     uint32_t now_us)
 {
-    (void) now_us;
-    return feedback_snapshot.Read().nodes;
+    // INV-05: ages are recomputed from the sealed absolute sample times with
+    // the consumer's own clock. A dispatcher that stops publishing therefore
+    // produces growing ages here instead of a frozen "still fresh" snapshot.
+    auto nodes = feedback_snapshot.Read().nodes;
+    for (auto& node : nodes)
+    {
+        node.position_age_ms = node.position_seen
+            ? RecentElapsedMicros32(now_us, node.position_sample_us) / 1000U
+            : kFeedbackAgeUnknown;
+        node.temperature_age_ms = node.temperature_seen
+            ? RecentElapsedMicros32(now_us, node.temperature_sample_us) / 1000U
+            : kFeedbackAgeUnknown;
+    }
+    return nodes;
+}
+
+std::array<SealedJointSample, kActuatorNodeCount> ReadSealedJointSamples()
+{
+    return feedback_snapshot.Read().sealed;
+}
+
+FeedbackRuntimeProgress ReadFeedbackRuntimeProgress()
+{
+    taskENTER_CRITICAL();
+    const FeedbackRuntimeProgress progress{
+        last_feedback_publish_us, feedback_publish_failure_count};
+    taskEXIT_CRITICAL();
+    return progress;
 }
 
 CoherentFeedbackStatus ReadCoherentFeedbackStatus()

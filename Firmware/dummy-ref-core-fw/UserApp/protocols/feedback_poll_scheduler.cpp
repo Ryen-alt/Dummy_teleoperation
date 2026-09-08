@@ -1,4 +1,5 @@
 #include "feedback_poll_scheduler.hpp"
+#include "monotonic_micros.hpp"
 #include "../../../can_transport_contract.h"
 
 #include <algorithm>
@@ -8,6 +9,9 @@ namespace dummy::protocol
 {
 namespace
 {
+constexpr uint8_t kAllNodeMask = static_cast<uint8_t>(
+    (1U << kActuatorNodeCount) - 1U);
+
 uint8_t NodeMask(uint8_t node_id)
 {
     return node_id >= 1U && node_id <= kActuatorNodeCount
@@ -215,14 +219,31 @@ uint8_t CanDispatchScheduler::SelectPositionRetryNode() const
 
 void CanDispatchScheduler::FinishPositionSweep(uint32_t now_us)
 {
+    const uint32_t finished_sweep_id = position_sweep_id_;
+    const uint8_t finished_valid_mask = position_sweep_valid_mask_;
     position_sweep_active_ = false;
     position_sweep_count_ = 0U;
+    position_sweep_valid_mask_ = 0U;
     position_sweep_id_ = 0U;
     position_retry_mask_ = 0U;
     position_retry_phase_ = false;
     position_pending_.fill(false);
     position_attempts_.fill(0U);
     position_sweep_start_node_ = NextNode(position_sweep_start_node_);
+
+    // A sweep only proves "fresh feedback" when every required node produced
+    // an accepted response inside it. Partial sweeps may still feed the
+    // per-node safety view but never unlock ReadyNoTarget.
+    if (phase_ == CanStreamPhase::AwaitFreshFeedback &&
+        finished_valid_mask == kAllNodeMask)
+    {
+        phase_ = CanStreamPhase::ReadyNoTarget;
+        diagnostics_.ready_sweep_id = finished_sweep_id;
+        diagnostics_.ready_time_us = now_us;
+        phase_ready_pending_ = true;
+        phase_ready_sweep_id_ = finished_sweep_id;
+    }
+
     const uint32_t period_us = CyclePeriodUs(config_.position_hz_per_node);
     if (period_us == 0U)
     {
@@ -307,6 +328,14 @@ void CanDispatchScheduler::ConsumeResponses(
             position_pending_[node_id - 1U] = false;
             position_retry_mask_ = static_cast<uint8_t>(
                 position_retry_mask_ & ~mask);
+            // The monitor only reports responses it accepted for the pending
+            // sweep, so these bits build the per-sweep completeness evidence.
+            if (position_sweep_active_)
+                position_sweep_valid_mask_ = static_cast<uint8_t>(
+                    position_sweep_valid_mask_ | mask);
+            if (phase_ == CanStreamPhase::AwaitFreshFeedback)
+                phase_valid_mask_ = static_cast<uint8_t>(
+                    phase_valid_mask_ | mask);
         }
         if ((responses.temperature_mask & mask) != 0U)
             diagnostics_.temperature_responded[node_id - 1U] = SaturatingIncrement(
@@ -362,17 +391,58 @@ void CanDispatchScheduler::ConsumeResponses(
         FinishPositionSweep(now_us);
 }
 
+void CanDispatchScheduler::FlushPhaseEvents(CanDispatchStep& step)
+{
+    if (phase_ready_pending_)
+    {
+        step.fresh_feedback_ready = true;
+        step.fresh_feedback_sweep_id = phase_ready_sweep_id_;
+        phase_ready_pending_ = false;
+    }
+}
+
+void CanDispatchScheduler::SetDispatchInput(const DispatchInput& input)
+{
+    dispatch_input_ = input;
+}
+
+void CanDispatchScheduler::FailClosedStream()
+{
+    // Stop all periodic service without manufacturing terminal states for
+    // transactions that never started. Only SetMode() re-arms traffic.
+    periodic_traffic_stopped_ = true;
+    deadlines_initialized_ = false;
+    next_target_deadline_us_ = 0U;
+    next_position_deadline_us_ = 0U;
+    next_temperature_deadline_us_ = 0U;
+    next_timing_profile_deadline_us_ = 0U;
+    target_fanout_active_ = false;
+    target_fanout_node_ = 1U;
+    phase_ = CanStreamPhase::Idle;
+}
+
 void CanDispatchScheduler::SetMode(CanDispatchMode mode)
 {
     if (mode == mode_)
         return;
     mode_ = mode;
     transition_node_ = 1U;
+    transition_frame_queued_ = false;
+    transition_queued_us_ = 0U;
     deadlines_initialized_ = false;
+    periodic_traffic_stopped_ = false;
+    fresh_feedback_baseline_us_ = 0U;
+    post_enable_feedback_deadline_us_ = 0U;
+    phase_valid_mask_ = 0U;
+    phase_ready_pending_ = false;
+    phase_ready_sweep_id_ = 0U;
     target_fanout_active_ = false;
     target_fanout_node_ = 1U;
+    target_fanout_action_sequence_ = 0U;
+    target_fanout_generation_ = 0U;
     position_sweep_active_ = false;
     position_sweep_count_ = 0U;
+    position_sweep_valid_mask_ = 0U;
     position_sweep_id_ = 0U;
     position_retry_mask_ = 0U;
     position_retry_phase_ = false;
@@ -383,12 +453,26 @@ void CanDispatchScheduler::SetMode(CanDispatchMode mode)
     pending_action_ = CanDispatchAction::None;
     pending_node_id_ = 0U;
     pending_transmitted_ = false;
-    if (mode == CanDispatchMode::Stream || mode == CanDispatchMode::Hold)
+    if (mode == CanDispatchMode::Stream)
+    {
+        phase_ = CanStreamPhase::Preflight;
         transition_ = Transition::HoldTargets;
+    }
+    else if (mode == CanDispatchMode::Hold)
+    {
+        phase_ = CanStreamPhase::Idle;
+        transition_ = Transition::HoldTargets;
+    }
     else if (mode == CanDispatchMode::Fault)
+    {
+        phase_ = CanStreamPhase::Idle;
         transition_ = Transition::Disable;
+    }
     else
+    {
+        phase_ = CanStreamPhase::Idle;
         transition_ = Transition::None;
+    }
 }
 
 CanDispatchStep CanDispatchScheduler::Next(
@@ -403,11 +487,14 @@ CanDispatchStep CanDispatchScheduler::Next(
         return {};
     }
     ConsumeResponses(responses, now_us, step);
-    if (transition_ == Transition::None && !deadlines_initialized_)
+    FlushPhaseEvents(step);
+    if (transition_ == Transition::None && !deadlines_initialized_ &&
+        !periodic_traffic_stopped_)
         InitializeDeadlines(now_us);
 
     if (query_pending_ && pending_transmitted_ &&
-        now_us - pending_since_us_ >= config_.response_timeout_us)
+        RecentElapsedMicros32(now_us, pending_since_us_) >=
+            config_.response_timeout_us)
     {
         step.timed_out_action = pending_action_;
         step.timed_out_node_id = pending_node_id_;
@@ -466,12 +553,56 @@ CanDispatchStep CanDispatchScheduler::Next(
             position_sweep_active_)
             AdvancePositionSweep(now_us);
     }
+    FlushPhaseEvents(step);
+
+    // A queued enable/disable frame must reach a terminal state within its
+    // own bounded budget. A lost completion callback cannot leave the stream
+    // in a transition that silently blocks feedback forever.
+    if ((transition_ == Transition::Enable ||
+         transition_ == Transition::Disable) &&
+        transition_frame_queued_ && transition_queued_us_ != 0U &&
+        config_.enable_completion_timeout_us != 0U &&
+        RecentElapsedMicros32(now_us, transition_queued_us_) >=
+            config_.enable_completion_timeout_us)
+    {
+        step.timed_out_action = transition_ == Transition::Enable
+            ? CanDispatchAction::EnableBroadcast
+            : CanDispatchAction::DisableBroadcast;
+        step.timed_out_final = true;
+        diagnostics_.enable_completion_timeout_count = SaturatingIncrement(
+            diagnostics_.enable_completion_timeout_count);
+        transition_ = Transition::None;
+        transition_frame_queued_ = false;
+        FailClosedStream();
+        return step;
+    }
+
+    // The AwaitFreshFeedback phase has a bounded budget of its own. Expiry is
+    // a startup/session failure, not something extra retries can repair.
+    if (phase_ == CanStreamPhase::AwaitFreshFeedback &&
+        post_enable_feedback_deadline_us_ != 0U &&
+        DeadlineDue(now_us, post_enable_feedback_deadline_us_))
+    {
+        step.post_enable_feedback_timeout = true;
+        step.post_enable_feedback_missing_mask = static_cast<uint8_t>(
+            kAllNodeMask & ~phase_valid_mask_);
+        diagnostics_.post_enable_feedback_timeout_count = SaturatingIncrement(
+            diagnostics_.post_enable_feedback_timeout_count);
+        FailClosedStream();
+        return step;
+    }
 
     // Emergency disable and HOLD transitions always outrank normal traffic.
     // The Bsp layer keeps exactly one frame in flight, so the next completion
     // interrupt is the only unavoidable safety delay.
     if (transition_ == Transition::Disable)
     {
+        if (transition_frame_queued_)
+        {
+            diagnostics_.idle_slot_count = SaturatingIncrement(
+                diagnostics_.idle_slot_count);
+            return step;
+        }
         step.action = CanDispatchAction::DisableBroadcast;
         step.transition = true;
         return step;
@@ -527,6 +658,12 @@ CanDispatchStep CanDispatchScheduler::Next(
 
     if (transition_ == Transition::Enable)
     {
+        if (transition_frame_queued_)
+        {
+            diagnostics_.idle_slot_count = SaturatingIncrement(
+                diagnostics_.idle_slot_count);
+            return step;
+        }
         if (AllNodesQuiet(now_us))
         {
             step.action = CanDispatchAction::EnableBroadcast;
@@ -545,16 +682,71 @@ CanDispatchStep CanDispatchScheduler::Next(
         return step;
     }
 
-    // A 50 Hz target deadline starts one frozen seven-node fan-out. Once
-    // started, TX-complete notifications drive nodes 2..7 immediately; the
-    // watchdog timer is no longer the throughput limiter.
-    if (mode_ == CanDispatchMode::Stream && !target_fanout_active_ &&
-        next_target_deadline_us_ != 0U &&
-        DeadlineDue(now_us, next_target_deadline_us_))
+    // Stream phase gate (doc 05 section 8): no fan-out is ever created from a
+    // missing target. AwaitFreshFeedback keeps the target deadline pending;
+    // ReadyNoTarget only moves to Streaming when a dispatchable target is
+    // actually available; Streaming itself skips a cycle instead of occupying
+    // the dispatcher when the target disappears.
+    if (mode_ == CanDispatchMode::Stream)
     {
-        target_fanout_active_ = true;
+        if (phase_ == CanStreamPhase::ReadyNoTarget &&
+            dispatch_input_.target_available &&
+            dispatch_input_.motion_authorized)
+        {
+            phase_ = CanStreamPhase::Streaming;
+            target_fanout_active_ = true;
+            target_fanout_node_ = 1U;
+            target_fanout_started_us_ = now_us;
+            target_fanout_action_sequence_ = dispatch_input_.action_sequence;
+            target_fanout_generation_ = dispatch_input_.target_generation;
+        }
+        else if (phase_ == CanStreamPhase::Streaming &&
+                 !target_fanout_active_ &&
+                 next_target_deadline_us_ != 0U &&
+                 DeadlineDue(now_us, next_target_deadline_us_))
+        {
+            if (dispatch_input_.target_available &&
+                dispatch_input_.motion_authorized)
+            {
+                target_fanout_active_ = true;
+                target_fanout_node_ = 1U;
+                target_fanout_started_us_ = now_us;
+                target_fanout_action_sequence_ =
+                    dispatch_input_.action_sequence;
+                target_fanout_generation_ =
+                    dispatch_input_.target_generation;
+            }
+            else
+            {
+                diagnostics_.target_unavailable_skip_count =
+                    SaturatingIncrement(
+                        diagnostics_.target_unavailable_skip_count);
+                const uint32_t period_us = CyclePeriodUs(
+                    config_.target_hz_per_node);
+                if (period_us != 0U)
+                    next_target_deadline_us_ = now_us + period_us;
+            }
+        }
+    }
+    // Frozen fan-out whose first frame has still not been admitted: bounded
+    // admission budget (doc 07 R04). Persistent Busy, a blocked channel or a
+    // stalled caller must terminate the batch instead of holding the
+    // dispatcher open forever.
+    if (target_fanout_active_ && target_fanout_node_ == 1U &&
+        config_.target_fanout_admission_timeout_us != 0U &&
+        RecentElapsedMicros32(now_us, target_fanout_started_us_) >=
+            config_.target_fanout_admission_timeout_us)
+    {
+        step.timed_out_action = CanDispatchAction::ActuatorTarget;
+        step.timed_out_node_id = target_fanout_node_;
+        step.timed_out_final = true;
+        diagnostics_.fanout_admission_timeout_count = SaturatingIncrement(
+            diagnostics_.fanout_admission_timeout_count);
+        target_fanout_active_ = false;
         target_fanout_node_ = 1U;
-        target_fanout_started_us_ = now_us;
+        target_fanout_action_sequence_ = 0U;
+        target_fanout_generation_ = 0U;
+        return step;
     }
     if (target_fanout_active_)
     {
@@ -588,6 +780,7 @@ CanDispatchStep CanDispatchScheduler::Next(
         position_retry_phase_ = false;
         position_pending_.fill(false);
         position_attempts_.fill(0U);
+        position_sweep_valid_mask_ = 0U;
         position_sweep_id_ = next_position_sweep_id_++;
         if (position_sweep_id_ == 0U)
         {
@@ -753,16 +946,73 @@ void CanDispatchScheduler::OnQueued(const CanDispatchStep& step, uint32_t now_us
     else if (transition_ == Transition::Enable ||
              transition_ == Transition::Disable)
     {
-        transition_ = Transition::None;
+        // The frame is in flight. The terminal state, or its bounded
+        // completion timeout, ends the transition; never re-emit the
+        // broadcast while its mailbox is busy.
+        transition_frame_queued_ = true;
+        transition_queued_us_ = now_us;
     }
-    if (transition_ == Transition::None && !deadlines_initialized_)
+    if (transition_ == Transition::None && !deadlines_initialized_ &&
+        !periodic_traffic_stopped_)
         InitializeDeadlines(now_us);
 }
 
 void CanDispatchScheduler::OnTransmissionCompleted(
     CanDispatchAction action, uint8_t node_id, uint32_t completed_us,
-    bool successful)
+    bool successful, uint32_t now_us)
 {
+    if (action == CanDispatchAction::EnableBroadcast &&
+        transition_ == Transition::Enable && transition_frame_queued_)
+    {
+        transition_ = Transition::None;
+        transition_frame_queued_ = false;
+        transition_queued_us_ = 0U;
+        if (successful)
+        {
+            // Old protocol: enable TX-complete is the observable baseline for
+            // "post-enable" feedback (doc 05 section 8.3). It proves the frame
+            // was sent, not motor adoption.
+            fresh_feedback_baseline_us_ = completed_us;
+            phase_valid_mask_ = 0U;
+            phase_ready_pending_ = false;
+            if (config_.position_hz_per_node != 0U)
+            {
+                phase_ = CanStreamPhase::AwaitFreshFeedback;
+                post_enable_feedback_deadline_us_ =
+                    config_.post_enable_feedback_timeout_us == 0U
+                    ? 0U
+                    : (now_us == 0U ? completed_us : now_us) +
+                        config_.post_enable_feedback_timeout_us;
+            }
+            else
+            {
+                // No feedback service configured: there is nothing to wait
+                // for, so the phase machine skips straight to ReadyNoTarget.
+                phase_ = CanStreamPhase::ReadyNoTarget;
+                post_enable_feedback_deadline_us_ = 0U;
+            }
+            InitializeDeadlines(now_us == 0U ? completed_us : now_us);
+        }
+        else
+        {
+            // A failed enable transmission must never open periodic traffic;
+            // the upper layer observes the terminal evidence and fails closed.
+            FailClosedStream();
+        }
+        return;
+    }
+    if (action == CanDispatchAction::DisableBroadcast &&
+        transition_ == Transition::Disable && transition_frame_queued_)
+    {
+        transition_ = Transition::None;
+        transition_frame_queued_ = false;
+        transition_queued_us_ = 0U;
+        phase_ = CanStreamPhase::Idle;
+        if (!deadlines_initialized_ && !periodic_traffic_stopped_)
+            InitializeDeadlines(now_us == 0U ? completed_us : now_us);
+        return;
+    }
+
     if (!query_pending_ || action != pending_action_ ||
         node_id != pending_node_id_)
         return;
@@ -775,6 +1025,123 @@ void CanDispatchScheduler::OnTransmissionCompleted(
     pending_transmitted_ = true;
 }
 
+void CanDispatchScheduler::CancelUnstartedTargetFanout(uint32_t now_us)
+{
+    // Only a fan-out that never admitted a single node may be dropped. A
+    // partially dispatched batch keeps its frozen target and completes,
+    // fails, or is cancelled by a safety event (doc 05 section 9.2).
+    if (!target_fanout_active_ || target_fanout_node_ != 1U)
+        return;
+    target_fanout_active_ = false;
+    target_fanout_action_sequence_ = 0U;
+    target_fanout_generation_ = 0U;
+    diagnostics_.cancelled_fanout_count = SaturatingIncrement(
+        diagnostics_.cancelled_fanout_count);
+    // Defer the next attempt one full cycle so an unavailable candidate can
+    // never spin the dispatcher and starve feedback again.
+    const uint32_t period_us = CyclePeriodUs(config_.target_hz_per_node);
+    if (period_us != 0U)
+        next_target_deadline_us_ = now_us + period_us;
+}
+
+CanDispatchStep CanDispatchScheduler::OnAdmissionFailed(
+    const CanDispatchStep& step, bool definitive_failure, uint32_t now_us)
+{
+    CanDispatchStep event{};
+    if (!definitive_failure || step.action == CanDispatchAction::None ||
+        step.node_id < 1U || step.node_id > kActuatorNodeCount)
+        return event;
+    const size_t index = step.node_id - 1U;
+    const uint8_t mask = NodeMask(step.node_id);
+    diagnostics_.query_admission_failure_count = SaturatingIncrement(
+        diagnostics_.query_admission_failure_count);
+
+    if (step.action == CanDispatchAction::ActuatorTarget && !step.transition)
+    {
+        // Definitive failure of the frozen batch (doc 07 R04): terminate the
+        // fan-out occupancy and hand the caller a final event. The caller
+        // cancels the completion tracker and fails the action closed.
+        diagnostics_.target_admission_failed = SaturatingIncrement(
+            diagnostics_.target_admission_failed);
+        event.timed_out_action = CanDispatchAction::ActuatorTarget;
+        event.timed_out_node_id = step.node_id;
+        event.timed_out_final = true;
+        event.admission_failed = true;
+        target_fanout_active_ = false;
+        target_fanout_node_ = 1U;
+        target_fanout_action_sequence_ = 0U;
+        target_fanout_generation_ = 0U;
+        return event;
+    }
+
+    if (step.action == CanDispatchAction::PositionRequest)
+    {
+        // The node was never queried on the wire: count it separately, skip
+        // it in the current sweep and allow at most one tail retry - exactly
+        // like a first timeout, without polluting request/timeout counters.
+        diagnostics_.position_admission_failed[index] = SaturatingIncrement(
+            diagnostics_.position_admission_failed[index]);
+        const bool retry_exhausted = position_retry_phase_ ||
+            position_attempts_[index] >= 2U;
+        if (retry_exhausted)
+        {
+            event.cancelled_position_node_id = step.node_id;
+            event.cancelled_position_sweep_id = step.feedback_sweep_id;
+            position_pending_[index] = false;
+            position_retry_mask_ = static_cast<uint8_t>(
+                position_retry_mask_ & ~mask);
+        }
+        else
+        {
+            position_retry_mask_ = static_cast<uint8_t>(
+                position_retry_mask_ | mask);
+        }
+        if (position_sweep_active_)
+            AdvancePositionSweep(now_us);
+        return event;
+    }
+
+    if (step.action == CanDispatchAction::TemperatureRequest)
+    {
+        diagnostics_.temperature_admission_failed[index] =
+            SaturatingIncrement(
+                diagnostics_.temperature_admission_failed[index]);
+        AdvanceDeadline(next_temperature_deadline_us_,
+                        config_.temperature_hz_per_node, now_us);
+        next_temperature_node_ = NextNode(step.node_id);
+        return event;
+    }
+
+    if (step.action == CanDispatchAction::MotorTimingRequest)
+    {
+        diagnostics_.timing_profile_admission_failed[index] =
+            SaturatingIncrement(
+                diagnostics_.timing_profile_admission_failed[index]);
+        AdvanceDeadline(next_timing_profile_deadline_us_,
+                        config_.timing_profile_hz_per_node, now_us);
+        next_timing_profile_node_ = NextNode(step.node_id);
+        return event;
+    }
+
+    if (step.action == CanDispatchAction::MotorDiagnosticsRequest)
+    {
+        // Preflight diagnostics that can never be admitted ends the whole
+        // enable attempt with an explicit final event (doc 07 R03).
+        diagnostics_.temperature_admission_failed[index] =
+            SaturatingIncrement(
+                diagnostics_.temperature_admission_failed[index]);
+        transition_ = Transition::None;
+        event.timed_out_action = CanDispatchAction::MotorDiagnosticsRequest;
+        event.timed_out_node_id = step.node_id;
+        event.timed_out_final = true;
+        event.admission_failed = true;
+        FailClosedStream();
+        return event;
+    }
+
+    return event;
+}
+
 void CanDispatchScheduler::OnDeferred()
 {
     diagnostics_.deferred_send_count = SaturatingIncrement(
@@ -784,9 +1151,19 @@ void CanDispatchScheduler::OnDeferred()
 void CanDispatchScheduler::Reset()
 {
     mode_ = CanDispatchMode::Bootstrap;
+    phase_ = CanStreamPhase::Idle;
+    dispatch_input_ = {};
     transition_ = Transition::None;
+    transition_frame_queued_ = false;
+    transition_queued_us_ = 0U;
     transition_node_ = 1U;
     deadlines_initialized_ = false;
+    periodic_traffic_stopped_ = false;
+    fresh_feedback_baseline_us_ = 0U;
+    post_enable_feedback_deadline_us_ = 0U;
+    phase_valid_mask_ = 0U;
+    phase_ready_pending_ = false;
+    phase_ready_sweep_id_ = 0U;
     next_target_deadline_us_ = 0U;
     next_position_deadline_us_ = 0U;
     next_temperature_deadline_us_ = 0U;
@@ -799,10 +1176,13 @@ void CanDispatchScheduler::Reset()
     target_fanout_active_ = false;
     target_fanout_node_ = 1U;
     target_fanout_started_us_ = 0U;
+    target_fanout_action_sequence_ = 0U;
+    target_fanout_generation_ = 0U;
     position_sweep_active_ = false;
     position_sweep_start_node_ = 1U;
     position_sweep_node_ = 1U;
     position_sweep_count_ = 0U;
+    position_sweep_valid_mask_ = 0U;
     position_sweep_id_ = 0U;
     next_position_sweep_id_ = 1U;
     position_retry_mask_ = 0U;
@@ -827,6 +1207,14 @@ CanDispatchDiagnostics CanDispatchScheduler::diagnostics() const
     output.pending_action = pending_action_;
     output.pending_node_id = pending_node_id_;
     output.config_valid = config_valid_;
+    output.stream_phase = phase_;
+    output.ready_sweep_id = diagnostics_.ready_sweep_id;
+    output.ready_time_us = diagnostics_.ready_time_us;
+    output.fresh_feedback_baseline_us = fresh_feedback_baseline_us_;
+    output.fanout_action_sequence = target_fanout_active_
+        ? target_fanout_action_sequence_ : 0U;
+    output.fanout_generation = target_fanout_active_
+        ? target_fanout_generation_ : 0U;
     return output;
 }
 

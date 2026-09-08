@@ -1,4 +1,4 @@
-﻿#include "common_inc.h"
+#include "common_inc.h"
 
 #include "binary_state_bridge.hpp"
 #include "joint_space_mapping.hpp"
@@ -39,10 +39,27 @@ void LatchCoherentRobotMeasurement()
     const auto coherence = ReadCoherentFeedbackStatus();
     if (!coherence.valid || coherence.sweep_id == 0U)
         return;
+    const auto sealed = ReadSealedJointSamples();
     taskENTER_CRITICAL();
     if (coherent_measurement.coherent_sweep_id != coherence.sweep_id)
     {
-        coherent_measurement.position = ReadLivePosition();
+        std::array<float, 7> position = ReadLivePosition();
+        bool fully_sealed = true;
+        for (size_t index = 0; index < kActuatorNodeCount; ++index)
+        {
+            const SealedJointSample& sample = sealed[index];
+            if (sample.valid &&
+                sample.sweep_id == coherence.position_sweep_id[index])
+            {
+                position[index] = sample.position;
+            }
+            else
+            {
+                fully_sealed = false;
+            }
+        }
+        coherent_measurement.position = position;
+        coherent_measurement.sealed = fully_sealed;
         coherent_measurement.position_sample_us = coherence.position_sample_us;
         coherent_measurement.position_sweep_id = coherence.position_sweep_id;
         coherent_measurement.coherent_sweep_id = coherence.sweep_id;
@@ -69,14 +86,16 @@ BinaryRobotMeasurement ReadRobotStateForBinaryProtocol(
     const bool gripper_position_valid = coherent_valid &&
         robot.hand != nullptr && safety.gripper_position_valid;
     output.validity = PositionFeedbackValidityBits(
-        coherent_valid && arm_absolute_valid && safety.arm_position_valid,
-        gripper_position_valid);
+        coherent_valid && output.sealed && arm_absolute_valid &&
+            safety.arm_position_valid,
+        gripper_position_valid && output.sealed);
 
     static MeasuredStateEstimator estimator;
     const auto estimate = estimator.Update(
         output.position, output.position_sample_us,
         output.coherent_sweep_id,
-        coherent_valid && arm_absolute_valid && safety.arm_position_valid &&
+        coherent_valid && output.sealed && arm_absolute_valid &&
+            safety.arm_position_valid &&
             gripper_position_valid);
     output.velocity = estimate.velocity;
     output.repeated = estimate.repeated;

@@ -181,6 +181,19 @@ void CanFeedbackMonitor::OnPositionTimeout(uint8_t node_id)
     node.position_pending = false;
 }
 
+bool CanFeedbackMonitor::OnPositionCancelled(uint8_t node_id, uint32_t sweep_id)
+{
+    if (node_id < 1U || node_id > nodes_.size() || sweep_id == 0U)
+        return false;
+    const NodeState& node = nodes_[node_id - 1U];
+    if (node.position_pending && node.pending_sweep_id == sweep_id)
+    {
+        OnPositionTimeout(node_id);
+        return true;
+    }
+    return false;
+}
+
 void CanFeedbackMonitor::OnTemperatureRequest(uint8_t node_id, uint32_t now_us)
 {
     (void) now_us;
@@ -230,6 +243,7 @@ CanFeedbackMonitor::Snapshot(uint32_t now_us) const
         target.consecutive_position_losses = source.consecutive_position_losses;
         target.temperature_c = source.temperature_c;
         target.position_sample_us = source.last_position_us;
+        target.temperature_sample_us = source.last_temperature_us;
         target.position_sweep_id = source.position_sweep_id;
     }
     return output;
@@ -238,6 +252,13 @@ CanFeedbackMonitor::Snapshot(uint32_t now_us) const
 CoherentFeedbackStatus CanFeedbackMonitor::CoherentSnapshot() const
 {
     return coherent_;
+}
+
+uint32_t CanFeedbackMonitor::NodePositionSweepId(uint8_t node_id) const
+{
+    if (node_id < 1U || node_id > nodes_.size())
+        return 0U;
+    return nodes_[node_id - 1U].position_sweep_id;
 }
 
 void CanFeedbackMonitor::CancelPendingRequests()

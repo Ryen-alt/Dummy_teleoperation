@@ -26,6 +26,15 @@ FeedbackSafetyOutput FeedbackSafetySupervisor::Update(const FeedbackSafetyInput&
     output.telemetry_validity = kCanFeedbackTelemetryValid;
     if (input.following_active)
         output.telemetry_validity |= kFollowingErrorTelemetryValid;
+
+    // Dispatcher liveness: ages are recomputed by the consumer, but a
+    // dispatcher that stops publishing altogether is a distinct first cause
+    // and must be reported as such while control is active.
+    if (input.control_active && input.dispatcher_published &&
+        input.dispatcher_progress_age_ms >= config_.dispatcher_stall_hold_ms)
+    {
+        output.hold_reason_bits |= kHoldReasonDispatcherStalled;
+    }
     bool any_temperature_valid = false;
     bool arm_valid = true;
     for (size_t index = 0; index < kActuatorNodeCount; ++index)

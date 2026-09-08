@@ -1,4 +1,4 @@
-﻿#include "common_inc.h"
+#include "common_inc.h"
 #include "configurations/robot_config_generated.hpp"
 #include "protocols/binary_control_bridge.hpp"
 #include "protocols/external_target_executor.hpp"
@@ -35,6 +35,10 @@ constexpr uint32_t kCanTxAbortTimeoutUs =
     dummy::generated_config::kCanTxAbortTimeoutUs;
 constexpr uint32_t kCanTargetFanoutTimeoutUs =
     dummy::generated_config::kCanTargetFanoutTimeoutUs;
+// Bounded recovery budget for a TX channel in RecoveryRequired/Blocked:
+// a few wake cycles of re-abort/poll, then the controlled peripheral reset
+// (doc 07 R01). Each cycle is at most one dispatcher wake (~1 ms).
+constexpr uint32_t kCanTxRecoveryMaxAttempts = 4U;
 
 struct CanContextWindowBaseline
 {
@@ -118,6 +122,9 @@ dummy::protocol::FeedbackSafetyConfig MakeFeedbackSafetyConfig()
     config.temperature_max_age_ms = dummy::generated_config::kTemperatureMaxAgeMs;
     config.temperature_fault_c = dummy::generated_config::kTemperatureFaultC;
     config.temperature_fault_ms = dummy::generated_config::kTemperatureFaultMs;
+    // Dispatcher liveness shares the reviewed feedback-HOLD boundary.
+    config.dispatcher_stall_hold_ms =
+        dummy::generated_config::kFeedbackHoldMs;
     return config;
 }
 
@@ -143,6 +150,16 @@ dummy::protocol::CanDispatchConfig MakeCanDispatchConfig()
     config.response_timeout_us =
         dummy::generated_config::kCanResponseTimeoutUs;
     config.node_quiet_us = dummy::generated_config::kCanNodeQuietUs;
+    // AwaitFreshFeedback shares the reviewed feedback-HOLD boundary, and the
+    // enable frame terminal budget matches the reviewed TX abort deadline.
+    config.post_enable_feedback_timeout_us =
+        dummy::generated_config::kFeedbackHoldMs * 1000U;
+    config.enable_completion_timeout_us =
+        dummy::generated_config::kCanTxAbortTimeoutUs;
+    // The first frame of a frozen fan-out gets the same reviewed admission
+    // budget as the whole batch (doc 07 R04).
+    config.target_fanout_admission_timeout_us =
+        dummy::generated_config::kCanTargetFanoutTimeoutUs;
     return config;
 }
 
@@ -268,6 +285,18 @@ void ThreadControlLoopFixUpdate(void* argument)
         safety_input.measured_position = measured_position;
         safety_input.feedback = dummy::protocol::ReadCanFeedbackStatus(
             static_cast<uint32_t>(now_us));
+        // Dispatcher liveness: the consumer measures the snapshot publish age
+        // with its own clock; ages inside the snapshot are recomputed the
+        // same way, so a stalled dispatcher can never look "still fresh".
+        const auto feedback_progress =
+            dummy::protocol::ReadFeedbackRuntimeProgress();
+        safety_input.dispatcher_published =
+            feedback_progress.last_publish_us != 0U;
+        safety_input.dispatcher_progress_age_ms =
+            feedback_progress.last_publish_us == 0U ? 0U :
+            dummy::protocol::RecentElapsedMicros32(
+                static_cast<uint32_t>(now_us),
+                feedback_progress.last_publish_us) / 1000U;
         const auto safety = feedback_safety_supervisor.Update(safety_input);
         dummy::protocol::PublishCanFeedbackReady(
             safety.arm_position_valid && safety.gripper_position_valid);
@@ -383,6 +412,13 @@ void ThreadCanDispatch(void* argument)
     uint32_t safety_preemption_count = 0U;
     uint32_t max_safety_wait_us = 0U;
     uint32_t max_rx_dispatch_latency_us = 0U;
+    // Generic per-step busy budget (doc 07 R03/R04): the same step staying
+    // Busy beyond its budget escalates to a definitive admission failure.
+    uint32_t busy_step_since_us = 0U;
+    dummy::protocol::CanDispatchAction busy_step_action =
+        dummy::protocol::CanDispatchAction::None;
+    uint8_t busy_step_node = 0U;
+    std::array<uint32_t, 2U> observed_tx_abort_recovery{};
     uint32_t transition_failure_count = 0U;
     uint32_t last_transition_failure_code = 0U;
     uint32_t last_transition_failure_node_id = 0U;
@@ -418,8 +454,36 @@ void ThreadCanDispatch(void* argument)
             get_can_ctx(&hcan1), get_can_ctx(&hcan2)};
         CAN_context* can_context = can_contexts[0];
         for (CAN_context* context : can_contexts)
+        {
             CanServiceTxDeadline(
                 context, micros(), kCanTxAbortTimeoutUs);
+            // Bounded channel recovery (doc 07 R01): re-abort and poll the
+            // mailbox for a few wake cycles, then perform the controlled
+            // peripheral reset. The business terminal was already delivered.
+            CanServiceTxRecovery(
+                context, micros(), kCanTxRecoveryMaxAttempts);
+        }
+        // A channel that needed recovery (or is still blocked) is first-cause
+        // evidence and fails the motion session closed.
+        for (size_t index = 0U; index < can_contexts.size(); ++index)
+        {
+            CAN_context* context = can_contexts[index];
+            if (context == nullptr)
+                continue;
+            if (context->tx_abort_recovery_count !=
+                observed_tx_abort_recovery[index])
+            {
+                observed_tx_abort_recovery[index] =
+                    context->tx_abort_recovery_count;
+                record_transition_failure(
+                    dummy::protocol::CanTransitionFailureCode::
+                        TxChannelRecovery,
+                    static_cast<uint32_t>(index + 1U),
+                    context->tx_channel_blocked ? 1U : 0U);
+                stream_fail_closed = true;
+                dummy::protocol::RequestBinaryRuntimeHold();
+            }
+        }
 
         const ScheduledActuatorRequest scheduled =
             ReadScheduledActuatorRequest();
@@ -460,6 +524,9 @@ void ThreadCanDispatch(void* argument)
             application_tracker.Reset();
             completion_tracker.Cancel();
             stream_fail_closed = false;
+            busy_step_since_us = 0U;
+            busy_step_action = dummy::protocol::CanDispatchAction::None;
+            busy_step_node = 0U;
             dummy::protocol::CancelPendingFeedbackRequests();
             if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream)
             {
@@ -499,6 +566,23 @@ void ThreadCanDispatch(void* argument)
             control_snapshot.lease_active &&
             (control_snapshot.mode == dummy::protocol::ControlMode::Teleop ||
              control_snapshot.mode == dummy::protocol::ControlMode::Policy);
+        // Single 32-bit tick captured once per wake; scheduler deadlines and
+        // fan-out admission both use it.
+        const uint32_t now_us = micros();
+        // Scheduler input (doc 05 section 8.1): the availability judgement
+        // must come from the same snapshot the payload is taken from. The
+        // dispatcher itself is the admission authority for the action.
+        dummy::protocol::DispatchInput dispatch_input{};
+        dispatch_input.now_us = now_us;
+        dispatch_input.session_epoch = control_snapshot.session_epoch;
+        dispatch_input.motion_authorized = binary_stream_authorized;
+        dispatch_input.target_available =
+            scheduled.mode == ScheduledActuatorMode::Stream &&
+            scheduled.sequence != 0U;
+        dispatch_input.action_sequence =
+            dispatch_input.target_available ? scheduled.sequence : 0U;
+        dispatch_input.target_generation = fanout_generation;
+        can_dispatch_scheduler.SetDispatchInput(dispatch_input);
         if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream &&
             (!binary_stream_authorized ||
              (completion_tracker.active() &&
@@ -611,6 +695,29 @@ void ThreadCanDispatch(void* argument)
                         completed_query, completion.metadata.node_id,
                         completion.completed_us,
                         completion.status == CanTxCompletionStatus::Complete);
+                }
+                // Route the enable/disable broadcast terminal states into the
+                // stream phase machine. The scheduler accepts them only while
+                // its own matching transition is pending, so completion
+                // reordering or stale callbacks cannot misattribute them.
+                if (completion.metadata.channel ==
+                    CanTxChannel::EnableTransition)
+                {
+                    can_dispatch_scheduler.OnTransmissionCompleted(
+                        dummy::protocol::CanDispatchAction::EnableBroadcast, 0U,
+                        completion.completed_us,
+                        completion.status == CanTxCompletionStatus::Complete,
+                        now_us);
+                }
+                else if (completion.metadata.channel ==
+                             CanTxChannel::Emergency ||
+                         completion.metadata.channel == CanTxChannel::Safety)
+                {
+                    can_dispatch_scheduler.OnTransmissionCompleted(
+                        dummy::protocol::CanDispatchAction::DisableBroadcast,
+                        0U, completion.completed_us,
+                        completion.status == CanTxCompletionStatus::Complete,
+                        now_us);
                 }
                 if ((completion.metadata.channel == CanTxChannel::Safety ||
                      completion.metadata.channel ==
@@ -825,10 +932,14 @@ void ThreadCanDispatch(void* argument)
                     rx_frame.received_us);
             }
         }
-        const uint32_t now_us = micros();
-        dummy::protocol::PublishFeedbackSnapshot(now_us);
+        // Service clock for this batch (doc 07 R02): sampled AFTER consuming
+        // every TX completion and RX frame, so ISR-recorded event timestamps
+        // can never be in the future relative to it. Deadline and quiet
+        // bookkeeping below all use this value.
+        const uint32_t service_now_us = micros();
+        dummy::protocol::PublishFeedbackSnapshot(service_now_us);
         if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream &&
-            completion_tracker.CheckDeadline(now_us) ==
+            completion_tracker.CheckDeadline(service_now_us) ==
                 dummy::protocol::TargetCompletionResult::Failed)
         {
             dummy::protocol::RecordBinaryTargetFailed(
@@ -861,11 +972,12 @@ void ThreadCanDispatch(void* argument)
             dummy::protocol::RecordBinaryCoherentSweep(
                 coherent.sweep_id, coherent_now_us, earliest_sample_us);
         }
-        const auto step = can_dispatch_scheduler.Next(now_us, responses);
+        const auto step =
+            can_dispatch_scheduler.Next(service_now_us, responses);
         if (step.accepted_timing_profile_node_id != 0U)
             (void) dummy::protocol::AcceptMotorTimingProfile(
                 step.accepted_timing_profile_node_id,
-                step.accepted_timing_profile_page, now_us);
+                step.accepted_timing_profile_page, service_now_us);
         if (step.timed_out_final)
         {
             if (step.timed_out_action ==
@@ -897,9 +1009,68 @@ void ThreadCanDispatch(void* argument)
                 stream_fail_closed = true;
                 dummy::protocol::RequestBinaryRuntimeHold();
             }
+            else if (step.timed_out_action ==
+                     dummy::protocol::CanDispatchAction::EnableBroadcast)
+            {
+                // The enable frame never reached a terminal state within its
+                // bounded budget. Fail closed instead of waiting forever.
+                record_transition_failure(
+                    dummy::protocol::CanTransitionFailureCode::
+                        EnableValidation,
+                    0U, dummy::generated_config::kCanTxAbortTimeoutUs);
+                stream_fail_closed = true;
+                dummy::protocol::RequestBinaryRuntimeHold();
+            }
+            else if (step.timed_out_action ==
+                     dummy::protocol::CanDispatchAction::ActuatorTarget)
+            {
+                // Frozen fan-out whose first frame was never admitted within
+                // its budget (doc 07 R04): fail the whole batch closed.
+                const uint32_t failed_sequence =
+                    target_fanout_active ? target_fanout.sequence : 0U;
+                if (failed_sequence != 0U)
+                {
+                    dummy::protocol::RecordBinaryTargetFailed(
+                        failed_sequence,
+                        dummy::protocol::BinaryControlMonotonicMicros());
+                }
+                target_fanout = {};
+                target_fanout_active = false;
+                completion_target = {};
+                application_tracker.Reset();
+                completion_tracker.Cancel();
+                record_transition_failure(
+                    dummy::protocol::CanTransitionFailureCode::
+                        TargetAdmissionFailed,
+                    step.timed_out_node_id,
+                    dummy::generated_config::kCanTargetFanoutTimeoutUs);
+                stream_fail_closed = true;
+                dummy::protocol::RequestBinaryRuntimeHold();
+            }
         }
 
-        bool queued = false;
+        // AwaitFreshFeedback budget expired without a complete post-enable
+        // sweep: a recorded startup failure with the missing-node mask.
+        if (step.post_enable_feedback_timeout)
+        {
+            record_transition_failure(
+                dummy::protocol::CanTransitionFailureCode::
+                    PostEnableFeedbackTimeout,
+                0U, step.post_enable_feedback_missing_mask);
+            stream_fail_closed = true;
+            dummy::protocol::RequestBinaryRuntimeHold();
+        }
+        if (step.fresh_feedback_ready)
+        {
+            // The scheduler sealed the first complete post-enable sweep and
+            // moved to ReadyNoTarget. Feedback publishing, coherent STATE and
+            // the host readiness barrier all consume the same sweep, so no
+            // additional wire surface is needed for the P0 protocol.
+            (void) step.fresh_feedback_sweep_id;
+        }
+
+        CanTxStatus send_status = CanTxStatus::Invalid;
+        bool retry_send_attempted = false;
         ScheduledActuatorRequest latest = scheduled;
         const auto target_retry = completion_tracker.retry_request();
         const bool dispatching_target_retry = target_retry.valid &&
@@ -912,7 +1083,7 @@ void ThreadCanDispatch(void* argument)
         tx_metadata.node_id = dispatching_target_retry
             ? target_retry.node_id : step.node_id;
         tx_metadata.feedback_sweep_id = step.feedback_sweep_id;
-        tx_metadata.enqueued_time_us = now_us;
+        tx_metadata.enqueued_time_us = service_now_us;
         if (dispatching_target_retry)
         {
             tx_metadata.channel = CanTxChannel::Target;
@@ -952,9 +1123,10 @@ void ThreadCanDispatch(void* argument)
                     target_retry.key.action_sequence)
             {
                 latest = completion_target;
-                queued = robot.ApplyExternalUrdfTargetNodeRad(
+                send_status = robot.ApplyExternalUrdfTargetNodeRad(
                     target_retry.node_id, completion_target.position,
                     &tx_metadata);
+                retry_send_attempted = true;
             }
         }
         else if (!block_normal_stream_dispatch)
@@ -988,32 +1160,42 @@ void ThreadCanDispatch(void* argument)
                         latest = target_fanout;
                         tx_metadata.action_sequence = latest.sequence;
                         tx_metadata.fanout_generation = fanout_generation;
-                        queued = robot.ApplyExternalUrdfTargetNodeRad(
+                        send_status = robot.ApplyExternalUrdfTargetNodeRad(
                             step.node_id, latest.position, &tx_metadata);
+                    }
+                    else
+                    {
+                        // The candidate was revoked or rejected before any
+                        // node of this fan-out was admitted. Cancel the
+                        // scheduler-side fan-out so feedback service resumes;
+                        // the next attempt is deferred one target cycle and
+                        // can never spin the dispatcher (doc 05 section 8.1).
+                        can_dispatch_scheduler.CancelUnstartedTargetFanout(
+                            service_now_us);
                     }
                 }
                 else
                 {
                     latest = ReadScheduledActuatorRequest();
                     if (latest.mode == scheduled.mode)
-                        queued = robot.ApplyExternalUrdfTargetNodeRad(
+                        send_status = robot.ApplyExternalUrdfTargetNodeRad(
                             step.node_id, latest.position, &tx_metadata);
                 }
                 break;
             case dummy::protocol::CanDispatchAction::PositionRequest:
-                queued = robot.TryRequestPositionFeedback(
+                send_status = robot.TryRequestPositionFeedback(
                     step.node_id, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::TemperatureRequest:
-                queued = robot.TryRequestTemperatureFeedback(
+                send_status = robot.TryRequestTemperatureFeedback(
                     step.node_id, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::MotorDiagnosticsRequest:
-                queued = robot.TryRequestTemperatureFeedback(
+                send_status = robot.TryRequestTemperatureFeedback(
                     step.node_id, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::MotorTimingRequest:
-                queued = robot.TryRequestTimingProfile(
+                send_status = robot.TryRequestTimingProfile(
                     step.node_id, step.timing_profile_page,
                     timing_profile_window_token, &tx_metadata);
                 break;
@@ -1032,7 +1214,7 @@ void ThreadCanDispatch(void* argument)
                 }
                 else
                 {
-                    queued = robot.TryConfigureGripperStreaming(
+                    send_status = robot.TryConfigureGripperStreaming(
                         dummy::generated_config::kGripperVelocityLimitPerS,
                         &tx_metadata);
                 }
@@ -1040,19 +1222,48 @@ void ThreadCanDispatch(void* argument)
             case dummy::protocol::CanDispatchAction::EnableBroadcast:
                 latest = ReadScheduledActuatorRequest();
                 if (latest.mode == ScheduledActuatorMode::Stream)
-                    queued = robot.TrySetExternalEnable(true, &tx_metadata);
+                    send_status = robot.TrySetExternalEnable(
+                        true, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::DisableBroadcast:
-                queued = robot.TrySetExternalEnable(false, &tx_metadata);
+                send_status = robot.TrySetExternalEnable(
+                    false, &tx_metadata);
                 break;
             case dummy::protocol::CanDispatchAction::None:
                 break;
             }
         }
 
+        const auto fail_closed_target_admission =
+            [&](uint8_t node_id, uint32_t detail)
+        {
+            // Definitive target admission failure (doc 07 R04): fail the
+            // frozen batch closed and synchronously clean the frozen target,
+            // the action ledger, the retry state and the completion tracker.
+            completion_tracker.FailAndCancel(
+                target_fanout_active ? target_fanout.sequence : 0U,
+                [](uint32_t failed_sequence)
+                {
+                    dummy::protocol::RecordBinaryTargetFailed(
+                        failed_sequence,
+                        dummy::protocol::BinaryControlMonotonicMicros());
+                });
+            target_fanout = {};
+            target_fanout_active = false;
+            completion_target = {};
+            application_tracker.Reset();
+            completion_tracker.Cancel();
+            record_transition_failure(
+                dummy::protocol::CanTransitionFailureCode::
+                    TargetAdmissionFailed,
+                node_id, detail);
+            stream_fail_closed = true;
+            dummy::protocol::RequestBinaryRuntimeHold();
+        };
+
         if (dispatching_target_retry)
         {
-            if (queued)
+            if (retry_send_attempted && send_status == CanTxStatus::Queued)
             {
                 if (!completion_tracker.MarkRetryQueued(target_retry))
                 {
@@ -1067,8 +1278,19 @@ void ThreadCanDispatch(void* argument)
                     dummy::protocol::RequestBinaryRuntimeHold();
                 }
             }
+            else if (retry_send_attempted &&
+                     (send_status == CanTxStatus::Invalid ||
+                      send_status == CanTxStatus::Error))
+            {
+                // Definitive failure of the retried node ends the whole batch
+                // (doc 07 R04); no scheduler fan-out transaction is involved.
+                fail_closed_target_admission(
+                    target_retry.node_id,
+                    static_cast<uint32_t>(send_status));
+            }
             else
             {
+                // Busy defers; the fan-out deadline bounds the transaction.
                 can_dispatch_scheduler.OnDeferred();
             }
             if (step.action != dummy::protocol::CanDispatchAction::None)
@@ -1076,9 +1298,12 @@ void ThreadCanDispatch(void* argument)
         }
         else if (step.action != dummy::protocol::CanDispatchAction::None)
         {
-            if (queued)
+            if (send_status == CanTxStatus::Queued)
             {
-                can_dispatch_scheduler.OnQueued(step, now_us);
+                can_dispatch_scheduler.OnQueued(step, service_now_us);
+                busy_step_since_us = 0U;
+                busy_step_action = dummy::protocol::CanDispatchAction::None;
+                busy_step_node = 0U;
                 if (step.action == dummy::protocol::CanDispatchAction::ActuatorTarget &&
                     !step.transition &&
                     latest.mode == ScheduledActuatorMode::Stream &&
@@ -1090,7 +1315,7 @@ void ThreadCanDispatch(void* argument)
                             tx_metadata.session_epoch,
                             latest.sequence,
                             tx_metadata.fanout_generation};
-                        if (!completion_tracker.Begin(key, now_us))
+                        if (!completion_tracker.Begin(key, service_now_us))
                         {
                             dummy::protocol::RecordBinaryTargetFailed(
                                 latest.sequence, dispatch_now_us);
@@ -1121,23 +1346,117 @@ void ThreadCanDispatch(void* argument)
             }
             else
             {
-                if (step.action ==
-                        dummy::protocol::CanDispatchAction::ConfigureGripperVelocity ||
+                const bool transition_business =
                     step.action ==
-                        dummy::protocol::CanDispatchAction::EnableBroadcast)
+                        dummy::protocol::CanDispatchAction::
+                            ConfigureGripperVelocity ||
+                    step.action ==
+                        dummy::protocol::CanDispatchAction::EnableBroadcast;
+                const bool query_step =
+                    step.action == dummy::protocol::CanDispatchAction::
+                        PositionRequest ||
+                    step.action == dummy::protocol::CanDispatchAction::
+                        TemperatureRequest ||
+                    step.action == dummy::protocol::CanDispatchAction::
+                        MotorDiagnosticsRequest ||
+                    step.action == dummy::protocol::CanDispatchAction::
+                        MotorTimingRequest;
+                bool escalated =
+                    send_status == CanTxStatus::Invalid ||
+                    send_status == CanTxStatus::Error;
+
+                if (send_status == CanTxStatus::Busy)
+                {
+                    // Generic per-step budget (doc 07 R03): the same step
+                    // staying Busy beyond its budget escalates into a
+                    // definitive admission failure. Transient Busy stays a
+                    // plain deferral.
+                    const uint32_t busy_budget_us = transition_business
+                        ? kCanTxAbortTimeoutUs
+                        : dummy::generated_config::kCanResponseTimeoutUs;
+                    const bool same_step =
+                        busy_step_action == step.action &&
+                        busy_step_node == step.node_id &&
+                        busy_step_since_us != 0U;
+                    if (!same_step)
+                    {
+                        busy_step_action = step.action;
+                        busy_step_node = step.node_id;
+                        busy_step_since_us = service_now_us;
+                    }
+                    escalated = same_step &&
+                        service_now_us - busy_step_since_us >= busy_budget_us;
+                    if (escalated)
+                    {
+                        busy_step_since_us = 0U;
+                        busy_step_action =
+                            dummy::protocol::CanDispatchAction::None;
+                        busy_step_node = 0U;
+                    }
+                }
+
+                if (!escalated)
+                {
+                    can_dispatch_scheduler.OnDeferred();
+                }
+                else if (transition_business)
                 {
                     const auto code = step.action ==
                             dummy::protocol::CanDispatchAction::
                                 ConfigureGripperVelocity
                         ? dummy::protocol::CanTransitionFailureCode::
                             ConfigurationQueue
-                        : dummy::protocol::CanTransitionFailureCode::EnableQueue;
-                    record_transition_failure(code, step.node_id, 0U);
+                        : dummy::protocol::CanTransitionFailureCode::
+                            EnableQueue;
+                    record_transition_failure(
+                        code, step.node_id,
+                        static_cast<uint32_t>(send_status));
                     stream_fail_closed = true;
                     dummy::protocol::RequestBinaryRuntimeHold();
                 }
+                else if (step.action ==
+                         dummy::protocol::CanDispatchAction::ActuatorTarget)
+                {
+                    if (step.transition &&
+                        dispatch_mode != dummy::protocol::CanDispatchMode::Stream)
+                    {
+                        // HOLD-mode hold targets keep retrying; the channel
+                        // recovery path unblocks the transport.
+                        can_dispatch_scheduler.OnDeferred();
+                    }
+                    else
+                    {
+                        (void) can_dispatch_scheduler.OnAdmissionFailed(
+                            step, true, service_now_us);
+                        fail_closed_target_admission(
+                            step.node_id,
+                            static_cast<uint32_t>(send_status));
+                    }
+                }
+                else if (query_step)
+                {
+                    // Consume the admission failure (doc 07 R03): the query
+                    // is closed or skipped with its own counters instead of
+                    // being re-issued forever.
+                    const auto admission =
+                        can_dispatch_scheduler.OnAdmissionFailed(
+                            step, true, service_now_us);
+                    dummy::protocol::RecordFeedbackAdmissionOutcome(admission);
+                    if (admission.timed_out_final && admission.admission_failed)
+                    {
+                        record_transition_failure(
+                            dummy::protocol::CanTransitionFailureCode::
+                                QueryAdmissionFailed,
+                            admission.timed_out_node_id,
+                            static_cast<uint32_t>(send_status));
+                        stream_fail_closed = true;
+                        dummy::protocol::RequestBinaryRuntimeHold();
+                    }
+                }
                 else
                 {
+                    // DisableBroadcast keeps the stop intent and defers; the
+                    // recovery path unblocks the channel.
                     can_dispatch_scheduler.OnDeferred();
                 }
             }
@@ -1173,6 +1492,10 @@ void ThreadCanDispatch(void* argument)
             can_degraded = can_degraded ||
                 (context != nullptr &&
                  (context->tx_recovery_count != 0U ||
+                  context->tx_abort_recovery_count != 0U ||
+                  context->tx_channel_blocked ||
+                  context->tx_state == CanTxLifecycleState::RecoveryRequired ||
+                  context->tx_state == CanTxLifecycleState::Blocked ||
                   context->tx_completion_overflow_count != 0U ||
                   context->rx_overflow_count != 0U ||
                   context->busoff_count != 0U));
@@ -1363,6 +1686,23 @@ void ThreadCanDispatch(void* argument)
         {
             stream_fail_closed = true;
             dummy::protocol::RequestBinaryRuntimeHold();
+        }
+        // Publish the stream phase on the existing v2 window flags so the
+        // host can distinguish "waiting for the first target" from a
+        // transition failure without a protocol upgrade.
+        if (diagnostics_window.active &&
+            can_dispatch_scheduler.mode() ==
+                dummy::protocol::CanDispatchMode::Stream)
+        {
+            const auto stream_phase = can_dispatch_scheduler.stream_phase();
+            if (stream_phase ==
+                dummy::protocol::CanStreamPhase::AwaitFreshFeedback)
+                can_diagnostics.window_flags |=
+                    dummy::protocol::kCanDiagnosticsStreamAwaitingFreshFeedback;
+            else if (stream_phase ==
+                     dummy::protocol::CanStreamPhase::ReadyNoTarget)
+                can_diagnostics.window_flags |=
+                    dummy::protocol::kCanDiagnosticsStreamReadyNoTarget;
         }
         if (diagnostics_window.counters_monotonic && !counters_monotonic)
         {

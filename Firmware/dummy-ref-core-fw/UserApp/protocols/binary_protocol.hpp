@@ -28,6 +28,10 @@ constexpr uint8_t kCanDiagnosticsWindowActive = 1U << 0U;
 constexpr uint8_t kCanDiagnosticsEpochStable = 1U << 1U;
 constexpr uint8_t kCanDiagnosticsMotorCountersMonotonic = 1U << 2U;
 constexpr uint8_t kCanDiagnosticsMarkersComplete = 1U << 3U;
+// Stream lifecycle phase markers (doc 05 section 8.2). These are additive to
+// the v2 validity mask; hosts must keep testing window_valid as a bit mask.
+constexpr uint8_t kCanDiagnosticsStreamAwaitingFreshFeedback = 1U << 4U;
+constexpr uint8_t kCanDiagnosticsStreamReadyNoTarget = 1U << 5U;
 constexpr uint8_t kCanDiagnosticsWindowValid =
     kCanDiagnosticsWindowActive | kCanDiagnosticsEpochStable |
     kCanDiagnosticsMotorCountersMonotonic |
@@ -248,6 +252,10 @@ enum class CanTransitionFailureCode : uint32_t
     MotorMarkersIncomplete = 8U,
     ConfigurationQueue = 9U,
     EnableQueue = 10U,
+    PostEnableFeedbackTimeout = 11U,
+    QueryAdmissionFailed = 12U,
+    TargetAdmissionFailed = 13U,
+    TxChannelRecovery = 14U,
 };
 
 struct CanDiagnosticsPayload

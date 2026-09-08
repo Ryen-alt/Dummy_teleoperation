@@ -114,7 +114,7 @@ void DummyRobot::MoveJoints(DOF6Kinematic::Joint6D_t _joints)
 }
 
 
-bool DummyRobot::ApplyExternalUrdfTargetNodeRad(
+CanTxStatus DummyRobot::ApplyExternalUrdfTargetNodeRad(
     uint8_t node_id, const std::array<float, 7>& target,
     const CanTxMetadata* metadata)
 {
@@ -134,7 +134,7 @@ bool DummyRobot::ApplyExternalUrdfTargetNodeRad(
         return hand->SetStreamingNormalizedPosition(
             target[6], dummy::generated_config::kGripperVelocityLimitPerS,
             metadata);
-    return false;
+    return CanTxStatus::Invalid;
 }
 
 
@@ -307,28 +307,28 @@ void DummyRobot::RequestTemperatureFeedback(uint8_t node_id)
 }
 
 
-bool DummyRobot::TryRequestPositionFeedback(
+CanTxStatus DummyRobot::TryRequestPositionFeedback(
     uint8_t node_id, const CanTxMetadata* metadata)
 {
     if (node_id >= 1U && node_id <= 6U)
         return motorJ[node_id]->TryUpdateAngle(metadata);
     if (hand != nullptr && node_id == hand->nodeID)
         return hand->TryUpdateAngle(metadata);
-    return false;
+    return CanTxStatus::Invalid;
 }
 
 
-bool DummyRobot::TryRequestTemperatureFeedback(
+CanTxStatus DummyRobot::TryRequestTemperatureFeedback(
     uint8_t node_id, const CanTxMetadata* metadata)
 {
     if (node_id >= 1U && node_id <= 6U)
         return motorJ[node_id]->TryGetTemp(metadata);
     if (hand != nullptr && node_id == hand->nodeID)
         return hand->TryGetTemp(metadata);
-    return false;
+    return CanTxStatus::Invalid;
 }
 
-bool DummyRobot::TryRequestTimingProfile(
+CanTxStatus DummyRobot::TryRequestTimingProfile(
     uint8_t node_id, uint8_t page, uint32_t window_token,
     const CanTxMetadata* metadata)
 {
@@ -337,25 +337,26 @@ bool DummyRobot::TryRequestTimingProfile(
             page, window_token, metadata);
     if (hand != nullptr && node_id == hand->nodeID)
         return hand->TryGetTimingProfile(page, window_token, metadata);
-    return false;
+    return CanTxStatus::Invalid;
 }
 
 
-bool DummyRobot::TrySetExternalEnable(
+CanTxStatus DummyRobot::TrySetExternalEnable(
     bool enable, const CanTxMetadata* metadata)
 {
-    const bool queued = motorJ[ALL]->TrySetEnable(enable, metadata);
-    if (queued)
+    const CanTxStatus status = motorJ[ALL]->TrySetEnable(enable, metadata);
+    if (status == CanTxStatus::Queued)
         isEnabled = enable;
-    return queued;
+    return status;
 }
 
 
-bool DummyRobot::TryConfigureGripperStreaming(
+CanTxStatus DummyRobot::TryConfigureGripperStreaming(
     float max_velocity_per_s, const CanTxMetadata* metadata)
 {
-    return hand != nullptr &&
-        hand->TryConfigureStreamingVelocity(max_velocity_per_s, metadata);
+    return hand != nullptr
+        ? hand->TryConfigureStreamingVelocity(max_velocity_per_s, metadata)
+        : CanTxStatus::Invalid;
 }
 
 
@@ -559,20 +560,20 @@ void StepHand::SetNormalizedPosition(float normalized, float max_velocity_per_s)
 }
 
 
-bool StepHand::SetStreamingNormalizedPosition(float normalized,
-                                              float max_velocity_per_s,
-                                              const CanTxMetadata* metadata)
+CanTxStatus StepHand::SetStreamingNormalizedPosition(float normalized,
+                                                      float max_velocity_per_s,
+                                                      const CanTxMetadata* metadata)
 {
     return SendNormalizedPosition(
         normalized, max_velocity_per_s, true, metadata);
 }
 
 
-bool StepHand::TryConfigureStreamingVelocity(
+CanTxStatus StepHand::TryConfigureStreamingVelocity(
     float max_velocity_per_s, const CanTxMetadata* metadata)
 {
     if (max_velocity_per_s <= 0.0F)
-        return false;
+        return CanTxStatus::Invalid;
     const float motor_velocity =
         fabsf(closedAngle - openedAngle) / 360.0F *
         static_cast<float>(reduction) * max_velocity_per_s;
@@ -580,14 +581,15 @@ bool StepHand::TryConfigureStreamingVelocity(
 }
 
 
-bool StepHand::SendNormalizedPosition(float normalized, float max_velocity_per_s,
-                                      bool streaming,
-                                      const CanTxMetadata* metadata)
+CanTxStatus StepHand::SendNormalizedPosition(float normalized,
+                                             float max_velocity_per_s,
+                                             bool streaming,
+                                             const CanTxMetadata* metadata)
 {
     if (normalized < 0.0F) normalized = 0.0F;
     else if (normalized > 1.0F) normalized = 1.0F;
     if (max_velocity_per_s <= 0.0F)
-        return false;
+        return CanTxStatus::Invalid;
 
     const float travel_degrees = closedAngle - openedAngle;
     const float target_angle = openedAngle + normalized * travel_degrees;
@@ -599,7 +601,7 @@ bool StepHand::SendNormalizedPosition(float normalized, float max_velocity_per_s
     if (streaming)
         return SetStreamingAngle(target_angle, metadata);
     SetAngleWithVelocityLimit(target_angle, motor_velocity);
-    return true;
+    return CanTxStatus::Queued;
 }
 
 

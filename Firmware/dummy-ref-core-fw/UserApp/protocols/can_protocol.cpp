@@ -1,6 +1,7 @@
-﻿#include "common_inc.h"
+#include "common_inc.h"
 
 #include "feedback_runtime.hpp"
+#include "ieee754_finite.hpp"
 #include "../../../can_transport_contract.h"
 
 extern DummyRobot robot;
@@ -38,23 +39,41 @@ void OnCanMessage(CAN_context* canCtx, const CAN_RxHeaderTypeDef* rxHeader,
     switch (cmd)
     {
         case 0x23:
+            // Validate DLC, payload finiteness and the feedback transaction
+            // BEFORE mutating shared realtime state (doc 05 section 3.2 /
+            // 10.1). A response the monitor rejects must never update the
+            // live actuator angle.
             if (rxHeader->DLC >= 5)
             {
                 float position;
                 memcpy(&position, data, sizeof(position));
-                actuator->UpdateAngleCallback(position, data[4] != 0);
-                dummy::protocol::RecordPositionFeedbackResponse(
-                    id, received_us);
-                if (armJointResponse)
-                    robot.UpdateJointAnglesCallback();
+                if (dummy::protocol::Ieee754IsFinite(position) &&
+                    dummy::protocol::RecordPositionFeedbackResponse(
+                        id, received_us))
+                {
+                    actuator->UpdateAngleCallback(position, data[4] != 0);
+                    if (armJointResponse)
+                        robot.UpdateJointAnglesCallback();
+                    // Seal after the absolute-branch resolution so value and
+                    // metadata describe the same sample.
+                    dummy::protocol::SealJointPositionSample(
+                        id, received_us);
+                }
             }
             break;
         case 0x25:
+            // Same rule: the shared temperature value is committed only after
+            // the monitor accepted the response for the pending transaction.
             if (rxHeader->DLC >= 4)
             {
-                memcpy(&actuator->temperature, data, sizeof(actuator->temperature));
-                dummy::protocol::RecordTemperatureFeedbackResponse(
-                    id, actuator->temperature, received_us);
+                float temperature;
+                memcpy(&temperature, data, sizeof(temperature));
+                if (dummy::protocol::Ieee754IsFinite(temperature) &&
+                    dummy::protocol::RecordTemperatureFeedbackResponse(
+                        id, temperature, received_us))
+                {
+                    actuator->temperature = temperature;
+                }
                 dummy::protocol::RecordMotorTransportDiagnostics(
                     id, data, rxHeader->DLC);
             }

@@ -26,6 +26,7 @@ class HoldReasonBits(IntEnum):
     FEEDBACK_STALE = 1 << 3
     OPERATOR = 1 << 4
     RUNTIME_LIMIT = 1 << 5
+    DISPATCHER_STALLED = 1 << 6
 
 
 class FaultBits(IntEnum):

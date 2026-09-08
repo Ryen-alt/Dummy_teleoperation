@@ -19,6 +19,7 @@ struct NodeFeedbackStatus
     uint16_t consecutive_position_losses = 0;
     float temperature_c = 0.0F;
     uint32_t position_sample_us = 0;
+    uint32_t temperature_sample_us = 0;
     uint32_t position_sweep_id = 0;
     bool position_seen = false;
     bool temperature_seen = false;
@@ -47,6 +48,9 @@ public:
                            uint32_t sweep_id = 0U);
     bool OnPositionResponse(uint8_t node_id, uint32_t now_us);
     void OnPositionTimeout(uint8_t node_id);
+    // Cancel only the still-pending request from this sweep. A stale cancel
+    // must not invalidate a later request or double-count the same loss.
+    bool OnPositionCancelled(uint8_t node_id, uint32_t sweep_id);
     void OnTemperatureRequest(uint8_t node_id, uint32_t now_us);
     bool OnTemperatureResponse(uint8_t node_id, uint32_t now_us,
                                float temperature_c);
@@ -54,6 +58,9 @@ public:
 
     std::array<NodeFeedbackStatus, kActuatorNodeCount> Snapshot(uint32_t now_us) const;
     CoherentFeedbackStatus CoherentSnapshot() const;
+    // Sweep identity the monitor accepted for a node's most recent position
+    // response; 0 when the node has never responded.
+    uint32_t NodePositionSweepId(uint8_t node_id) const;
     void CancelPendingRequests();
     void Reset();
 

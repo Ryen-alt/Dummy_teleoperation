@@ -36,11 +36,15 @@ add_compile_options(-ffunction-sections -fdata-sections -fno-common -fmessage-le
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-register")
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
-    message(STATUS "Maximum optimization for speed")
-    add_compile_options(-Ofast)
+    # Conventional optimization only. -Ofast (and its implied
+    # -ffinite-math-only) is unsound for this firmware: it folds the NaN/Inf
+    # input checks at the protocol and safety boundaries into "always true"
+    # (doc 07 R05). Keep -O2 so those checks remain effective in production.
+    message(STATUS "Maximum safe optimization (-O2)")
+    add_compile_options(-O2)
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
-    message(STATUS "Maximum optimization for speed, debug info included")
-    add_compile_options(-Ofast -g)
+    message(STATUS "Maximum safe optimization, debug info included (-O2 -g)")
+    add_compile_options(-O2 -g)
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "MinSizeRel")
     message(STATUS "Maximum optimization for size")
     add_compile_options(-Os)

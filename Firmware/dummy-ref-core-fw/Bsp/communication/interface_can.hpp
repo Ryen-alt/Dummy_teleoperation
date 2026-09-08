@@ -3,6 +3,7 @@
 
 #include "fibre/protocol.hpp"
 #include "protocols/spsc_ring.hpp"
+#include "../../../can_tx_lifecycle.hpp"
 #include <stm32f4xx_hal.h>
 #include <cmsis_os.h>
 
@@ -27,12 +28,11 @@ enum class CanTxCompletionStatus : uint8_t
     Error,
 };
 
-enum class CanTxLifecycleState : uint8_t
-{
-    Idle,
-    InFlight,
-    AbortRequested,
-};
+// The TX channel lifecycle is the shared state machine from
+// Firmware/can_tx_lifecycle.hpp (doc 07 R01); this alias keeps the
+// transport-side type name while making firmware and host tests share one
+// implementation.
+using CanTxLifecycleState = dummy::can_tx::State;
 
 struct CanTxMetadata
 {
@@ -80,11 +80,16 @@ struct CAN_context
     uint32_t tx_queued_count = 0;
     uint32_t tx_busy_count = 0;
     uint32_t tx_recovery_count = 0;
+    uint32_t tx_abort_recovery_count = 0;
+    uint32_t stale_tx_callback_count = 0;
+    uint32_t tx_recovery_attempts = 0;
     uint32_t tx_enqueue_error_count = 0;
     uint32_t busoff_count = 0;
     bool busoff_active = false;
     volatile uint32_t tx_started_us = 0;
+    volatile uint32_t abort_requested_us = 0;
     volatile CanTxLifecycleState tx_state = CanTxLifecycleState::Idle;
+    volatile bool tx_channel_blocked = false;
     volatile uint8_t active_mailbox_index = 0;
     CanTxMetadata active_tx_metadata{};
     volatile bool active_tx_metadata_valid = false;
@@ -149,6 +154,16 @@ bool CanTakeTxCompletion(CAN_context* canCtx, CanTxCompletion& completion);
 bool CanTakeRxFrame(CAN_context* canCtx, CanRxFrame& frame);
 void CanServiceTxDeadline(CAN_context* canCtx, uint32_t now_us,
                           uint32_t timeout_us);
+// Bounded recovery for a channel in RecoveryRequired/Blocked (doc 07 R01):
+// re-abort and poll the mailbox up to max_attempts wake cycles, then perform
+// a controlled peripheral reset. The business terminal was already delivered
+// when the channel entered RecoveryRequired; recovery only restores send
+// eligibility.
+void CanServiceTxRecovery(CAN_context* canCtx, uint32_t now_us,
+                          uint32_t max_attempts);
+// Controlled stop/init/start cycle that confirms the old request is gone and
+// re-arms the channel. Returns false when the HAL refuses the reset.
+bool CanResetCanChannel(CAN_context* canCtx);
 void NotifyCanDispatcherFromIsr();
 void OnCanMessage(CAN_context* canCtx, const CAN_RxHeaderTypeDef* rxHeader,
                   const uint8_t* data, uint32_t received_us);

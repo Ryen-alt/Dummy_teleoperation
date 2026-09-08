@@ -9,6 +9,8 @@
 .coverage
 coverage.xml
 htmlcov/
+.tmp/
+.cache/
 
 # Local build outputs and Markdown notes.
 build/

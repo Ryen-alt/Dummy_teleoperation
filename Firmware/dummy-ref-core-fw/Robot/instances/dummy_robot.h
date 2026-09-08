@@ -64,10 +64,10 @@ public:
 
     void SetPercent(float _percent);
     void SetNormalizedPosition(float normalized, float max_velocity_per_s);
-    bool SetStreamingNormalizedPosition(
+    CanTxStatus SetStreamingNormalizedPosition(
         float normalized, float max_velocity_per_s,
         const CanTxMetadata* metadata = nullptr);
-    bool TryConfigureStreamingVelocity(
+    CanTxStatus TryConfigureStreamingVelocity(
         float max_velocity_per_s,
         const CanTxMetadata* metadata = nullptr);
     void SetGripCurrent(float _current);
@@ -98,9 +98,9 @@ public:
     }
 
 private:
-    bool SendNormalizedPosition(float normalized, float max_velocity_per_s,
-                                bool streaming,
-                                const CanTxMetadata* metadata = nullptr);
+    CanTxStatus SendNormalizedPosition(float normalized, float max_velocity_per_s,
+                                       bool streaming,
+                                       const CanTxMetadata* metadata = nullptr);
     bool isCalibrating = false;
 };
 
@@ -182,9 +182,9 @@ public:
     bool MoveL(float _x, float _y, float _z, float _a, float _b, float _c);
     void MoveJoints(DOF6Kinematic::Joint6D_t _joints);
     // The binary host-facing target is expressed in URDF joint coordinates.
-    bool ApplyExternalUrdfTargetNodeRad(uint8_t node_id,
-                                       const std::array<float, 7>& target,
-                                       const CanTxMetadata* metadata = nullptr);
+    CanTxStatus ApplyExternalUrdfTargetNodeRad(
+        uint8_t node_id, const std::array<float, 7>& target,
+        const CanTxMetadata* metadata = nullptr);
     dummy::protocol::AbsoluteJointSeedResult SeedAbsoluteJointPosition(
         const std::array<float, 6>& reference_urdf_rad);
     bool AbsoluteJointPositionValid() const
@@ -196,18 +196,18 @@ public:
     void SetJointAcceleration(float _acc);
     void RequestPositionFeedback(uint8_t node_id);
     void RequestTemperatureFeedback(uint8_t node_id);
-    bool TryRequestPositionFeedback(
+    CanTxStatus TryRequestPositionFeedback(
         uint8_t node_id, const CanTxMetadata* metadata = nullptr);
-    bool TryRequestTemperatureFeedback(
+    CanTxStatus TryRequestTemperatureFeedback(
         uint8_t node_id, const CanTxMetadata* metadata = nullptr);
-    bool TryRequestTimingProfile(
+    CanTxStatus TryRequestTimingProfile(
         uint8_t node_id, uint8_t page, uint32_t window_token,
         const CanTxMetadata* metadata = nullptr);
     // Realtime binary control uses a single non-blocking broadcast after its
     // per-node hold targets have been admitted by the CAN dispatcher.
-    bool TrySetExternalEnable(
+    CanTxStatus TrySetExternalEnable(
         bool enable, const CanTxMetadata* metadata = nullptr);
-    bool TryConfigureGripperStreaming(
+    CanTxStatus TryConfigureGripperStreaming(
         float max_velocity_per_s,
         const CanTxMetadata* metadata = nullptr);
     void UpdateJointAnglesCallback();

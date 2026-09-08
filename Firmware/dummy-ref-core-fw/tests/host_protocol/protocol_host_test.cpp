@@ -10,7 +10,9 @@
 #include "feedback_poll_scheduler.hpp"
 #include "can_timing_profiler.hpp"
 #include "../../../can_transport_contract.h"
+#include "../../../can_tx_lifecycle.hpp"
 #include "published_double_buffer.hpp"
+#include "ieee754_finite.hpp"
 #include "robot_config_generated.hpp"
 #include "spsc_ring.hpp"
 
@@ -28,6 +30,8 @@ using namespace dummy::protocol;
 
 namespace
 {
+DispatchInput MakeStreamDispatchInput(uint32_t now_us, bool target_available);
+
 void TestSpscRingUsesAllSlotsAndWrapsWithoutOverwrite()
 {
     SpscRing<uint32_t, 32U> ring;
@@ -1118,6 +1122,13 @@ void TestCanDispatcherTransitionsAndFrequencyPlan()
     assert((diagnostic_nodes == std::vector<uint8_t>{1U, 2U, 3U, 4U, 5U, 6U, 7U}));
     assert(configured);
     assert(enabled);
+    scheduler.OnTransmissionCompleted(
+        CanDispatchAction::EnableBroadcast, 0U, now_us, true, now_us);
+    assert(scheduler.stream_phase() == CanStreamPhase::AwaitFreshFeedback);
+    // The 50 Hz plan only produces targets when a dispatchable target is
+    // actually available (doc 05 section 8). The stream starts in
+    // AwaitFreshFeedback and reaches Streaming through ReadyNoTarget.
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
 
     const CanDispatchDiagnostics before = scheduler.diagnostics();
     FeedbackResponseEvents responses{};
@@ -1454,8 +1465,25 @@ uint32_t CompleteStreamTransition(CanDispatchScheduler& scheduler)
     assert(diagnostics_count == kActuatorNodeCount);
     assert(configured);
     assert(enabled);
+    // While the enable frame is in flight the transition must stay pending.
+    assert(scheduler.Next(now_us).action == CanDispatchAction::None);
+    // The enable frame terminal state opens the stream phase machine.
+    scheduler.OnTransmissionCompleted(
+        CanDispatchAction::EnableBroadcast, 0U, now_us, true, now_us);
     assert(scheduler.Next(now_us).action == CanDispatchAction::None);
     return now_us;
+}
+
+DispatchInput MakeStreamDispatchInput(uint32_t now_us, bool target_available)
+{
+    DispatchInput input{};
+    input.now_us = now_us;
+    input.session_epoch = 7U;
+    input.motion_authorized = true;
+    input.target_available = target_available;
+    input.action_sequence = target_available ? 11U : 0U;
+    input.target_generation = 3U;
+    return input;
 }
 
 void TestCanTimingProfileSchedulerPagesAndTimeouts()
@@ -1786,8 +1814,13 @@ void TestCanDispatcherDoesNotBurstAfterDeferredDeadline()
     config.node_quiet_us = 0U;
     config.position_hz_per_node = 0U;
     config.temperature_hz_per_node = 0U;
+    // This scenario defers the frozen fan-out on purpose for 50 watchdog
+    // ticks (~71 ms). That only stays legal inside the fan-out admission
+    // budget (doc 07 R04); production would fail the batch at 15 ms.
+    config.target_fanout_admission_timeout_us = 100000U;
     CanDispatchScheduler scheduler(config);
     uint32_t now_us = CompleteStreamTransition(scheduler);
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
 
     CanDispatchStep due{};
     for (size_t tick = 0; tick < 50U; ++tick)
@@ -1908,6 +1941,7 @@ void TestSafetyModesPreemptPartialTargetFanout()
 
     CanDispatchScheduler hold_scheduler(config);
     uint32_t now_us = CompleteStreamTransition(hold_scheduler) + 20000U;
+    hold_scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
     const CanDispatchStep normal_target = hold_scheduler.Next(now_us);
     assert(normal_target.action == CanDispatchAction::ActuatorTarget);
     assert(normal_target.node_id == 1U);
@@ -1922,6 +1956,7 @@ void TestSafetyModesPreemptPartialTargetFanout()
 
     CanDispatchScheduler fault_scheduler(config);
     now_us = CompleteStreamTransition(fault_scheduler) + 20000U;
+    fault_scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
     const CanDispatchStep fault_target = fault_scheduler.Next(now_us);
     assert(fault_target.action == CanDispatchAction::ActuatorTarget);
     assert(fault_target.node_id == 1U);
@@ -1932,6 +1967,1038 @@ void TestSafetyModesPreemptPartialTargetFanout()
     const CanDispatchStep fault = fault_scheduler.Next(now_us + 1U);
     assert(fault.action == CanDispatchAction::DisableBroadcast);
     assert(fault.transition);
+}
+
+// Formal regression for the StreamPrime defect (doc 05 sections 2 and 8.5):
+// the host sends no motion target at all, yet the dispatcher keeps querying
+// positions, seals one complete post-enable sweep and reaches ReadyNoTarget.
+void TestCanDispatcherStreamsFeedbackWithoutFirstTarget()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, false));
+
+    FeedbackResponseEvents responses{};
+    bool ready_seen = false;
+    uint32_t ready_sweep_id = 0U;
+    uint32_t position_requests = 0U;
+    uint32_t non_transition_targets = 0U;
+    const uint32_t end_us = now_us + 200000U;
+    while (now_us < end_us)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.fresh_feedback_ready)
+        {
+            ready_seen = true;
+            ready_sweep_id = step.fresh_feedback_sweep_id;
+        }
+        if (step.action != CanDispatchAction::None)
+        {
+            if (step.action == CanDispatchAction::ActuatorTarget &&
+                !step.transition)
+                ++non_transition_targets;
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+            {
+                ++position_requests;
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            }
+            else if (step.action == CanDispatchAction::TemperatureRequest ||
+                     step.action ==
+                         CanDispatchAction::MotorDiagnosticsRequest)
+                responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            now_us += 100U;
+        }
+        else
+        {
+            now_us += 1000U;
+        }
+    }
+    assert(ready_seen);
+    assert(ready_sweep_id != 0U);
+    assert(scheduler.stream_phase() == CanStreamPhase::ReadyNoTarget);
+    assert(non_transition_targets == 0U);
+    assert(position_requests >= 28U);
+    const CanDispatchDiagnostics diagnostics = scheduler.diagnostics();
+    assert(diagnostics.stream_phase == CanStreamPhase::ReadyNoTarget);
+    assert(diagnostics.ready_sweep_id == ready_sweep_id);
+    assert(diagnostics.ready_time_us != 0U);
+    assert(diagnostics.fresh_feedback_baseline_us != 0U);
+    assert(diagnostics.post_enable_feedback_timeout_count == 0U);
+    assert(diagnostics.target_unavailable_skip_count == 0U);
+}
+
+// doc 05 section 8.5 item 2: a target available before the fresh sweep is
+// sealed must not open a fan-out before ReadyNoTarget; once the sweep is
+// sealed, the same available target starts Streaming immediately.
+void TestCanDispatcherGatesFirstTargetUntilFreshFeedback()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
+
+    FeedbackResponseEvents responses{};
+    bool ready_seen = false;
+    bool fanout_before_ready = false;
+    CanDispatchStep last_step{};
+    for (size_t attempt = 0U; attempt < 100000U && !ready_seen; ++attempt)
+    {
+        last_step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (last_step.action == CanDispatchAction::ActuatorTarget &&
+            !last_step.transition && !last_step.fresh_feedback_ready)
+            fanout_before_ready = true;
+        if (last_step.fresh_feedback_ready)
+            ready_seen = true;
+        if (last_step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(last_step, now_us);
+            scheduler.OnTransmissionCompleted(
+                last_step.action, last_step.node_id, now_us, true, now_us);
+            if (last_step.action == CanDispatchAction::PositionRequest)
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (last_step.node_id - 1U));
+            else if (last_step.action == CanDispatchAction::TemperatureRequest)
+                responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (last_step.node_id - 1U));
+            now_us += 100U;
+        }
+        else
+        {
+            now_us += 1000U;
+        }
+    }
+    assert(ready_seen);
+    assert(!fanout_before_ready);
+    // The ready tick either already carries the first fan-out or the very
+    // next step does; nothing re-enters AwaitFreshFeedback.
+    CanDispatchStep first = last_step;
+    if (first.action == CanDispatchAction::None)
+        first = scheduler.Next(now_us);
+    assert(first.action == CanDispatchAction::ActuatorTarget);
+    assert(!first.transition);
+    assert(first.node_id == 1U);
+    assert(scheduler.stream_phase() == CanStreamPhase::Streaming);
+}
+
+// doc 05 section 8.1: a candidate revoked before admission cancels the
+// unstarted fan-out, defers the next attempt one cycle and never starves
+// feedback service.
+void TestCanDispatcherCancelsUnstartedFanoutWithoutStarvingFeedback()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
+    FeedbackResponseEvents responses{};
+
+    // Seal fresh feedback first. Stop at the ready tick without admitting
+    // anything the ready tick itself may have opened.
+    CanDispatchStep ready_step{};
+    for (size_t attempt = 0U; attempt < 100000U; ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        if (step.fresh_feedback_ready)
+        {
+            ready_step = step;
+            break;
+        }
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            now_us += 100U;
+        }
+        else
+        {
+            now_us += 1000U;
+        }
+    }
+    assert(ready_step.fresh_feedback_ready);
+
+    // The ready tick opens the first fan-out because the target is already
+    // available; revoke it before admission.
+    CanDispatchStep target_step = ready_step;
+    if (target_step.action == CanDispatchAction::None)
+        target_step = scheduler.Next(now_us);
+    assert(target_step.action == CanDispatchAction::ActuatorTarget);
+    assert(!target_step.transition);
+    assert(target_step.node_id == 1U);
+    const uint32_t cancel_us = now_us + 100U;
+    scheduler.CancelUnstartedTargetFanout(cancel_us);
+    assert(scheduler.diagnostics().cancelled_fanout_count == 1U);
+
+    // The target was revoked: feedback must now advance freely and no
+    // non-transition target may appear.
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(cancel_us, false));
+    responses = {};
+    uint32_t position_requests = 0U;
+    uint32_t skip_count_before =
+        scheduler.diagnostics().target_unavailable_skip_count;
+    const uint32_t end_us = cancel_us + 60000U;
+    while (now_us < end_us)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        assert(!(step.action == CanDispatchAction::ActuatorTarget &&
+                 !step.transition));
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+            {
+                ++position_requests;
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            }
+            now_us += 100U;
+        }
+        else
+        {
+            now_us += 1000U;
+        }
+    }
+    assert(position_requests >= 14U);
+    assert(scheduler.diagnostics().target_unavailable_skip_count >
+           skip_count_before);
+    assert(scheduler.stream_phase() == CanStreamPhase::Streaming);
+}
+
+// doc 05 section 8.2: the AwaitFreshFeedback phase has a bounded budget; its
+// expiry is a recorded startup failure, not an endless wait.
+void TestCanDispatcherPostEnableFeedbackTimeoutFailsClosed()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    config.post_enable_feedback_timeout_us = 100000U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    assert(scheduler.stream_phase() == CanStreamPhase::AwaitFreshFeedback);
+
+    bool timeout_seen = false;
+    uint8_t missing_mask = 0U;
+    for (size_t tick = 0U; tick < 200000U; ++tick)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us);
+        if (step.post_enable_feedback_timeout)
+        {
+            timeout_seen = true;
+            missing_mask = step.post_enable_feedback_missing_mask;
+            break;
+        }
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            // No position response ever arrives.
+        }
+        now_us += 1000U;
+    }
+    assert(timeout_seen);
+    assert(missing_mask == 0x7FU);
+    assert(scheduler.stream_phase() == CanStreamPhase::Idle);
+    assert(scheduler.diagnostics().post_enable_feedback_timeout_count == 1U);
+    // Fail closed: no periodic traffic until the mode changes again.
+    for (size_t tick = 0U; tick < 20U; ++tick)
+    {
+        assert(scheduler.Next(now_us + tick * 1000U).action ==
+               CanDispatchAction::None);
+    }
+}
+
+// doc 05 section 3.5 / 8.2: a lost enable completion cannot park the stream
+// in a transition forever; the bounded completion timeout fails it closed.
+void TestCanDispatcherEnableCompletionTimeoutFailsClosed()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    config.enable_completion_timeout_us = 5000U;
+    CanDispatchScheduler scheduler(config);
+    scheduler.SetMode(CanDispatchMode::Stream);
+    uint32_t now_us = 0U;
+    FeedbackResponseEvents responses{};
+    bool enable_queued = false;
+    for (size_t attempt = 0U; attempt < 64U && !enable_queued; ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            assert(step.transition);
+            scheduler.OnQueued(step, now_us);
+            if (step.action ==
+                CanDispatchAction::MotorDiagnosticsRequest)
+                responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            else if (step.action == CanDispatchAction::EnableBroadcast)
+                enable_queued = true;
+        }
+        ++now_us;
+    }
+    assert(enable_queued);
+    assert(scheduler.stream_phase() == CanStreamPhase::Preflight);
+    // While the frame is in flight the transition must not re-emit.
+    assert(scheduler.Next(now_us).action == CanDispatchAction::None);
+
+    const CanDispatchStep timeout = scheduler.Next(
+        now_us + config.enable_completion_timeout_us);
+    assert(timeout.timed_out_action == CanDispatchAction::EnableBroadcast);
+    assert(timeout.timed_out_final);
+    assert(scheduler.stream_phase() == CanStreamPhase::Idle);
+    assert(scheduler.diagnostics().enable_completion_timeout_count == 1U);
+    for (size_t tick = 0U; tick < 20U; ++tick)
+    {
+        assert(scheduler.Next(now_us + tick * 1000U).action ==
+               CanDispatchAction::None);
+    }
+}
+
+// ---- doc 07 R02: the service clock must tolerate ISR timestamps that are a
+// few microseconds ahead of it, and genuine 32-bit wrap must keep working.
+void TestCanDispatcherCompletionSlightlyInFutureDoesNotTimeout()
+{
+    CanDispatchScheduler scheduler;
+    uint32_t now_us = 0U;
+    CanDispatchStep request{};
+    for (size_t tick = 0U; tick < 20U; ++tick)
+    {
+        request = scheduler.Next(now_us);
+        if (request.action == CanDispatchAction::PositionRequest)
+            break;
+        now_us += 1429U;
+    }
+    assert(request.action == CanDispatchAction::PositionRequest);
+    scheduler.OnQueued(request, now_us);
+    // The ISR recorded the completion after the consumer sampled its clock:
+    // completed_us is 100 us in the apparent future (doc 07 R02).
+    scheduler.OnTransmissionCompleted(
+        request.action, request.node_id, now_us + 100U, true);
+    assert(scheduler.Next(now_us).timed_out_action ==
+           CanDispatchAction::None);
+    assert(scheduler.Next(now_us + 3900U).timed_out_action ==
+           CanDispatchAction::None);
+    // The real response budget still applies 4 ms after the TX-complete.
+    const CanDispatchStep timeout = scheduler.Next(now_us + 4100U);
+    assert(timeout.timed_out_action == CanDispatchAction::PositionRequest);
+    assert(timeout.timed_out_node_id == request.node_id);
+}
+
+void TestCanDispatcherResponseTimeoutSurvivesClockWrap()
+{
+    CanDispatchConfig config{};
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    scheduler.Next(0U);
+    uint32_t now_us = 24900U;
+    CanDispatchStep request{};
+    for (size_t tick = 0U; tick < 4U; ++tick)
+    {
+        request = scheduler.Next(now_us);
+        if (request.action == CanDispatchAction::PositionRequest)
+            break;
+        now_us += 100U;
+    }
+    assert(request.action == CanDispatchAction::PositionRequest);
+    scheduler.OnQueued(request, now_us);
+    scheduler.OnTransmissionCompleted(
+        request.action, request.node_id, 0xFFFFFFF0U, true);
+    // Wrapped clock just after the completion: 32 us elapsed, no timeout.
+    assert(scheduler.Next(0x00000010U).timed_out_action ==
+           CanDispatchAction::None);
+    // Wrapped clock past the 4 ms budget: the timeout still fires.
+    const CanDispatchStep timeout = scheduler.Next(0x00000FE0U);
+    assert(timeout.timed_out_action == CanDispatchAction::PositionRequest);
+    assert(timeout.timed_out_node_id == request.node_id);
+}
+
+// ---- doc 07 R03: definitive admission failures are actually consumed.
+void TestCanDispatcherAdmissionFailureSkipsAndRetriesPositionQuery()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    scheduler.Next(0U);
+    uint32_t now_us = 25000U;
+    const CanDispatchStep step = scheduler.Next(now_us);
+    assert(step.action == CanDispatchAction::PositionRequest);
+    const uint8_t failed_node = step.node_id;
+
+    // Definitive admission failure WITHOUT OnQueued: the node was never
+    // requested on the wire, gets its own counter and one tail retry.
+    const CanDispatchStep event =
+        scheduler.OnAdmissionFailed(step, true, now_us);
+    assert(event.action == CanDispatchAction::None);
+    assert(scheduler.diagnostics().position_admission_failed[
+               failed_node - 1U] == 1U);
+    assert(scheduler.diagnostics().position_requested[
+               failed_node - 1U] == 0U);
+
+    CanDispatchStep next = scheduler.Next(now_us + 100U);
+    assert(next.action == CanDispatchAction::PositionRequest);
+    assert(next.node_id != failed_node);
+    for (size_t completed = 1U; completed < kActuatorNodeCount; ++completed)
+    {
+        scheduler.OnQueued(next, now_us);
+        FeedbackResponseEvents response{};
+        response.position_mask = static_cast<uint8_t>(
+            1U << (next.node_id - 1U));
+        now_us += 100U;
+        next = scheduler.Next(now_us, response);
+    }
+    assert(next.action == CanDispatchAction::PositionRequest);
+    assert(next.node_id == failed_node);
+
+    // The second admission failure exhausts the tail retry and the sweep
+    // finishes without inventing request or timeout counts.
+    scheduler.OnAdmissionFailed(next, true, now_us);
+    assert(scheduler.diagnostics().position_admission_failed[
+               failed_node - 1U] == 2U);
+    assert(scheduler.diagnostics().position_requested[
+               failed_node - 1U] == 0U);
+    assert(scheduler.diagnostics().position_timed_out[
+               failed_node - 1U] == 0U);
+    const CanDispatchStep after = scheduler.Next(now_us + 100U);
+    assert(after.action != CanDispatchAction::PositionRequest);
+}
+
+void TestPositionTailAdmissionFailureCancelsMonitorRequest()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    config.timing_profile_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    CanFeedbackMonitor monitor;
+    FeedbackResponseEvents responses{};
+    bool first_queued = false, saw_first_timeout = false, cancelled = false;
+    uint32_t now_us = 100U;
+    CanDispatchStep outcome{};
+    for (; now_us < 100000U; now_us += 100U)
+    {
+        const auto step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.timed_out_action == CanDispatchAction::PositionRequest &&
+            step.timed_out_node_id == 1U)
+            saw_first_timeout = true;
+        if (step.action != CanDispatchAction::PositionRequest)
+            continue;
+        if (step.node_id == 1U && first_queued)
+        {
+            outcome = scheduler.OnAdmissionFailed(step, true, now_us);
+            assert(ApplyFeedbackAdmissionOutcome(monitor, outcome));
+            cancelled = true;
+            break;
+        }
+        scheduler.OnQueued(step, now_us);
+        monitor.OnPositionRequest(step.node_id, now_us, step.feedback_sweep_id);
+        scheduler.OnTransmissionCompleted(step.action, step.node_id, now_us, true);
+        if (step.node_id == 1U)
+        {
+            first_queued = true;
+            continue;
+        }
+        assert(monitor.OnPositionResponse(step.node_id, now_us));
+        responses.position_mask = static_cast<uint8_t>(1U << (step.node_id - 1U));
+    }
+    assert(first_queued && saw_first_timeout && cancelled);
+    assert(outcome.cancelled_position_node_id == 1U);
+    assert(outcome.cancelled_position_sweep_id != 0U);
+    assert(!outcome.timed_out_final); // admission loss is not a fabricated timeout
+    assert(!monitor.OnPositionResponse(1U, now_us + 10U));
+    assert(!monitor.CoherentSnapshot().valid);
+    assert(monitor.Snapshot(now_us)[0].total_position_losses == 1U);
+    assert(!ApplyFeedbackAdmissionOutcome(monitor, outcome));
+    assert(monitor.Snapshot(now_us)[0].total_position_losses == 1U);
+    // A delayed duplicate cancellation cannot erase a newer sweep request.
+    monitor.OnPositionRequest(1U, now_us, outcome.cancelled_position_sweep_id + 1U);
+    assert(!ApplyFeedbackAdmissionOutcome(monitor, outcome));
+    assert(monitor.OnPositionResponse(1U, now_us + 20U));
+    assert(monitor.Snapshot(now_us + 20U)[0].total_position_losses == 1U);
+}
+
+void TestTargetRetryAdmissionFailureRecordsOwnerBeforeCancel()
+{
+    TargetCompletionTracker tracker(15000U);
+    const TargetFanoutKey key{1U, 42U, 7U};
+    assert(tracker.Begin(key, 1000U));
+    for (uint8_t node_id = 1U; node_id < 7U; ++node_id)
+        tracker.RecordCompletion(key, node_id, true, 1000U + node_id * 100U);
+    assert(tracker.RecordCompletion(key, 7U, false, 1800U) ==
+           TargetCompletionResult::RetryRequired);
+    unsigned records = 0U;
+    // The producer fanout is already empty after all seven frames queued.
+    tracker.FailAndCancel(0U, [&](uint32_t sequence)
+    {
+        assert(sequence == 42U && tracker.active());
+        ++records;
+    });
+    assert(records == 1U && !tracker.active() && !tracker.retry_request().valid);
+    tracker.FailAndCancel(0U, [&](uint32_t) { ++records; });
+    assert(records == 1U);
+    // Before the first enqueue, the candidate owns the failure instead.
+    tracker.FailAndCancel(43U, [&](uint32_t sequence)
+    {
+        assert(sequence == 43U);
+        ++records;
+    });
+    assert(records == 2U);
+}
+
+void TestCanDispatcherPreflightAdmissionFailureFailsClosed()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    scheduler.SetMode(CanDispatchMode::Stream);
+    uint32_t now_us = 0U;
+    for (uint8_t node_id = 1U; node_id <= kActuatorNodeCount; ++node_id)
+    {
+        const CanDispatchStep hold = scheduler.Next(now_us++);
+        assert(hold.action == CanDispatchAction::ActuatorTarget);
+        assert(hold.node_id == node_id);
+        scheduler.OnQueued(hold, now_us);
+    }
+    const CanDispatchStep request = scheduler.Next(now_us++);
+    assert(request.action == CanDispatchAction::MotorDiagnosticsRequest);
+    assert(request.node_id == 1U);
+
+    // Definitive admission failure ends the whole preflight with an explicit
+    // final event (doc 07 R03): no retry, no enable, no periodic traffic.
+    const CanDispatchStep event =
+        scheduler.OnAdmissionFailed(request, true, now_us);
+    assert(event.timed_out_final);
+    assert(event.admission_failed);
+    assert(event.timed_out_action ==
+           CanDispatchAction::MotorDiagnosticsRequest);
+    assert(event.timed_out_node_id == 1U);
+    assert(scheduler.diagnostics().query_admission_failure_count == 1U);
+    for (size_t tick = 0U; tick < 20U; ++tick)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us + tick * 1000U);
+        assert(step.action != CanDispatchAction::ConfigureGripperVelocity);
+        assert(step.action != CanDispatchAction::EnableBroadcast);
+        assert(step.action == CanDispatchAction::None);
+    }
+}
+
+// ---- doc 07 R04: the frozen fan-out has a bounded pre-first-frame budget and
+// definitive failures terminate it.
+void TestCanDispatcherFanoutAdmissionBudgetFailsClosed()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    config.target_fanout_admission_timeout_us = 15000U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
+    FeedbackResponseEvents responses{};
+    CanDispatchStep ready_step{};
+    for (size_t attempt = 0U; attempt < 100000U; ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        if (step.fresh_feedback_ready)
+        {
+            ready_step = step;
+            break;
+        }
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            now_us += 100U;
+        }
+        else
+        {
+            now_us += 1000U;
+        }
+    }
+    assert(ready_step.fresh_feedback_ready);
+    assert(ready_step.action == CanDispatchAction::ActuatorTarget);
+    assert(!ready_step.transition);
+
+    // Never admit node 1; the unstarted fan-out must expire on its own
+    // budget instead of holding the dispatcher open (doc 07 R04).
+    responses = {};
+    const uint32_t deadline_now =
+        now_us + config.target_fanout_admission_timeout_us;
+    const CanDispatchStep timed_out = scheduler.Next(deadline_now, responses);
+    assert(timed_out.timed_out_final);
+    assert(timed_out.timed_out_action == CanDispatchAction::ActuatorTarget);
+    assert(timed_out.timed_out_node_id == 1U);
+    assert(scheduler.diagnostics().fanout_admission_timeout_count == 1U);
+
+    // Occupancy released: with the target revoked, feedback runs again.
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(deadline_now, false));
+    bool position_seen = false;
+    uint32_t probe_now = deadline_now;
+    for (size_t tick = 0U; tick < 200U && !position_seen; ++tick)
+    {
+        const CanDispatchStep step = scheduler.Next(probe_now, responses);
+        responses = {};
+        if (step.action == CanDispatchAction::PositionRequest)
+        {
+            position_seen = true;
+            break;
+        }
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, probe_now);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, probe_now, true, probe_now);
+        }
+        probe_now += 1000U;
+    }
+    assert(position_seen);
+}
+
+void TestCanDispatcherTargetAdmissionFailureEndsFanout()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
+    FeedbackResponseEvents responses{};
+    CanDispatchStep ready_step{};
+    for (size_t attempt = 0U; attempt < 100000U; ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        if (step.fresh_feedback_ready)
+        {
+            ready_step = step;
+            break;
+        }
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            now_us += 100U;
+        }
+        else
+        {
+            now_us += 1000U;
+        }
+    }
+    assert(ready_step.fresh_feedback_ready);
+    assert(ready_step.action == CanDispatchAction::ActuatorTarget);
+    assert(!ready_step.transition);
+
+    // Definitive admission failure of the first frame ends the frozen batch
+    // immediately (doc 07 R04).
+    responses = {};
+    const CanDispatchStep event =
+        scheduler.OnAdmissionFailed(ready_step, true, now_us);
+    assert(event.timed_out_final);
+    assert(event.admission_failed);
+    assert(event.timed_out_action == CanDispatchAction::ActuatorTarget);
+    assert(event.timed_out_node_id == ready_step.node_id);
+    assert(scheduler.diagnostics().target_admission_failed == 1U);
+
+    // Feedback keeps running once the target is revoked.
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, false));
+    bool position_seen = false;
+    uint32_t probe_now = now_us;
+    for (size_t tick = 0U; tick < 200U && !position_seen; ++tick)
+    {
+        const CanDispatchStep step = scheduler.Next(probe_now, responses);
+        responses = {};
+        if (step.action == CanDispatchAction::PositionRequest)
+        {
+            position_seen = true;
+            break;
+        }
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, probe_now);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, probe_now, true, probe_now);
+        }
+        probe_now += 1000U;
+    }
+    assert(position_seen);
+}
+
+// doc 07 section 3.129: replacing the dispatch input mid-fanout must not
+// change the identity of the frozen batch.
+void TestCanDispatcherFanoutIdentityFrozenAgainstInputReplacement()
+{
+    CanDispatchConfig config{};
+    config.node_quiet_us = 0U;
+    config.temperature_hz_per_node = 0U;
+    CanDispatchScheduler scheduler(config);
+    uint32_t now_us = CompleteStreamTransition(scheduler);
+    scheduler.SetDispatchInput(MakeStreamDispatchInput(now_us, true));
+    FeedbackResponseEvents responses{};
+    CanDispatchStep ready_step{};
+    for (size_t attempt = 0U; attempt < 100000U; ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        if (step.fresh_feedback_ready)
+        {
+            ready_step = step;
+            break;
+        }
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            now_us += 100U;
+        }
+        else
+        {
+            now_us += 1000U;
+        }
+    }
+    assert(ready_step.fresh_feedback_ready);
+    assert(ready_step.action == CanDispatchAction::ActuatorTarget);
+    // Freeze the batch with the first admitted node.
+    scheduler.OnQueued(ready_step, now_us);
+    assert(scheduler.diagnostics().fanout_action_sequence == 11U);
+    assert(scheduler.diagnostics().fanout_generation == 3U);
+
+    // Replace the input with a different action/generation mid-fanout.
+    DispatchInput replacement = MakeStreamDispatchInput(now_us, true);
+    replacement.action_sequence = 99U;
+    replacement.target_generation = 9U;
+    scheduler.SetDispatchInput(replacement);
+    const CanDispatchStep next = scheduler.Next(now_us + 100U);
+    assert(next.action == CanDispatchAction::ActuatorTarget);
+    assert(next.node_id == 2U);
+    assert(scheduler.diagnostics().fanout_action_sequence == 11U);
+    assert(scheduler.diagnostics().fanout_generation == 3U);
+}
+
+// doc 07 section 5 G0: at least one startup regression must run with the
+// production quiet=5000us / response=4000us plan.
+void TestCanDispatcherStartupWithProductionTimingPlan()
+{
+    CanDispatchScheduler scheduler; // default production plan
+    scheduler.SetMode(CanDispatchMode::Stream);
+    uint32_t now_us = 0U;
+    FeedbackResponseEvents responses{};
+    bool enabled = false;
+    for (size_t attempt = 0U; attempt < 400U && !enabled; ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.action != CanDispatchAction::None)
+        {
+            assert(step.transition);
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            if (step.action ==
+                CanDispatchAction::MotorDiagnosticsRequest)
+                responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            else if (step.action == CanDispatchAction::EnableBroadcast)
+                enabled = true;
+        }
+        now_us += 1000U;
+    }
+    assert(enabled);
+
+    // No first target at all: feedback keeps running and seals ready under
+    // the production timing plan.
+    bool ready_seen = false;
+    uint32_t position_requests = 0U;
+    uint32_t non_transition_targets = 0U;
+    for (size_t attempt = 0U; attempt < 2000U && !ready_seen; ++attempt)
+    {
+        const CanDispatchStep step = scheduler.Next(now_us, responses);
+        responses = {};
+        if (step.fresh_feedback_ready)
+            ready_seen = true;
+        if (step.action != CanDispatchAction::None)
+        {
+            if (step.action == CanDispatchAction::ActuatorTarget &&
+                !step.transition)
+                ++non_transition_targets;
+            scheduler.OnQueued(step, now_us);
+            scheduler.OnTransmissionCompleted(
+                step.action, step.node_id, now_us, true, now_us);
+            if (step.action == CanDispatchAction::PositionRequest)
+            {
+                ++position_requests;
+                responses.position_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+            }
+            else if (step.action == CanDispatchAction::TemperatureRequest ||
+                     step.action ==
+                         CanDispatchAction::MotorDiagnosticsRequest)
+                responses.temperature_mask = static_cast<uint8_t>(
+                    1U << (step.node_id - 1U));
+        }
+        now_us += 1000U;
+    }
+    assert(ready_seen);
+    assert(non_transition_targets == 0U);
+    assert(position_requests >= 7U);
+}
+
+// ---- doc 07 R01: the shared TX lifecycle must deliver exactly one business
+// terminal per enqueue and never over-release or leak the token.
+namespace
+{
+struct TxLifecycleDriver
+{
+    dummy::can_tx::State state = dummy::can_tx::State::Idle;
+    uint32_t terminals = 0U;
+    uint32_t releases = 0U;
+    uint32_t stale = 0U;
+    uint32_t recovery = 0U;
+    dummy::can_tx::Terminal last_terminal = dummy::can_tx::Terminal::None;
+
+    void Feed(dummy::can_tx::Event event)
+    {
+        const dummy::can_tx::Transition transition =
+            dummy::can_tx::Advance(state, event);
+        state = transition.next;
+        if (transition.terminal != dummy::can_tx::Terminal::None)
+        {
+            ++terminals;
+            last_terminal = transition.terminal;
+        }
+        if (transition.release_token)
+            ++releases;
+        if (transition.count_stale)
+            ++stale;
+        if (transition.count_recovery)
+            ++recovery;
+    }
+};
+}
+
+void TestCanTxLifecycleNormalCompleteAndDuplicateCallback()
+{
+    TxLifecycleDriver driver;
+    driver.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    assert(driver.state == dummy::can_tx::State::InFlight);
+    assert(driver.terminals == 0U);
+    assert(driver.releases == 0U);
+    driver.Feed(dummy::can_tx::Event::CompleteCallback);
+    assert(driver.state == dummy::can_tx::State::Idle);
+    assert(driver.terminals == 1U);
+    assert(driver.last_terminal == dummy::can_tx::Terminal::Complete);
+    assert(driver.releases == 1U);
+    // A duplicate callback after settlement is stale: never a second
+    // terminal, never a second token release.
+    driver.Feed(dummy::can_tx::Event::CompleteCallback);
+    assert(driver.state == dummy::can_tx::State::Idle);
+    assert(driver.terminals == 1U);
+    assert(driver.releases == 1U);
+    assert(driver.stale == 1U);
+}
+
+void TestCanTxLifecycleAbortRacesAndAbortCallback()
+{
+    TxLifecycleDriver completed;
+    completed.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    completed.Feed(dummy::can_tx::Event::AbortAccepted);
+    assert(completed.state == dummy::can_tx::State::AbortRequested);
+    // The frame actually completed before the abort landed: evidence-based
+    // Complete, not a fabricated one.
+    completed.Feed(dummy::can_tx::Event::CompleteCallback);
+    assert(completed.state == dummy::can_tx::State::Idle);
+    assert(completed.terminals == 1U);
+    assert(completed.last_terminal == dummy::can_tx::Terminal::Complete);
+    assert(completed.releases == 1U);
+
+    TxLifecycleDriver aborted;
+    aborted.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    aborted.Feed(dummy::can_tx::Event::AbortCallback);
+    assert(aborted.state == dummy::can_tx::State::Idle);
+    assert(aborted.terminals == 1U);
+    assert(aborted.last_terminal == dummy::can_tx::Terminal::Aborted);
+    assert(aborted.releases == 1U);
+}
+
+void TestCanTxLifecyclePendingMailboxKeepsTokenAndConvergesOnce()
+{
+    // R01 core: a still-pending mailbox at the second deadline must NOT
+    // release the token; the business terminal is delivered exactly once.
+    TxLifecycleDriver pending;
+    pending.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    pending.Feed(dummy::can_tx::Event::AbortAccepted);
+    pending.Feed(dummy::can_tx::Event::MailboxStillPending);
+    assert(pending.state == dummy::can_tx::State::RecoveryRequired);
+    assert(pending.terminals == 1U);
+    assert(pending.last_terminal == dummy::can_tx::Terminal::Error);
+    assert(pending.releases == 0U);
+    // A late abort IRQ while recovering converges without a second terminal.
+    pending.Feed(dummy::can_tx::Event::AbortCallback);
+    assert(pending.state == dummy::can_tx::State::Idle);
+    assert(pending.terminals == 1U);
+    assert(pending.releases == 1U);
+
+    // TME evidence paths: TME+TXOK is a real Complete; TME without TXOK is
+    // Aborted. Both converge with exactly one terminal.
+    TxLifecycleDriver complete;
+    complete.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    complete.Feed(dummy::can_tx::Event::AbortAccepted);
+    complete.Feed(dummy::can_tx::Event::MailboxEndedComplete);
+    assert(complete.state == dummy::can_tx::State::Idle);
+    assert(complete.terminals == 1U);
+    assert(complete.last_terminal == dummy::can_tx::Terminal::Complete);
+    assert(complete.releases == 1U);
+
+    TxLifecycleDriver ended_aborted;
+    ended_aborted.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    ended_aborted.Feed(dummy::can_tx::Event::AbortAccepted);
+    ended_aborted.Feed(dummy::can_tx::Event::MailboxEndedAborted);
+    assert(ended_aborted.state == dummy::can_tx::State::Idle);
+    assert(ended_aborted.terminals == 1U);
+    assert(ended_aborted.last_terminal == dummy::can_tx::Terminal::Aborted);
+    assert(ended_aborted.releases == 1U);
+}
+
+void TestCanTxLifecycleRecoveryExhaustionBlocksThenResetRestores()
+{
+    TxLifecycleDriver driver;
+    driver.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    driver.Feed(dummy::can_tx::Event::AbortAccepted);
+    driver.Feed(dummy::can_tx::Event::MailboxStillPending);
+    assert(driver.state == dummy::can_tx::State::RecoveryRequired);
+    // Bounded polls without hardware progress.
+    driver.Feed(dummy::can_tx::Event::MailboxStillPending);
+    driver.Feed(dummy::can_tx::Event::MailboxStillPending);
+    driver.Feed(dummy::can_tx::Event::RecoveryExhausted);
+    assert(driver.state == dummy::can_tx::State::Blocked);
+    assert(driver.terminals == 1U);
+    assert(driver.releases == 0U);
+    // Any callback while blocked is stale evidence.
+    driver.Feed(dummy::can_tx::Event::CompleteCallback);
+    driver.Feed(dummy::can_tx::Event::AbortCallback);
+    assert(driver.state == dummy::can_tx::State::Blocked);
+    assert(driver.terminals == 1U);
+    assert(driver.releases == 0U);
+    // The controlled peripheral reset restores eligibility exactly once.
+    driver.Feed(dummy::can_tx::Event::ChannelReset);
+    assert(driver.state == dummy::can_tx::State::Idle);
+    assert(driver.terminals == 1U);
+    assert(driver.releases == 1U);
+    // The channel is usable again; the next transaction gets its own
+    // terminal and token release.
+    driver.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    assert(driver.state == dummy::can_tx::State::InFlight);
+    driver.Feed(dummy::can_tx::Event::CompleteCallback);
+    assert(driver.state == dummy::can_tx::State::Idle);
+    assert(driver.terminals == 2U);
+    assert(driver.releases == 2U);
+}
+
+void TestCanTxLifecycleEnqueueFailureAndStaleMailboxCallbacks()
+{
+    TxLifecycleDriver failed;
+    failed.Feed(dummy::can_tx::Event::EnqueueFailed);
+    assert(failed.state == dummy::can_tx::State::Idle);
+    assert(failed.terminals == 1U);
+    assert(failed.last_terminal == dummy::can_tx::Terminal::Error);
+    assert(failed.releases == 1U);
+
+    TxLifecycleDriver abort_rejected;
+    abort_rejected.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    abort_rejected.Feed(dummy::can_tx::Event::AbortRejected);
+    assert(abort_rejected.state == dummy::can_tx::State::RecoveryRequired);
+    assert(abort_rejected.terminals == 1U);
+    assert(abort_rejected.last_terminal == dummy::can_tx::Terminal::Error);
+    assert(abort_rejected.releases == 0U);
+    abort_rejected.Feed(dummy::can_tx::Event::MailboxEndedAborted);
+    assert(abort_rejected.state == dummy::can_tx::State::Idle);
+    assert(abort_rejected.terminals == 1U);
+    assert(abort_rejected.releases == 1U);
+
+    // A rejected re-abort during recovery keeps waiting under the bounded
+    // attempt count; no premature terminal.
+    TxLifecycleDriver reabort;
+    reabort.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    reabort.Feed(dummy::can_tx::Event::AbortAccepted);
+    reabort.Feed(dummy::can_tx::Event::AbortRejected);
+    assert(reabort.state == dummy::can_tx::State::AbortRequested);
+    assert(reabort.terminals == 0U);
+
+    // Wrong-mailbox / idle-channel callbacks are stale and never settle a
+    // live transaction.
+    TxLifecycleDriver stale;
+    stale.Feed(dummy::can_tx::Event::EnqueueSucceeded);
+    stale.Feed(dummy::can_tx::Event::StaleCallback);
+    assert(stale.state == dummy::can_tx::State::InFlight);
+    assert(stale.terminals == 0U);
+    assert(stale.stale == 1U);
+}
+
+void TestCanTxLifecycleTableIsTotal()
+{
+    // The whole state x event table must be defined (no silent gaps), so the
+    // transport and the tests share every path.
+    for (uint8_t state_index = 0U; state_index <= 4U; ++state_index)
+    {
+        for (uint8_t event_index = 0U; event_index <= 11U; ++event_index)
+        {
+            const dummy::can_tx::Transition transition =
+                dummy::can_tx::Advance(
+                    static_cast<dummy::can_tx::State>(state_index),
+                    static_cast<dummy::can_tx::Event>(event_index));
+            (void) transition;
+            assert(static_cast<uint8_t>(transition.next) <= 4U);
+            assert(static_cast<uint8_t>(transition.terminal) <= 3U);
+        }
+    }
+}
+
+// ---- doc 07 R05: the explicit IEEE-754 classifier rejects non-finite
+// payloads without relying on std::isfinite semantics under -Ofast.
+void TestIeee754FiniteClassificationRejectsNonFinitePayloads()
+{
+    assert(!Ieee754IsFinite(std::numeric_limits<float>::quiet_NaN()));
+    assert(!Ieee754IsFinite(std::numeric_limits<float>::infinity()));
+    assert(!Ieee754IsFinite(-std::numeric_limits<float>::infinity()));
+    assert(Ieee754IsFinite(0.0F));
+    assert(Ieee754IsFinite(-0.0F));
+    assert(Ieee754IsFinite(1.0F));
+    assert(Ieee754IsFinite(-1.0F));
+    assert(Ieee754IsFinite(std::numeric_limits<float>::max()));
+    assert(Ieee754IsFinite(std::numeric_limits<float>::min()));
+    assert(Ieee754IsFinite(std::numeric_limits<float>::denorm_min()));
 }
 
 void TestTargetCompletionRetriesOnlyTheExactFailedNode()
@@ -2261,6 +3328,28 @@ int main()
     TestCanDispatcherRejectsInvalidRatePlanWithoutFallback();
     TestCanDispatcherBootstrapsEveryNodeAndFaultPreemptsQuery();
     TestSafetyModesPreemptPartialTargetFanout();
+    TestCanDispatcherStreamsFeedbackWithoutFirstTarget();
+    TestCanDispatcherGatesFirstTargetUntilFreshFeedback();
+    TestCanDispatcherCancelsUnstartedFanoutWithoutStarvingFeedback();
+    TestCanDispatcherPostEnableFeedbackTimeoutFailsClosed();
+    TestCanDispatcherEnableCompletionTimeoutFailsClosed();
+    TestCanDispatcherCompletionSlightlyInFutureDoesNotTimeout();
+    TestCanDispatcherResponseTimeoutSurvivesClockWrap();
+    TestCanDispatcherAdmissionFailureSkipsAndRetriesPositionQuery();
+    TestCanDispatcherPreflightAdmissionFailureFailsClosed();
+    TestPositionTailAdmissionFailureCancelsMonitorRequest();
+    TestTargetRetryAdmissionFailureRecordsOwnerBeforeCancel();
+    TestCanDispatcherFanoutAdmissionBudgetFailsClosed();
+    TestCanDispatcherTargetAdmissionFailureEndsFanout();
+    TestCanDispatcherFanoutIdentityFrozenAgainstInputReplacement();
+    TestCanDispatcherStartupWithProductionTimingPlan();
+    TestCanTxLifecycleNormalCompleteAndDuplicateCallback();
+    TestCanTxLifecycleAbortRacesAndAbortCallback();
+    TestCanTxLifecyclePendingMailboxKeepsTokenAndConvergesOnce();
+    TestCanTxLifecycleRecoveryExhaustionBlocksThenResetRestores();
+    TestCanTxLifecycleEnqueueFailureAndStaleMailboxCallbacks();
+    TestCanTxLifecycleTableIsTotal();
+    TestIeee754FiniteClassificationRejectsNonFinitePayloads();
     TestTargetCompletionRetriesOnlyTheExactFailedNode();
     TestTargetCompletionFailsOnSecondErrorOrFanoutDeadline();
     TestTargetCompletionSafetyCancelRejectsStaleRetry();
