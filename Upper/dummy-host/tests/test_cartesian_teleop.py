@@ -596,12 +596,26 @@ class _ScriptedCartesianGamepad:
         self.closed = True
 
 
+@pytest.mark.parametrize("stale_proposal", [False, True])
 def test_cartesian_fake_mcu_reuses_joint_gateway_and_records_semantics(
     config: RobotConfig,
     tmp_path: Path,
+    monkeypatch,
+    stale_proposal: bool,
 ) -> None:
     profile = _profile()
-    kinematics = _kinematics(config, profile)
+    # This contract tests gateway/recording semantics. The real URDF solver is
+    # covered above; its wall-clock solve occasionally crosses an asynchronous
+    # feedback boundary and correctly triggers HOLD instead of this happy path.
+    kinematics = _LinearKinematics()
+    if stale_proposal:
+        propose = CartesianPoseIntegrator.propose
+
+        def expired_proposal(self, *args, **kwargs):
+            result = propose(self, *args, **kwargs)
+            return replace(result, source_sweep_id=result.source_sweep_id + 1000)
+
+        monkeypatch.setattr(CartesianPoseIntegrator, "propose", expired_proposal)
     # Keep the synthetic dead-man asserted long enough for the asynchronous
     # lease thread to acquire control even under a loaded full-suite runner.
     source = _ScriptedCartesianGamepad(
@@ -629,6 +643,11 @@ def test_cartesian_fake_mcu_reuses_joint_gateway_and_records_semantics(
         kinematics=kinematics,
     )
     recorder.close()
+    if stale_proposal:
+        assert result.actions_sent == 0
+        assert result.final_mode == "HOLD"
+        assert "coherent feedback sweep changed while IK was solving" in recorder.events_path.read_text()
+        return
     assert result.actions_sent >= 1
     assert result.final_mode == "HOLD"
     assert source.closed

@@ -119,6 +119,8 @@ def main() -> None:
     )
     parser.add_argument("--session-root", required=True)
     parser.add_argument("--duration", type=float)
+    parser.add_argument("--acceptance-window", action="store_true",
+                        help="Record one strict window after startup, with a bounded final evidence drain")
     parser.add_argument(
         "--progress-interval",
         type=float,
@@ -153,6 +155,8 @@ def main() -> None:
     )
     parser.add_argument("--allow-gripper", action="store_true")
     args = parser.parse_args()
+    if args.acceptance_window and args.duration is None:
+        parser.error("--acceptance-window requires --duration")
     if args.execute and not args.port:
         parser.error("--execute requires --port")
     if not args.execute and (args.acceptance_session or args.acknowledge_real_risk):
@@ -396,6 +400,7 @@ def main() -> None:
             recorder,
             profile,
             duration_s=args.duration,
+            acceptance_window=args.acceptance_window,
             require_camera=args.require_camera,
             allowed_joints=(
                 None

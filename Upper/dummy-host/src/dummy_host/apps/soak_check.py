@@ -9,6 +9,9 @@ from pathlib import Path
 import numpy as np
 
 from ..domain import ControlMode, HoldReasonBits
+from ..acceptance_window import (
+    AcceptanceWindow, MAX_ACTION_DRAIN_NS, load_acceptance_window,
+)
 from ..protocol import (
     CAN_DIAGNOSTICS_FORMAT_VERSION,
     CAN_DIAGNOSTICS_PAYLOAD_SIZE,
@@ -120,6 +123,7 @@ class SoakCheckReport:
     metrics: SoakMetrics
     failures: tuple[str, ...]
     warnings: tuple[str, ...]
+    window: AcceptanceWindow | None = None
 
 
 def _rate_failures(
@@ -289,6 +293,7 @@ def evaluate_soak_metrics(
 
 def _event_evidence(
     path: Path,
+    window: AcceptanceWindow | None = None,
 ) -> tuple[dict[str, int], tuple[int, ...], tuple[int, ...]]:
     counts: dict[str, int] = {}
     collection_starts: list[int] = []
@@ -302,8 +307,10 @@ def _event_evidence(
             raise SoakCheckError(f"invalid events.jsonl: {exc}") from exc
         event = value.get("event")
         if isinstance(event, str):
-            counts[event] = counts.get(event, 0) + 1
             monotonic_ns = value.get("monotonic_ns")
+            if window is None or (isinstance(monotonic_ns, int)
+                                  and window.start_ns <= monotonic_ns <= window.evidence_end_ns):
+                counts[event] = counts.get(event, 0) + 1
             if event in {"collection_started", "collection_stopped"}:
                 if (
                     isinstance(monotonic_ns, bool)
@@ -351,6 +358,7 @@ def check_soak_session(
     except SessionCheckError as exc:
         raise SoakCheckError(str(exc)) from exc
     manifest = json.loads((session_dir / "manifest.json").read_text(encoding="utf-8"))
+    window = load_acceptance_window(session_dir, manifest)
     if manifest.get("schema_version") != 6:
         raise SoakCheckError("v2.2.2 soak acceptance requires Raw Session schema v6")
     failures = list(integrity.errors)
@@ -363,10 +371,69 @@ def check_soak_session(
         failures.append("session did not close cleanly")
 
     db_path = session_dir / "samples.sqlite"
+    wal_path = session_dir / "samples.sqlite-wal"
+    if wal_path.exists() and wal_path.stat().st_size:
+        raise SoakCheckError("soak requires a closed, checkpointed database; pending WAL evidence exists")
     try:
         with sqlite3.connect(
             f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True
         ) as connection:
+            # TEMP views only: the source database and its checksums are never
+            # changed. All existing metric queries use the same explicit scope.
+            if window is not None:
+                connection.execute("PRAGMA temp_store=MEMORY")
+                connection.execute(f"""CREATE TEMP VIEW samples AS
+                    SELECT * FROM main.samples WHERE control_actual_start_ns >= {window.start_ns}
+                    AND control_actual_start_ns < {window.stop_ns}""")
+                connection.execute(f"""CREATE TEMP VIEW action_lifecycle AS
+                    SELECT * FROM main.action_lifecycle WHERE action_sequence IN
+                    (SELECT action_sequence FROM samples WHERE action_sequence IS NOT NULL)
+                    OR (send_enqueued_host_ns >= {window.start_ns}
+                        AND send_enqueued_host_ns < {window.stop_ns})""")
+                connection.execute(f"""CREATE TEMP VIEW can_diagnostics AS
+                    SELECT * FROM main.can_diagnostics WHERE host_time_ns >= {window.diagnostic_start_ns}
+                    AND host_time_ns <= {window.diagnostic_stop_ns}""")
+                connection.execute("""CREATE TEMP VIEW time_sync_models AS
+                    SELECT * FROM main.time_sync_models WHERE model_id IN
+                    (SELECT time_sync_model_id FROM samples)""")
+                invalid_window = connection.execute("""SELECT COUNT(*) FROM samples
+                    WHERE sample_valid = 0 OR position_valid = 0 OR gripper_valid = 0
+                    OR deadman = 0 OR connected = 0 OR hold_requested != 0
+                    OR estop_requested != 0 OR control_missed_periods != 0""").fetchone()[0]
+                epoch_misses = connection.execute("""SELECT COUNT(*) FROM samples
+                    WHERE session_epoch != ?""", (window.session_epoch,)).fetchone()[0]
+                if epoch_misses:
+                    failures.append("control samples changed session epoch within acceptance")
+                missing = connection.execute("""SELECT COUNT(*) FROM samples s
+                    LEFT JOIN action_lifecycle a ON s.action_sequence = a.action_sequence
+                    WHERE s.action_sequence IS NOT NULL AND a.action_sequence IS NULL""").fetchone()[0]
+                if missing:
+                    failures.append("window action sample has no lifecycle record")
+                bad_actions = connection.execute("""SELECT COUNT(*) FROM action_lifecycle
+                    WHERE session_epoch != ? OR send_enqueued_host_ns IS NULL
+                    OR send_enqueued_host_ns < ? OR send_enqueued_host_ns >= ?
+                    OR can_queued_exact_host_ns IS NULL OR terminal_stage IS NOT NULL
+                    OR post_command_feedback_host_ns > ?
+                    OR acknowledged_host_ns < send_enqueued_host_ns
+                    OR post_command_feedback_mcu_us < can_tx_complete_exact_mcu_us""",
+                    (window.session_epoch, window.start_ns, window.stop_ns,
+                     min(window.evidence_end_ns, window.stop_ns + MAX_ACTION_DRAIN_NS))).fetchone()[0]
+                if bad_actions:
+                    failures.append("window action lifecycle has invalid ownership, terminal state or completion boundary")
+                # No motion action can be omitted by moving it just outside a
+                # marker; startup contains no targets and drain contains no new ones.
+                outside = connection.execute("""SELECT COUNT(*) FROM main.action_lifecycle
+                    WHERE send_enqueued_host_ns < ? OR send_enqueued_host_ns >= ?""",
+                    (window.start_ns, window.stop_ns)).fetchone()[0]
+                if outside:
+                    failures.append("motion actions exist outside the single acceptance window")
+                unhealthy_drain = connection.execute("""SELECT COUNT(*) FROM main.samples
+                    WHERE control_actual_start_ns >= ? AND control_actual_start_ns <= ?
+                    AND (sample_valid = 0 OR state_mode != ? OR state_fault_bits != 0
+                         OR deadman = 0 OR hold_requested != 0 OR estop_requested != 0)""",
+                    (window.stop_ns, window.evidence_end_ns, int(ControlMode.TELEOP))).fetchone()[0]
+                if unhealthy_drain:
+                    failures.append("control became unhealthy during acceptance evidence drain")
             sample_row = connection.execute(
                 """
                 SELECT COUNT(*),
@@ -492,9 +559,13 @@ def check_soak_session(
     else:
         first = diagnostics_rows[0]
         last = diagnostics_rows[-1]
+        if window is not None and (int(first[0]) != window.diagnostic_start_ns
+                                   or int(last[0]) != window.diagnostic_stop_ns):
+            failures.append("acceptance diagnostic boundary snapshots are missing")
         identity_indices = (3, 6, 7)
         diagnostic_window_valid = all(
-            first[index] == last[index] for index in identity_indices
+            first[index] == row[index]
+            for row in diagnostics_rows for index in identity_indices
         )
         diagnostic_window_valid = diagnostic_window_valid and all(
             int(row[1]) == CAN_DIAGNOSTICS_FORMAT_VERSION
@@ -517,6 +588,21 @@ def check_soak_session(
             diagnostic_duration_s = duration_delta_us / 1e6
 
         counter_rollback = False
+        # Check every intermediate snapshot, not only the endpoints. A reset
+        # followed by recovery must never cancel an error or create a fake rate.
+        array_indices = set(range(9, 22)) | {28, 29, 30, 31}
+        scalar_indices = {8, 22, 23, 24, 25, 26, 27, 32, 33, 34, 35, 36}
+        for previous, current in zip(diagnostics_rows, diagnostics_rows[1:]):
+            for index in array_indices | scalar_indices:
+                if index in array_indices:
+                    size = 2 if index in {19, 20, 21, 28, 29, 30, 31} else 7
+                    before = _decode_counter_array(previous[index], field=str(index), length=size)
+                    after = _decode_counter_array(current[index], field=str(index), length=size)
+                else:
+                    before, after = (int(previous[index]),), (int(current[index]),)
+                if any(end < start for start, end in zip(before, after)):
+                    counter_rollback = True
+                    failures.append("CAN diagnostic counter rolled back within the evidence window")
 
         def counter_deltas(
             first_values: tuple[int, ...],
@@ -614,7 +700,7 @@ def check_soak_session(
         )
 
     event_counts, collection_starts, collection_stops = _event_evidence(
-        session_dir / "events.jsonl"
+        session_dir / "events.jsonl", window
     )
     if len(collection_starts) != 1 or len(collection_stops) != 1:
         failures.append(
@@ -627,10 +713,19 @@ def check_soak_session(
         duration_s = 0.0
     else:
         duration_s = (collection_stops[0] - collection_starts[0]) / 1e9
+    if window is not None:
+        duration_s = (window.stop_ns - window.start_ns) / 1e9
+        if diagnostic_duration_s < thresholds.minimum_duration_s:
+            failures.append("CAN diagnostic evidence is shorter than the required acceptance duration")
+        for name in ("operator_hold", "deadman_released", "safety_hold_latched",
+                     "action_enqueue_failed", "episode_failure", "episode_success",
+                     "episode_cancel", "control_timing_invalid"):
+            if event_counts.get(name, 0):
+                failures.append(f"acceptance interrupted by {name}")
     metrics = SoakMetrics(
         duration_s=duration_s,
         samples=samples,
-        invalid_samples=integrity.invalid_samples,
+        invalid_samples=integrity.invalid_samples if window is None else int(invalid_window),
         fault_samples=fault_samples,
         hold_samples=hold_samples,
         control_rate_hz=0.0 if duration_s <= 0 else samples / duration_s,
@@ -697,6 +792,7 @@ def check_soak_session(
         metrics=metrics,
         failures=tuple(dict.fromkeys(failures)),
         warnings=integrity.warnings,
+        window=window,
     )
 
 
@@ -706,12 +802,23 @@ def main() -> None:
     )
     parser.add_argument("--session", required=True)
     parser.add_argument("--minimum-duration-s", type=float, default=3600.0)
+    parser.add_argument("--config", help="frozen RobotConfig; verifies hash and uses its CAN rates")
     parser.add_argument("--json-output")
     args = parser.parse_args()
     thresholds = replace(
         SoakThresholds(), minimum_duration_s=args.minimum_duration_s
     )
     try:
+        if args.config:
+            from ..schema import load_robot_config
+            config = load_robot_config(args.config)
+            manifest = json.loads((Path(args.session) / "manifest.json").read_text(encoding="utf-8"))
+            if manifest.get("robot_config_hash") != config.config_hash:
+                raise ValueError("session robot_config_hash does not match the supplied configuration")
+            thresholds = replace(thresholds, control_rate_hz=float(config.control_rate_hz),
+                                 target_rate_hz=float(config.can_target_hz_per_node),
+                                 position_rate_hz=float(config.can_position_hz_per_node),
+                                 temperature_rate_hz=float(config.can_temperature_hz_per_node))
         report = check_soak_session(args.session, thresholds)
     except (OSError, ValueError, SoakCheckError) as exc:
         parser.error(str(exc))

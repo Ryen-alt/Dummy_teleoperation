@@ -4,6 +4,7 @@
 #include "can_feedback_monitor.hpp"
 #include "feedback_poll_scheduler.hpp"
 #include "binary_protocol.hpp"
+#include "feedback_safety_supervisor.hpp"
 
 #include <array>
 #include <cstdint>
@@ -38,6 +39,7 @@ struct FeedbackRuntimeProgress
 {
     uint32_t last_publish_us = 0U;
     uint32_t publish_failure_count = 0U;
+    bool published = false;
 };
 
 // Firmware-only bridge around the pure C++ monitor. The CAN dispatcher is the
@@ -71,6 +73,10 @@ void PublishFeedbackSnapshot(uint32_t now_us);
 std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(uint32_t now_us);
 std::array<SealedJointSample, kActuatorNodeCount> ReadSealedJointSamples();
 FeedbackRuntimeProgress ReadFeedbackRuntimeProgress();
+FeedbackSafetyInput ReadFeedbackSafetyInput(
+    uint64_t now_us, bool control_active, bool following_active,
+    const std::array<float, kActuatorNodeCount>& commanded,
+    const std::array<float, kActuatorNodeCount>& measured);
 CoherentFeedbackStatus ReadCoherentFeedbackStatus();
 MotorTransportDiagnostics ReadMotorTransportDiagnostics();
 void ResetMotorTransportDiagnostics();

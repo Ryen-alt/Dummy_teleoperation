@@ -15,6 +15,7 @@ htmlcov/
 # Local build outputs and Markdown notes.
 build/
 *.md
+!/Upper/dummy-host/docs/can_acceptance_window.md
 
 # Editor, OS, and temporary files.
 **/.idea/

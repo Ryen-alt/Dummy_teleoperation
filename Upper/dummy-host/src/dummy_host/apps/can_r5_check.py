@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
 from dummy_host.apps.soak_check import SoakThresholds, check_soak_session
-from dummy_host.can_a9 import load_can_timing_profile_events
+from dummy_host.can_a9 import load_can_timing_profile_events, load_acceptance_timing_profile
+from dummy_host.acceptance_window import AcceptanceWindow
 from dummy_host.can_r5 import (
     CanR5Decision,
     CanR5RuntimeEvidence,
@@ -20,7 +22,8 @@ from dummy_host.schema import RobotConfig, load_robot_config
 
 
 def _runtime_event_evidence(
-    path: Path, session_epoch: int
+    path: Path, session_epoch: int, window: AcceptanceWindow | None = None,
+    action_sequences: set[int] | None = None,
 ) -> tuple[tuple[int, ...], int, int]:
     fanouts: list[tuple[int, int, int]] = []
     starts: list[int] = []
@@ -78,14 +81,18 @@ def _runtime_event_evidence(
         raise ValueError(
             "R5 requires exactly one ordered collection_started/stopped window"
         )
+    lower = starts[0] if window is None else window.start_ns
+    upper = stops[0] if window is None else window.evidence_end_ns
     selected = [
         (sequence, duration)
         for monotonic_ns, sequence, duration in fanouts
-        if starts[0] <= monotonic_ns <= stops[0]
+        if lower <= monotonic_ns <= upper
     ]
     if len({sequence for sequence, _ in selected}) != len(selected):
         raise ValueError("R5 fanout evidence repeats an action sequence")
-    return tuple(duration for _, duration in selected), starts[0], stops[0]
+    if action_sequences is not None and {sequence for sequence, _ in selected} != action_sequences:
+        raise ValueError("R5 fanout sequences do not match the window action ledger")
+    return tuple(duration for _, duration in selected), lower, upper
 
 
 def check_can_r5_session(
@@ -128,14 +135,23 @@ def check_can_r5_session(
     )
     soak = check_soak_session(session_dir, soak_thresholds)
     events_path = session_dir / "events.jsonl"
+    sequences = None
+    if soak.window is not None:
+        with sqlite3.connect(f"file:{(session_dir / 'samples.sqlite').as_posix()}?mode=ro", uri=True) as db:
+            sequences = {int(row[0]) for row in db.execute("""SELECT action_sequence
+                FROM action_lifecycle WHERE send_enqueued_host_ns >= ? AND send_enqueued_host_ns < ?""",
+                (soak.window.start_ns, soak.window.stop_ns))}
+            diagnostic_start_us = int(db.execute("""SELECT window_start_us FROM can_diagnostics
+                WHERE host_time_ns = ?""", (soak.window.diagnostic_start_ns,)).fetchone()[0])
     fanouts, collection_start_ns, collection_stop_ns = _runtime_event_evidence(
-        events_path, session_epoch
+        events_path, session_epoch, soak.window, sequences
     )
     profile = load_can_timing_profile_events(
         events_path,
         minimum_monotonic_ns=collection_start_ns,
         maximum_monotonic_ns=collection_stop_ns,
-    )
+    ) if soak.window is None else load_acceptance_timing_profile(
+        events_path, soak.window, diagnostic_start_us=diagnostic_start_us)
     if profile.session_epoch != session_epoch:
         evidence_failures.append(
             "A9 profile session_epoch does not match the session manifest"
@@ -194,6 +210,7 @@ def main() -> None:
     parser.add_argument("--session", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--minimum-required-position-hz", type=int, default=20)
+    parser.add_argument("--minimum-duration-s", type=float, default=600.0)
     parser.add_argument("--json-output")
     args = parser.parse_args()
     try:
@@ -201,6 +218,7 @@ def main() -> None:
             args.session,
             load_robot_config(args.config),
             minimum_required_position_hz=args.minimum_required_position_hz,
+            thresholds=CanR5Thresholds(minimum_duration_s=args.minimum_duration_s),
         )
     except (OSError, TypeError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))

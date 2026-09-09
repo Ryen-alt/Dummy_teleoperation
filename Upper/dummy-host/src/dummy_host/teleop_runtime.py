@@ -9,6 +9,7 @@ from typing import Callable, Protocol
 import numpy as np
 
 from .cameras import CameraError, CameraFrame
+from .acceptance_window import MAX_ACTION_DRAIN_NS, MAX_BOUNDARY_DELAY_NS
 from .cartesian_teleop import CartesianPoseIntegrator, CartesianTeleopError
 from .domain import ActionLifecycleUpdate, ActionStage, EpisodeError, EpisodeManager, EpisodeStatus
 from .kinematics.calibration import CartesianCalibration
@@ -130,6 +131,18 @@ class _EvidenceTelemetryWorker:
         self.thread = Thread(
             target=self._run, name="dummy-evidence-telemetry", daemon=True
         )
+        self.latest_diagnostics = None
+        self.final_requested = False
+        self.final_boundary: tuple[int, int] | None = None
+
+    def diagnostics_snapshot(self):
+        with self.lock:
+            return self.latest_diagnostics
+
+    def request_final_boundary(self) -> tuple[int, int] | None:
+        with self.lock:
+            self.final_requested = True
+            return self.final_boundary
 
     def start(self) -> None:
         self.thread.start()
@@ -153,29 +166,38 @@ class _EvidenceTelemetryWorker:
         try:
             while not self.stop.is_set():
                 now = time.monotonic()
+                with self.lock:
+                    final_capture = self.final_requested and self.final_boundary is None
                 if now >= next_sync:
                     exchange = self.robot.time_sync()
                     self.recorder.record_time_sync(
                         exchange, self.estimator.observe(exchange)
                     )
                     next_sync = now + 0.5
-                if now >= next_diagnostics:
+                if now >= next_diagnostics or final_capture:
+                    diagnostics = self.robot.read_can_diagnostics()
+                    diagnostic_ns = self.clock_ns()
                     self.recorder.record_can_diagnostics(
-                        self.robot.read_can_diagnostics(),
-                        host_time_ns=self.clock_ns(),
+                        diagnostics, host_time_ns=diagnostic_ns,
                     )
+                    with self.lock:
+                        self.latest_diagnostics = (diagnostic_ns, diagnostics)
                     next_diagnostics = now + 1.0
                 if (
                     self.robot.firmware_capabilities
                     & CAPABILITY_CAN_TIMING_PROFILE
-                    and now >= next_timing_profile
+                    and (now >= next_timing_profile or final_capture)
                 ):
+                    timing_profile = self.robot.read_can_timing_profile()
                     self.recorder.record_event(
                         "can_timing_profile",
                         monotonic_ns=self.clock_ns(),
-                        payload=asdict(self.robot.read_can_timing_profile()),
+                        payload=asdict(timing_profile),
                     )
                     next_timing_profile = now + 5.0
+                if final_capture:
+                    with self.lock:
+                        self.final_boundary = (diagnostic_ns, self.clock_ns())
                 wait_s = max(
                     0.001,
                     min(next_sync, next_diagnostics, next_timing_profile)
@@ -500,6 +522,7 @@ def run_teleop_collection(
     profile: TeleopProfile,
     *,
     duration_s: float | None = None,
+    acceptance_window: bool = False,
     require_camera: bool = False,
     allowed_joints: set[int] | None = None,
     allow_gripper: bool = False,
@@ -518,7 +541,10 @@ def run_teleop_collection(
     same safety filter and binary firmware protocol.
     """
 
-    if duration_s is not None and duration_s <= 0:
+    if acceptance_window and duration_s is None:
+        input_source.close()
+        raise ValueError("acceptance_window requires a finite collection duration")
+    if duration_s is not None and (not np.isfinite(duration_s) or duration_s <= 0):
         input_source.close()
         raise ValueError("duration_s must be positive")
     if require_camera and robot.camera_manager is None:
@@ -605,6 +631,11 @@ def run_teleop_collection(
     consecutive_control_overruns = 0
     idle_input_timeout_active = False
     runtime_error: BaseException | None = None
+    acceptance_start_ns: int | None = None
+    acceptance_stop_ns: int | None = None
+    acceptance_final_boundary: tuple[int, int] | None = None
+    if acceptance_window:
+        recorder.enable_acceptance_window()
 
     def runtime_event(name: str, when_ns: int, payload: dict[str, object]) -> None:
         recorder.record_event(name, monotonic_ns=when_ns, payload=payload)
@@ -792,10 +823,16 @@ def run_teleop_collection(
             nonlocal episode_last_sequence, episode_finalize_deadline_ns
             nonlocal latest_action_sequence
             nonlocal idle_input_timeout_active
+            nonlocal acceptance_start_ns, acceptance_stop_ns, acceptance_final_boundary
             now_ns = scheduled.actual_start_ns
             if deadline_ns is not None and now_ns >= deadline_ns:
-                stop.set()
-                return
+                if not acceptance_window or acceptance_start_ns is None:
+                    stop.set()
+                    return
+                if acceptance_stop_ns is None:
+                    acceptance_stop_ns = now_ns
+                if now_ns - acceptance_stop_ns > MAX_BOUNDARY_DELAY_NS:
+                    raise TeleopError("acceptance evidence boundary timed out")
             assert lease is not None
             assert evidence_telemetry is not None
             telemetry_error = evidence_telemetry.snapshot_error()
@@ -1244,6 +1281,37 @@ def run_teleop_collection(
                 record_control_sample(command, final_state, scheduled)
                 return
 
+            if acceptance_window and acceptance_start_ns is None:
+                baseline = evidence_telemetry.diagnostics_snapshot()
+                if (baseline is None or baseline[0] < collection_started_ns
+                        or not 0 <= now_ns - baseline[0] <= MAX_BOUNDARY_DELAY_NS
+                        or baseline[1].session_epoch != robot.session_id
+                        or not baseline[1].window_valid):
+                    integrator.advance_without_motion(now_ns)
+                    record_control_sample(command, final_state, scheduled)
+                    return
+                acceptance_start_ns = now_ns
+                recorder.record_event(
+                    "acceptance_window_started", monotonic_ns=now_ns,
+                    payload={"session_epoch": robot.session_id,
+                             "robot_config_hash": robot.config.config_hash,
+                             "diagnostic_start_ns": baseline[0]},
+                )
+
+            if acceptance_stop_ns is not None:
+                with action_stage_lock:
+                    stages = set(action_stages.get(latest_action_sequence, set()))
+                if latest_action_sequence is not None and ActionStage.ACKNOWLEDGED in stages:
+                    lease.request_target_refresh(latest_action_sequence, control_tick_id, now_ns)
+                if latest_action_sequence is None or ActionStage.POST_COMMAND_FEEDBACK in stages:
+                    acceptance_final_boundary = evidence_telemetry.request_final_boundary()
+                    if acceptance_final_boundary is not None:
+                        stop.set()
+                elif now_ns - acceptance_stop_ns >= MAX_ACTION_DRAIN_NS:
+                    raise TeleopError("acceptance final action did not complete within 250 ms")
+                record_control_sample(command, final_state, scheduled)
+                return
+
             if teleop_mode == "cartesian":
                 assert isinstance(integrator, CartesianPoseIntegrator)
                 if not integrator.has_fresh_coherent_sweep(final_state):
@@ -1564,7 +1632,17 @@ def run_teleop_collection(
             )
 
         scheduler_stats = scheduler.run_timed(tick, stop)
-        if robot.firmware_capabilities & CAPABILITY_CAN_TIMING_PROFILE:
+        if acceptance_window:
+            if acceptance_start_ns is None or acceptance_stop_ns is None or acceptance_final_boundary is None:
+                raise TeleopError("acceptance window did not complete")
+            recorder.record_event(
+                "acceptance_window_stopped", monotonic_ns=acceptance_stop_ns,
+                payload={"session_epoch": robot.session_id,
+                         "robot_config_hash": robot.config.config_hash,
+                         "diagnostic_stop_ns": acceptance_final_boundary[0],
+                         "evidence_end_ns": acceptance_final_boundary[1]},
+            )
+        elif robot.firmware_capabilities & CAPABILITY_CAN_TIMING_PROFILE:
             recorder.record_event(
                 "can_timing_profile",
                 monotonic_ns=clock_ns(),

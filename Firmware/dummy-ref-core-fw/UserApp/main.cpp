@@ -8,6 +8,7 @@
 #include "protocols/feedback_poll_scheduler.hpp"
 #include "protocols/joint_space_mapping.hpp"
 #include "protocols/monotonic_micros.hpp"
+#include "protocols/scheduled_actuator_request.hpp"
 
 #include <algorithm>
 #include <array>
@@ -166,29 +167,18 @@ dummy::protocol::CanDispatchConfig MakeCanDispatchConfig()
 dummy::protocol::CanDispatchScheduler can_dispatch_scheduler(
     MakeCanDispatchConfig());
 
-enum class ScheduledActuatorMode : uint8_t
-{
-    Idle,
-    Stream,
-    Hold,
-    Fault,
-};
-
-struct ScheduledActuatorRequest
-{
-    ScheduledActuatorMode mode = ScheduledActuatorMode::Idle;
-    std::array<float, 7> position{};
-    uint32_t sequence = 0;
-};
+using dummy::protocol::ScheduledActuatorMode;
+using dummy::protocol::ScheduledActuatorRequest;
 
 ScheduledActuatorRequest scheduled_actuator_request{};
 
 void PublishStreamingActuatorTarget(const std::array<float, 7>& position,
-                                    uint32_t sequence)
+                                    uint32_t sequence, uint32_t session_epoch)
 {
     taskENTER_CRITICAL();
     scheduled_actuator_request.position = position;
     scheduled_actuator_request.sequence = sequence;
+    scheduled_actuator_request.session_epoch = session_epoch;
     scheduled_actuator_request.mode = ScheduledActuatorMode::Stream;
     taskEXIT_CRITICAL();
 }
@@ -199,6 +189,7 @@ void PublishActuatorMode(ScheduledActuatorMode mode,
     taskENTER_CRITICAL();
     scheduled_actuator_request.position = hold_position;
     scheduled_actuator_request.sequence = 0U;
+    scheduled_actuator_request.session_epoch = 0U;
     scheduled_actuator_request.mode = mode;
     taskEXIT_CRITICAL();
 }
@@ -276,27 +267,10 @@ void ThreadControlLoopFixUpdate(void* argument)
                 measured_position);
         }
 
-        dummy::protocol::FeedbackSafetyInput safety_input{};
-        safety_input.now_us = now_us;
-        safety_input.control_active = binary_snapshot.lease_active;
-        safety_input.following_active = step.command_valid;
-        safety_input.commanded_position = step.command_valid
-            ? step.position : external_target_executor.commanded_position();
-        safety_input.measured_position = measured_position;
-        safety_input.feedback = dummy::protocol::ReadCanFeedbackStatus(
-            static_cast<uint32_t>(now_us));
-        // Dispatcher liveness: the consumer measures the snapshot publish age
-        // with its own clock; ages inside the snapshot are recomputed the
-        // same way, so a stalled dispatcher can never look "still fresh".
-        const auto feedback_progress =
-            dummy::protocol::ReadFeedbackRuntimeProgress();
-        safety_input.dispatcher_published =
-            feedback_progress.last_publish_us != 0U;
-        safety_input.dispatcher_progress_age_ms =
-            feedback_progress.last_publish_us == 0U ? 0U :
-            dummy::protocol::RecentElapsedMicros32(
-                static_cast<uint32_t>(now_us),
-                feedback_progress.last_publish_us) / 1000U;
+        const auto safety_input = dummy::protocol::ReadFeedbackSafetyInput(
+            now_us, binary_snapshot.lease_active, step.command_valid,
+            step.command_valid ? step.position : external_target_executor.commanded_position(),
+            measured_position);
         const auto safety = feedback_safety_supervisor.Update(safety_input);
         dummy::protocol::PublishCanFeedbackReady(
             safety.arm_position_valid && safety.gripper_position_valid);
@@ -344,7 +318,8 @@ void ThreadControlLoopFixUpdate(void* argument)
                 // Latest-value mailbox: the 200 Hz executor may overwrite an
                 // intermediate point before a node's 50 Hz slot. No stale
                 // backlog is ever replayed onto the actuator bus.
-                PublishStreamingActuatorTarget(step.position, step.sequence);
+                PublishStreamingActuatorTarget(
+                    step.position, step.sequence, binary_snapshot.session_epoch);
                 break;
             }
             robot.UpdateJointPose6D();
@@ -499,6 +474,15 @@ void ThreadCanDispatch(void* argument)
             dummy::protocol::BinaryControlMonotonicMicros();
         const auto control_snapshot =
             dummy::protocol::ReadBinaryControlSnapshot(dispatch_now_us);
+        const auto target_owner_epoch = [&]() -> uint32_t
+        {
+            // A failed tracker is inactive but still owns its original key
+            // until Cancel(). Preserve it across a concurrent USB HELLO.
+            if (completion_tracker.key().action_sequence != 0U)
+                return completion_tracker.key().session_epoch;
+            return target_fanout_active
+                ? target_fanout.session_epoch : control_snapshot.session_epoch;
+        };
 
         // Observe the safety mailbox before crediting or retrying any target
         // completion from the same wake. Once the mode changes, stale target
@@ -515,7 +499,7 @@ void ThreadCanDispatch(void* argument)
             {
                 dummy::protocol::RecordBinaryTargetPreemptedBySafety(
                     preempted_sequence,
-                    dummy::protocol::BinaryControlMonotonicMicros());
+                    dummy::protocol::BinaryControlMonotonicMicros(), target_owner_epoch());
                 ++safety_preemption_count;
             }
             target_fanout = {};
@@ -577,14 +561,14 @@ void ThreadCanDispatch(void* argument)
         dispatch_input.session_epoch = control_snapshot.session_epoch;
         dispatch_input.motion_authorized = binary_stream_authorized;
         dispatch_input.target_available =
-            scheduled.mode == ScheduledActuatorMode::Stream &&
-            scheduled.sequence != 0U;
+            scheduled.HasTargetFor(control_snapshot.session_epoch);
         dispatch_input.action_sequence =
             dispatch_input.target_available ? scheduled.sequence : 0U;
         dispatch_input.target_generation = fanout_generation;
         can_dispatch_scheduler.SetDispatchInput(dispatch_input);
         if (dispatch_mode == dummy::protocol::CanDispatchMode::Stream &&
             (!binary_stream_authorized ||
+             (target_fanout_active && target_fanout.session_epoch != control_snapshot.session_epoch) ||
              (completion_tracker.active() &&
               control_snapshot.session_epoch !=
                   completion_tracker.key().session_epoch)))
@@ -595,9 +579,10 @@ void ThreadCanDispatch(void* argument)
             if (control_snapshot.mode != dummy::protocol::ControlMode::Teleop &&
                 control_snapshot.mode != dummy::protocol::ControlMode::Policy)
                 authorization_detail |= 1U << 1U;
-            if (completion_tracker.active() &&
-                control_snapshot.session_epoch !=
-                    completion_tracker.key().session_epoch)
+            if ((completion_tracker.active() &&
+                 control_snapshot.session_epoch != completion_tracker.key().session_epoch) ||
+                (target_fanout_active &&
+                 control_snapshot.session_epoch != target_fanout.session_epoch))
                 authorization_detail |= 1U << 2U;
             record_transition_failure(
                 dummy::protocol::CanTransitionFailureCode::AuthorizationLost,
@@ -608,7 +593,7 @@ void ThreadCanDispatch(void* argument)
             if (preempted_sequence != 0U)
             {
                 dummy::protocol::RecordBinaryTargetPreemptedBySafety(
-                    preempted_sequence, dispatch_now_us);
+                    preempted_sequence, dispatch_now_us, target_owner_epoch());
                 ++safety_preemption_count;
             }
             target_fanout = {};
@@ -655,7 +640,7 @@ void ThreadCanDispatch(void* argument)
             if (failed_sequence != 0U)
                 dummy::protocol::RecordBinaryTargetFailed(
                     failed_sequence,
-                    dummy::protocol::BinaryControlMonotonicMicros());
+                    dummy::protocol::BinaryControlMonotonicMicros(), target_owner_epoch());
             target_fanout = {};
             target_fanout_active = false;
             completion_target = {};
@@ -898,7 +883,7 @@ void ThreadCanDispatch(void* argument)
                 {
                     dummy::protocol::RecordBinaryTargetCanTxCompleteExact(
                         completion.metadata.action_sequence, completed_us,
-                        completion_tracker.last_fanout_us());
+                        completion_tracker.last_fanout_us(), completion.metadata.session_epoch);
                     completion_target = {};
                     completion_tracker.Cancel();
                 }
@@ -906,7 +891,7 @@ void ThreadCanDispatch(void* argument)
                          dummy::protocol::TargetCompletionResult::Failed)
                 {
                     dummy::protocol::RecordBinaryTargetFailed(
-                        completion.metadata.action_sequence, completed_us);
+                        completion.metadata.action_sequence, completed_us, completion.metadata.session_epoch);
                     target_fanout = {};
                     target_fanout_active = false;
                     completion_target = {};
@@ -944,7 +929,7 @@ void ThreadCanDispatch(void* argument)
         {
             dummy::protocol::RecordBinaryTargetFailed(
                 completion_tracker.key().action_sequence,
-                dummy::protocol::BinaryControlMonotonicMicros());
+                dummy::protocol::BinaryControlMonotonicMicros(), target_owner_epoch());
             target_fanout = {};
             target_fanout_active = false;
             completion_target = {};
@@ -970,7 +955,7 @@ void ThreadCanDispatch(void* argument)
                     ? sample_us : std::min(earliest_sample_us, sample_us);
             }
             dummy::protocol::RecordBinaryCoherentSweep(
-                coherent.sweep_id, coherent_now_us, earliest_sample_us);
+                coherent.sweep_id, coherent_now_us, earliest_sample_us, control_snapshot.session_epoch);
         }
         const auto step =
             can_dispatch_scheduler.Next(service_now_us, responses);
@@ -1032,7 +1017,7 @@ void ThreadCanDispatch(void* argument)
                 {
                     dummy::protocol::RecordBinaryTargetFailed(
                         failed_sequence,
-                        dummy::protocol::BinaryControlMonotonicMicros());
+                        dummy::protocol::BinaryControlMonotonicMicros(), target_owner_epoch());
                 }
                 target_fanout = {};
                 target_fanout_active = false;
@@ -1142,10 +1127,9 @@ void ThreadCanDispatch(void* argument)
                     {
                         const ScheduledActuatorRequest candidate =
                             ReadScheduledActuatorRequest();
-                        if (candidate.mode == ScheduledActuatorMode::Stream &&
-                            candidate.sequence != 0U &&
+                        if (candidate.HasTargetFor(control_snapshot.session_epoch) &&
                             dummy::protocol::TryStartBinaryTargetDispatch(
-                                candidate.sequence))
+                                candidate.sequence, control_snapshot.session_epoch))
                         {
                             target_fanout = candidate;
                             target_fanout_active = true;
@@ -1159,6 +1143,7 @@ void ThreadCanDispatch(void* argument)
                     {
                         latest = target_fanout;
                         tx_metadata.action_sequence = latest.sequence;
+                        tx_metadata.session_epoch = latest.session_epoch;
                         tx_metadata.fanout_generation = fanout_generation;
                         send_status = robot.ApplyExternalUrdfTargetNodeRad(
                             step.node_id, latest.position, &tx_metadata);
@@ -1242,11 +1227,11 @@ void ThreadCanDispatch(void* argument)
             // the action ledger, the retry state and the completion tracker.
             completion_tracker.FailAndCancel(
                 target_fanout_active ? target_fanout.sequence : 0U,
-                [](uint32_t failed_sequence)
+                [&](uint32_t failed_sequence)
                 {
                     dummy::protocol::RecordBinaryTargetFailed(
                         failed_sequence,
-                        dummy::protocol::BinaryControlMonotonicMicros());
+                        dummy::protocol::BinaryControlMonotonicMicros(), target_owner_epoch());
                 });
             target_fanout = {};
             target_fanout_active = false;
@@ -1268,7 +1253,7 @@ void ThreadCanDispatch(void* argument)
                 if (!completion_tracker.MarkRetryQueued(target_retry))
                 {
                     dummy::protocol::RecordBinaryTargetFailed(
-                        target_retry.key.action_sequence, dispatch_now_us);
+                        target_retry.key.action_sequence, dispatch_now_us, target_retry.key.session_epoch);
                     target_fanout = {};
                     target_fanout_active = false;
                     completion_target = {};
@@ -1318,7 +1303,7 @@ void ThreadCanDispatch(void* argument)
                         if (!completion_tracker.Begin(key, service_now_us))
                         {
                             dummy::protocol::RecordBinaryTargetFailed(
-                                latest.sequence, dispatch_now_us);
+                                latest.sequence, dispatch_now_us, latest.session_epoch);
                             target_fanout = {};
                             target_fanout_active = false;
                             application_tracker.Reset();
@@ -1337,7 +1322,7 @@ void ThreadCanDispatch(void* argument)
                         dummy::protocol::RecordBinaryTargetCanQueuedExact(
                             latest.sequence,
                             dummy::protocol::BinaryControlMonotonicMicros(),
-                            coherent.sweep_id);
+                            coherent.sweep_id, latest.session_epoch);
                         target_fanout = {};
                         target_fanout_active = false;
                         application_tracker.Reset();

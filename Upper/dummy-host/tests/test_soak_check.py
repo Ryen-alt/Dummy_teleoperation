@@ -4,6 +4,10 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
+import pytest
+import json
+import sqlite3
+import hashlib
 
 from dummy_host.apps.can_r5_check import check_can_r5_session
 from dummy_host.apps.soak_check import (
@@ -159,7 +163,7 @@ def _can_diagnostics(
     )
 
 
-def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Path) -> None:
+def _record_soak_fixture(config, tmp_path: Path, *, acceptance=False) -> Path:
     profile = load_teleop_profile(
         Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml"
     )
@@ -195,7 +199,12 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
     position = np.concatenate(
         (config.initial_pose_rad, np.asarray([0.5], dtype=np.float32))
     )
-    recorder.record_event("collection_started", monotonic_ns=start_ns)
+    recorder.record_event("collection_started", monotonic_ns=start_ns - 100_000_000 if acceptance else start_ns)
+    if acceptance:
+        recorder.enable_acceptance_window()
+        recorder.record_event("acceptance_window_started", monotonic_ns=start_ns,
+            payload={"session_epoch": epoch, "robot_config_hash": config.config_hash,
+                     "diagnostic_start_ns": start_ns})
     for index in range(1, 21):
         tick_ns = start_ns + (index - 1) * 50_000_000
         state = RobotState(
@@ -216,6 +225,12 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
             feedback_max_skew_us=29_000,
             coherent_reference_mcu_us=tick_ns // 1000,
         )
+        if acceptance and index == 1:
+            startup_ns = start_ns - 50_000_000
+            recorder.record_sample(mapper.map(set(), startup_ns),
+                replace(state, mode=ControlMode.HOLD),
+                timing=ControlTickTiming(0, startup_ns, startup_ns, startup_ns),
+                valid=False, invalid_reason="startup waiting for control")
         action = AppliedAction(
             position.copy(),
             position.copy(),
@@ -235,7 +250,9 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
         for offset, stage in enumerate(
             (
                 ActionStage.SAFETY_ACCEPTED,
+                ActionStage.SEND_ENQUEUED,
                 ActionStage.ACKNOWLEDGED,
+                ActionStage.CAN_QUEUED_EXACT,
                 ActionStage.CAN_TX_COMPLETE_EXACT,
                 ActionStage.POST_COMMAND_FEEDBACK,
             )
@@ -275,7 +292,7 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
     )
     recorder.record_event(
         "can_timing_profile",
-        monotonic_ns=start_ns + 999_000_000,
+        monotonic_ns=start_ns + 1_001_000_000 if acceptance else start_ns + 999_000_000,
         payload=asdict(
             replace(
                 a9_fixture,
@@ -285,13 +302,23 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
             )
         ),
     )
+    if acceptance:
+        recorder.record_event("acceptance_window_stopped", monotonic_ns=start_ns + 1_000_000_000,
+            payload={"session_epoch": epoch, "robot_config_hash": config.config_hash,
+                     "diagnostic_stop_ns": start_ns + 1_000_000_000,
+                     "evidence_end_ns": start_ns + 1_002_000_000})
     recorder.record_event(
-        "collection_stopped", monotonic_ns=start_ns + 1_000_000_000
+        "collection_stopped", monotonic_ns=start_ns + (1_003_000_000 if acceptance else 1_000_000_000)
     )
     recorder.close()
+    return recorder.session_dir
 
+
+@pytest.mark.parametrize("acceptance", [False, True])
+def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Path, acceptance) -> None:
+    session = _record_soak_fixture(config, tmp_path, acceptance=acceptance)
     report = check_soak_session(
-        recorder.session_dir, SoakThresholds(minimum_duration_s=1.0)
+        session, SoakThresholds(minimum_duration_s=1.0)
     )
     assert report.ok, report.failures
     assert report.metrics.coherent_ratio == 1.0
@@ -299,7 +326,7 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
     assert report.metrics.target_rate_hz_per_node == (50.0,) * 7
 
     r5 = check_can_r5_session(
-        recorder.session_dir,
+        session,
         config,
         thresholds=CanR5Thresholds(
             minimum_duration_s=1.0,
@@ -309,3 +336,124 @@ def test_soak_checker_reads_a_complete_v6_evidence_session(config, tmp_path: Pat
     assert r5.result == "RECONFIGURE"
     assert r5.runtime.exact_fanout_samples == 20
     assert r5.runtime.exact_fanout_p99_ms == 0.9
+
+
+def _seal_fixture(session: Path) -> None:
+    """Seal synthetic mutations so semantic checks, not checksum failures, run."""
+    db = sqlite3.connect(session / "samples.sqlite")
+    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    db.close()
+    checksums = json.loads((session / "checksums.json").read_text())
+    checksums["files"] = {name: hashlib.sha256((session / name).read_bytes()).hexdigest()
+                          for name in checksums["files"]}
+    (session / "checksums.json").write_text(json.dumps(checksums))
+
+
+@pytest.mark.parametrize("sql, expected", [
+    ("UPDATE samples SET state_mode=2 WHERE sample_index=10", "HOLD sample"),
+    ("UPDATE samples SET sample_valid=0 WHERE sample_index=10", "invalid control sample"),
+    ("UPDATE samples SET session_epoch=78 WHERE sample_index=10", "changed session epoch"),
+    ("UPDATE samples SET control_missed_periods=1 WHERE sample_index=10", "invalid control sample"),
+    ("DELETE FROM action_lifecycle WHERE action_sequence=10", "no lifecycle record"),
+    ("UPDATE action_lifecycle SET terminal_stage='preempted_by_safety' WHERE action_sequence=10", "invalid ownership"),
+    ("UPDATE action_lifecycle SET post_command_feedback_host_ns=NULL WHERE action_sequence=20", "incomplete action"),
+    ("UPDATE action_lifecycle SET post_command_feedback_host_ns=12000000000 WHERE action_sequence=20", "completion boundary"),
+    ("UPDATE action_lifecycle SET send_enqueued_host_ns=9999999999 WHERE action_sequence=1", "outside the single"),
+    ("DELETE FROM can_diagnostics WHERE host_time_ns=11000000000", "first and last diagnostic"),
+])
+def test_acceptance_preserves_strict_failure_gates(config, tmp_path, sql, expected):
+    session = _record_soak_fixture(config, tmp_path, acceptance=True)
+    with sqlite3.connect(session / "samples.sqlite") as db:
+        db.execute(sql)
+    _seal_fixture(session)
+    report = check_soak_session(session, SoakThresholds(minimum_duration_s=1))
+    assert not report.ok
+    assert any(expected in failure for failure in report.failures), report.failures
+
+
+@pytest.mark.parametrize("mutation", ["missing_stop", "duplicate_start", "epoch", "reversed", "far_boundary"])
+def test_acceptance_rejects_missing_or_ambiguous_markers(config, tmp_path, mutation):
+    session = _record_soak_fixture(config, tmp_path, acceptance=True)
+    path = session / "events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    start = next(e for e in events if e["event"] == "acceptance_window_started")
+    if mutation == "missing_stop":
+        events = [e for e in events if e["event"] != "acceptance_window_stopped"]
+    elif mutation == "duplicate_start":
+        events.append(start)
+    elif mutation == "epoch":
+        start["payload"]["session_epoch"] += 1
+    elif mutation == "reversed":
+        start["monotonic_ns"] += 2_000_000_000
+    else:
+        start["payload"]["diagnostic_start_ns"] -= 3_000_000_000
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    _seal_fixture(session)
+    with pytest.raises(ValueError, match="acceptance"):
+        check_soak_session(session, SoakThresholds(minimum_duration_s=1))
+
+
+@pytest.mark.parametrize("change", ["epoch", "rollback"])
+def test_acceptance_checks_intermediate_diagnostics(config, tmp_path, change):
+    session = _record_soak_fixture(config, tmp_path, acceptance=True)
+    with sqlite3.connect(session / "samples.sqlite") as db:
+        columns = [r[1] for r in db.execute("PRAGMA table_info(can_diagnostics)") if r[1] != "diagnostic_index"]
+        row = dict(zip(columns, db.execute(f"SELECT {','.join(columns)} FROM can_diagnostics ORDER BY host_time_ns DESC LIMIT 1").fetchone()))
+        row["host_time_ns"] = 10_500_000_000
+        row["window_duration_us"] = 500000
+        if change == "epoch":
+            row["session_epoch"] += 1
+        else:
+            row["unexpected_response_count"] = 1 # final snapshot goes back to zero
+        db.execute(f"INSERT INTO can_diagnostics ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", tuple(row.values()))
+    _seal_fixture(session)
+    report = check_soak_session(session, SoakThresholds(minimum_duration_s=1))
+    assert not report.ok
+    assert not report.metrics.diagnostic_window_valid
+
+
+@pytest.mark.parametrize("change", ["inactive_final", "wrong_epoch", "wrong_origin", "different_sequence"])
+def test_r5_rejects_cross_window_profile_and_fanout_evidence(config, tmp_path, change):
+    session = _record_soak_fixture(config, tmp_path, acceptance=True)
+    path = session / "events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    profile = next(e for e in events if e["event"] == "can_timing_profile")
+    if change == "inactive_final":
+        earlier = json.loads(json.dumps(profile))
+        earlier["monotonic_ns"] -= 10_000_000
+        events.insert(events.index(profile), earlier)
+        profile["payload"]["window_flags"] &= ~1
+    elif change == "wrong_epoch":
+        profile["payload"]["session_epoch"] += 1
+    elif change == "wrong_origin":
+        profile["payload"]["window_start_us"] += 1
+    else:
+        next(e for e in events if e["event"] == "can_target_fanout")["payload"]["action_sequence"] = 999
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    _seal_fixture(session)
+    with pytest.raises(ValueError, match="A9 acceptance|fanout sequences"):
+        check_can_r5_session(session, config,
+            thresholds=CanR5Thresholds(minimum_duration_s=1, minimum_fanout_samples=10))
+
+
+def test_last_action_can_complete_in_bounded_drain(config, tmp_path):
+    session = _record_soak_fixture(config, tmp_path, acceptance=True)
+    with sqlite3.connect(session / "samples.sqlite") as db:
+        db.execute("""UPDATE action_lifecycle SET can_tx_complete_exact_host_ns=11000500000,
+            post_command_feedback_host_ns=11001000000 WHERE action_sequence=20""")
+    path = session / "events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    next(e for e in events if e["event"] == "can_target_fanout"
+         and e["payload"]["action_sequence"] == 20)["monotonic_ns"] = 11_000_500_000
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    _seal_fixture(session)
+    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in session.iterdir() if p.is_file()}
+    report = check_soak_session(session, SoakThresholds(minimum_duration_s=1))
+    assert report.ok, report.failures
+    r5 = check_can_r5_session(session, config,
+        thresholds=CanR5Thresholds(minimum_duration_s=1, minimum_fanout_samples=10))
+    assert r5.runtime.exact_fanout_samples == 20
+    assert r5.result == "RECONFIGURE"
+    assert before == {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in session.iterdir() if p.is_file()}

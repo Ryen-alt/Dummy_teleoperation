@@ -24,16 +24,16 @@ struct BinaryControlSnapshot
 uint64_t BinaryControlMonotonicMicros();
 BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us);
 void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
-                                      uint32_t coherent_sweep_id);
+                                      uint32_t coherent_sweep_id, uint32_t session_epoch);
 void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us,
-                                          uint32_t fanout_us);
-void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us);
-bool TryStartBinaryTargetDispatch(uint32_t sequence);
-void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us);
-void RecordBinaryTargetPreemptedBySafety(uint32_t sequence, uint64_t now_us);
-void RecordBinaryTargetFailed(uint32_t sequence, uint64_t now_us);
+                                          uint32_t fanout_us, uint32_t session_epoch);
+void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us, uint32_t session_epoch);
+bool TryStartBinaryTargetDispatch(uint32_t sequence, uint32_t session_epoch);
+void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us, uint32_t session_epoch);
+void RecordBinaryTargetPreemptedBySafety(uint32_t sequence, uint64_t now_us, uint32_t session_epoch);
+void RecordBinaryTargetFailed(uint32_t sequence, uint64_t now_us, uint32_t session_epoch);
 void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us,
-                               uint64_t earliest_sample_us);
+                               uint64_t earliest_sample_us, uint32_t session_epoch);
 void RequestBinaryRuntimeHold();
 void ApplyBinarySafetyOutcome(const FeedbackSafetyOutput& safety);
 FeedbackSafetyOutput ReadBinarySafetyTelemetry();

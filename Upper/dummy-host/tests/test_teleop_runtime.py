@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -23,6 +24,8 @@ from dummy_host.teleop import (
     load_teleop_profile,
 )
 from dummy_host.teleop_runtime import _LeaseCoordinator, run_teleop_collection
+from dummy_host.acceptance_window import load_acceptance_window
+from dummy_host.apps.soak_check import check_soak_session, SoakThresholds
 
 
 class ScriptedKeyboard:
@@ -51,6 +54,53 @@ class IdleKeyboard(ScriptedKeyboard):
         assert now_ns is not None
         self.polls += 1
         return self.mapper.map(set(), now_ns)
+
+
+class AcceptanceKeyboard(ScriptedKeyboard):
+    def poll(self, now_ns: int | None = None) -> TeleopCommand:
+        assert now_ns is not None
+        self.polls += 1
+        return self.mapper.map({"KEY_SPACE"} if self.polls > 2 else set(), now_ns)
+
+
+def test_runtime_records_one_acceptance_window_and_drains_actions(config, tmp_path):
+    profile = load_teleop_profile(Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml")
+    recorder = SessionRecorder(tmp_path, config, profile, source="test")
+    robot = DummyRobot(config, FakeMcuTransport(config))
+    try:
+        stats = run_teleop_collection(robot, AcceptanceKeyboard(KeyboardMapper(profile)),
+            recorder, profile, duration_s=2.1, acceptance_window=True)
+    finally:
+        recorder.close()
+    assert stats.actions_sent > 0
+    manifest = json.loads(recorder.manifest_path.read_text())
+    window = load_acceptance_window(recorder.session_dir, manifest)
+    assert window is not None
+    with sqlite3.connect(recorder.db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM samples WHERE control_actual_start_ns < ?",
+                          (window.start_ns,)).fetchone()[0] > 0
+        assert db.execute("SELECT COUNT(*) FROM samples WHERE control_actual_start_ns >= ? AND control_actual_start_ns < ? AND sample_valid=0",
+                          (window.start_ns, window.stop_ns)).fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM action_lifecycle WHERE post_command_feedback_host_ns IS NULL").fetchone()[0] == 0
+    report = check_soak_session(recorder.session_dir, SoakThresholds(minimum_duration_s=0.5))
+    assert report.metrics.invalid_samples == 0
+    assert report.metrics.hold_samples == 0
+    assert report.metrics.incomplete_action_sequences == 0
+    assert not any("boundary" in f or "ownership" in f or "outside the single" in f for f in report.failures), report.failures
+
+
+def test_failed_acceptance_startup_cannot_fall_back_to_whole_session(config, tmp_path):
+    profile = load_teleop_profile(Path(__file__).parents[1] / "configs" / "teleop_inputs.yaml")
+    recorder = SessionRecorder(tmp_path, config, profile, source="test")
+    try:
+        with pytest.raises(TeleopError, match="window did not complete"):
+            run_teleop_collection(DummyRobot(config, FakeMcuTransport(config)),
+                IdleKeyboard(KeyboardMapper(profile)), recorder, profile,
+                duration_s=0.2, acceptance_window=True)
+    finally:
+        recorder.close()
+    with pytest.raises(ValueError, match="exactly one"):
+        check_soak_session(recorder.session_dir, SoakThresholds(minimum_duration_s=0.1))
 
 
 class StrayEpisodeFailureKeyboard(ScriptedKeyboard):

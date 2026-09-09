@@ -4,6 +4,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from .acceptance_window import AcceptanceWindow, read_events
 
 from .protocol import (
     CAN_TIMING_PROFILE_EPOCH_STABLE,
@@ -211,3 +212,51 @@ def load_can_timing_profile_events(
         for key, value in selected.items()
     }
     return CanTimingProfile(**converted)
+
+
+def load_acceptance_timing_profile(path: Path, window: AcceptanceWindow,
+                                   *, diagnostic_start_us: int) -> CanTimingProfile:
+    """Validate the entire cumulative A9 history in the declared evidence scope.
+
+    Percentiles cannot be subtracted. Startup in the same MCU epoch remains
+    included, conservatively; no previous active snapshot may mask a reset or
+    inactive final snapshot.
+    """
+    profiles = []
+    for record in read_events(path):
+        if record.get("event") != "can_timing_profile":
+            continue
+        when = record.get("monotonic_ns")
+        if isinstance(when, bool) or not isinstance(when, int):
+            raise ValueError("A9 snapshot has invalid timestamp")
+        if not window.diagnostic_start_ns <= when <= window.evidence_end_ns:
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("A9 snapshot payload is not an object")
+        profile = CanTimingProfile(**{k: tuple(v) if isinstance(v, list) else v
+                                     for k, v in payload.items()})
+        profiles.append((when, profile))
+    if not profiles or profiles[-1][0] < window.diagnostic_stop_ns:
+        raise ValueError("acceptance is missing its final A9 boundary snapshot")
+    first = profiles[0][1]
+    previous = None
+    counters = ("position_samples", "temperature_samples", "motor_can_samples",
+                "motor_missed_ticks", "timing_request", "timing_response", "timing_timeout",
+                "position_max_us", "temperature_max_us", "motor_can_max_x10_us",
+                "motor_jitter_max_x10_us", "motor_control_max_x10_us")
+    for when, profile in profiles:
+        if (profile.session_epoch != window.session_epoch
+                or profile.window_start_us != diagnostic_start_us
+                or profile.window_reset_count != first.window_reset_count
+                or not profile.window_flags & CAN_TIMING_PROFILE_WINDOW_ACTIVE
+                or not profile.window_flags & CAN_TIMING_PROFILE_EPOCH_STABLE):
+            raise ValueError("A9 acceptance window identity or active state changed")
+        if previous is not None:
+            if when < previous[0] or profile.window_duration_us < previous[1].window_duration_us:
+                raise ValueError("A9 acceptance clock rolled back")
+            for name in counters:
+                if any(b < a for a, b in zip(getattr(previous[1], name), getattr(profile, name))):
+                    raise ValueError(f"A9 acceptance counter rolled back: {name}")
+        previous = (when, profile)
+    return profiles[-1][1]

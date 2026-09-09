@@ -36,6 +36,7 @@ CanTimingProfiler can_timing_profiler{};
 std::array<SealedJointSample, kActuatorNodeCount> sealed_joint_samples{};
 uint32_t last_feedback_publish_us = 0U;
 uint32_t feedback_publish_failure_count = 0U;
+bool feedback_published = false;
 
 struct FeedbackPublishedSnapshot
 {
@@ -255,14 +256,18 @@ void PublishFeedbackSnapshot(uint32_t now_us)
     snapshot.coherent = feedback_monitor.CoherentSnapshot();
     snapshot.motor_transport = motor_transport_diagnostics;
     snapshot.sealed = sealed_joint_samples;
-    if (feedback_snapshot.TryPublish(snapshot))
+    const bool published = feedback_snapshot.TryPublish(snapshot);
+    taskENTER_CRITICAL();
+    if (published)
     {
         last_feedback_publish_us = now_us;
+        feedback_published = true;
     }
     else if (feedback_publish_failure_count != UINT32_MAX)
     {
         ++feedback_publish_failure_count;
     }
+    taskEXIT_CRITICAL();
 }
 
 std::array<NodeFeedbackStatus, kActuatorNodeCount> ReadCanFeedbackStatus(
@@ -293,9 +298,29 @@ FeedbackRuntimeProgress ReadFeedbackRuntimeProgress()
 {
     taskENTER_CRITICAL();
     const FeedbackRuntimeProgress progress{
-        last_feedback_publish_us, feedback_publish_failure_count};
+        last_feedback_publish_us, feedback_publish_failure_count, feedback_published};
     taskEXIT_CRITICAL();
     return progress;
+}
+
+FeedbackSafetyInput ReadFeedbackSafetyInput(
+    uint64_t now_us, bool control_active, bool following_active,
+    const std::array<float, kActuatorNodeCount>& commanded,
+    const std::array<float, kActuatorNodeCount>& measured)
+{
+    FeedbackSafetyInput input{};
+    input.now_us = now_us;
+    input.control_active = control_active;
+    input.following_active = following_active;
+    input.commanded_position = commanded;
+    input.measured_position = measured;
+    input.feedback = ReadCanFeedbackStatus(static_cast<uint32_t>(now_us));
+    const auto progress = ReadFeedbackRuntimeProgress();
+    input.dispatcher_published = progress.published;
+    input.dispatcher_progress_age_ms = progress.published
+        ? RecentElapsedMicros32(static_cast<uint32_t>(now_us), progress.last_publish_us) / 1000U
+        : 0U;
+    return input;
 }
 
 CoherentFeedbackStatus ReadCoherentFeedbackStatus()

@@ -52,3 +52,27 @@ else()
     target_compile_options(dummy_can_transport_host_test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 endif()
 add_test(NAME dummy_can_transport_host_test COMMAND dummy_can_transport_host_test)
+
+# Actual snapshot, USB parser/action ledger, state bridge and safety components.
+# Only hardware/RTOS and the legacy ASCII transport boundary are stubbed.
+add_executable(dummy_runtime_integration_host_test
+    runtime_integration_host_test.cpp
+    ../../UserApp/protocols/binary_protocol.cpp
+    ../../UserApp/protocols/binary_control_session.cpp
+    ../../UserApp/protocols/can_feedback_monitor.cpp
+    ../../UserApp/protocols/feedback_safety_supervisor.cpp
+    ../../UserApp/protocols/feedback_poll_scheduler.cpp
+    ../../UserApp/protocols/can_timing_profiler.cpp
+    ../../UserApp/protocols/measured_state_estimator.cpp
+    ../../UserApp/protocols/external_target_executor.cpp
+)
+target_include_directories(dummy_runtime_integration_host_test PRIVATE
+    runtime_stubs ../../Bsp/communication ../../UserApp ../../UserApp/protocols)
+if(MSVC)
+    target_compile_options(dummy_runtime_integration_host_test PRIVATE /W4 /WX /UNDEBUG)
+    set_property(TARGET dummy_runtime_integration_host_test PROPERTY CXX_STANDARD 20)
+else()
+    target_compile_options(dummy_runtime_integration_host_test PRIVATE
+        -Wall -Wextra -Werror -UNDEBUG -Wno-missing-field-initializers)
+endif()
+add_test(NAME dummy_runtime_integration_host_test COMMAND dummy_runtime_integration_host_test)

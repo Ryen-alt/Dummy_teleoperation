@@ -339,6 +339,12 @@ class SessionRecorder:
             self._manifest["session_epoch"] = session_epoch
         self._write_json_atomic(self.manifest_path, self._manifest)
 
+    def enable_acceptance_window(self) -> None:
+        """Declare the contract before collection, including failed startup runs."""
+        self._require_open()
+        self._manifest["acceptance_window_contract"] = 1
+        self._write_json_atomic(self.manifest_path, self._manifest)
+
     def archive_cartesian_calibration(
         self, calibration: CartesianCalibration
     ) -> None:

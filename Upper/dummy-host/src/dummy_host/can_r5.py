@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 
 from .can_a9 import CanA9Evaluation, evaluate_can_a9
 from .protocol import CanTimingProfile
@@ -16,6 +17,9 @@ class CanR5Thresholds:
     branch_b_limit_transaction_us: int = 3571
 
     def __post_init__(self) -> None:
+        if any(isinstance(v, bool) or not isinstance(v, (int, float))
+               or not math.isfinite(v) for v in asdict(self).values()):
+            raise ValueError("R5 thresholds must be finite numbers")
         if (
             self.minimum_duration_s <= 0
             or self.minimum_fanout_samples <= 0

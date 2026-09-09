@@ -239,13 +239,20 @@ BinaryControlSnapshot ReadBinaryControlSnapshot(uint64_t now_us)
 }
 
 void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
-                                      uint32_t coherent_sweep_id)
+                                      uint32_t coherent_sweep_id, uint32_t session_epoch)
 {
     taskENTER_CRITICAL();
+    if (session_epoch == 0U || session_epoch != binary_progress_epoch ||
+        session_epoch != binary_session.session_id())
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     auto& record = ProgressRecord(sequence);
     const bool first_report =
         (record.flags & kActionProgressCanQueuedExact) == 0U;
-    if (first_report)
+    if (first_report && (record.flags & (kActionProgressSuperseded |
+            kActionProgressFailed | kActionProgressPreemptedBySafety)) == 0U)
     {
         record.flags |= kActionProgressCanQueuedExact;
         record.can_queued_time_low_us = static_cast<uint32_t>(now_us);
@@ -262,16 +269,23 @@ void RecordBinaryTargetCanQueuedExact(uint32_t sequence, uint64_t now_us,
 }
 
 void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us,
-                                          uint32_t fanout_us)
+                                          uint32_t fanout_us, uint32_t session_epoch)
 {
     if (sequence == 0U)
         return;
     taskENTER_CRITICAL();
+    if (session_epoch == 0U || session_epoch != binary_progress_epoch ||
+        session_epoch != binary_session.session_id())
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     auto& record = ProgressRecord(sequence);
     const bool queued =
         (record.flags & kActionProgressCanQueuedExact) != 0U;
     const bool terminal =
-        (record.flags & kActionProgressSuperseded) != 0U;
+        (record.flags & (kActionProgressSuperseded | kActionProgressFailed |
+                         kActionProgressPreemptedBySafety)) != 0U;
     const bool first_report =
         (record.flags & kActionProgressCanTxCompleteExact) == 0U;
     if (queued && !terminal && first_report)
@@ -288,11 +302,17 @@ void RecordBinaryTargetCanTxCompleteExact(uint32_t sequence, uint64_t now_us,
     taskEXIT_CRITICAL();
 }
 
-void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us)
+void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us, uint32_t session_epoch)
 {
     if (sequence == 0U)
         return;
     taskENTER_CRITICAL();
+    if (session_epoch == 0U || session_epoch != binary_progress_epoch ||
+        session_epoch != binary_session.session_id())
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     auto& accepted = ProgressRecord(sequence);
     (void) now_us;
     const bool already_exact =
@@ -301,11 +321,17 @@ void RecordBinaryTargetAccepted(uint32_t sequence, uint64_t now_us)
     taskEXIT_CRITICAL();
 }
 
-bool TryStartBinaryTargetDispatch(uint32_t sequence)
+bool TryStartBinaryTargetDispatch(uint32_t sequence, uint32_t session_epoch)
 {
     if (sequence == 0U)
         return false;
     taskENTER_CRITICAL();
+    if (session_epoch == 0U || session_epoch != binary_progress_epoch ||
+        session_epoch != binary_session.session_id())
+    {
+        taskEXIT_CRITICAL();
+        return false;
+    }
     bool accepted = false;
     for (const auto& record : binary_progress)
     {
@@ -322,16 +348,24 @@ bool TryStartBinaryTargetDispatch(uint32_t sequence)
     return accepted;
 }
 
-void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us)
+void RecordBinaryTargetSuperseded(uint32_t sequence, uint64_t now_us, uint32_t session_epoch)
 {
     if (sequence == 0U)
         return;
     taskENTER_CRITICAL();
+    if (session_epoch == 0U || session_epoch != binary_progress_epoch ||
+        session_epoch != binary_session.session_id())
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     auto& record = ProgressRecord(sequence);
     const bool first_report =
         (record.flags & kActionProgressSuperseded) == 0U;
     if ((record.flags & (kActionProgressCanQueuedExact |
-                        kActionProgressCanTxCompleteExact)) != 0U)
+                        kActionProgressCanTxCompleteExact |
+                        kActionProgressSuperseded | kActionProgressFailed |
+                        kActionProgressPreemptedBySafety)) != 0U)
     {
         taskEXIT_CRITICAL();
         return;
@@ -357,7 +391,8 @@ void RecordTerminalProgress(uint32_t sequence, uint64_t now_us,
         return;
     auto& record = ProgressRecord(sequence);
     if ((record.flags & kActionProgressCanTxCompleteExact) != 0U ||
-        (record.flags & flag) != 0U)
+        (record.flags & (kActionProgressSuperseded | kActionProgressFailed |
+                         kActionProgressPreemptedBySafety)) != 0U)
         return;
     record.flags |= flag;
     const size_t index = static_cast<size_t>(&record - binary_progress.data());
@@ -368,18 +403,30 @@ void RecordTerminalProgress(uint32_t sequence, uint64_t now_us,
 }
 }
 
-void RecordBinaryTargetPreemptedBySafety(uint32_t sequence, uint64_t now_us)
+void RecordBinaryTargetPreemptedBySafety(uint32_t sequence, uint64_t now_us, uint32_t session_epoch)
 {
     taskENTER_CRITICAL();
+    if (session_epoch == 0U || session_epoch != binary_progress_epoch ||
+        session_epoch != binary_session.session_id())
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     RecordTerminalProgress(
         sequence, now_us, kActionProgressPreemptedBySafety,
         ActionProgressStage::PreemptedBySafety);
     taskEXIT_CRITICAL();
 }
 
-void RecordBinaryTargetFailed(uint32_t sequence, uint64_t now_us)
+void RecordBinaryTargetFailed(uint32_t sequence, uint64_t now_us, uint32_t session_epoch)
 {
     taskENTER_CRITICAL();
+    if (session_epoch == 0U || session_epoch != binary_progress_epoch ||
+        session_epoch != binary_session.session_id())
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     RecordTerminalProgress(
         sequence, now_us, kActionProgressFailed,
         ActionProgressStage::Failed);
@@ -387,11 +434,17 @@ void RecordBinaryTargetFailed(uint32_t sequence, uint64_t now_us)
 }
 
 void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us,
-                               uint64_t earliest_sample_us)
+                               uint64_t earliest_sample_us, uint32_t session_epoch)
 {
     if (coherent_sweep_id == 0U)
         return;
     taskENTER_CRITICAL();
+    if (session_epoch == 0U || session_epoch != binary_progress_epoch ||
+        session_epoch != binary_session.session_id())
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     for (size_t index = 0; index < binary_pending_progress.size(); ++index)
     {
         const auto pending = binary_pending_progress[index];
@@ -402,7 +455,8 @@ void RecordBinaryCoherentSweep(uint32_t coherent_sweep_id, uint64_t now_us,
             continue;
         auto& record = binary_progress[index];
         if (record.action_sequence != pending.sequence ||
-            (record.flags & kActionProgressSuperseded) != 0U)
+            (record.flags & (kActionProgressSuperseded | kActionProgressFailed |
+                             kActionProgressPreemptedBySafety)) != 0U)
         {
             binary_pending_progress[index] = {};
             continue;
@@ -535,7 +589,7 @@ void ProcessBinaryBytes(const uint8_t* data, size_t length, uint64_t now_us)
         }
         if (result.target_updated)
             dummy::protocol::RecordBinaryTargetAccepted(
-                request.header.sequence, now_us);
+                request.header.sequence, now_us, request.header.session_id);
         if (result.joint_position_seed_requested)
         {
             if (!dummy::protocol::ReadCanFeedbackReady())

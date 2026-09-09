@@ -29,6 +29,15 @@ public:
 
     T Read() const
     {
+        return WithRead([](const T& value) { return value; });
+    }
+
+    // Keep a slot pinned for a bounded visitor. The visitor must not retain
+    // references to the snapshot. Also supports exercising publisher back-
+    // pressure without replacing the production snapshot implementation.
+    template<typename Visitor>
+    auto WithRead(Visitor visitor) const
+    {
         for (;;)
         {
             const uint8_t index = active_index_.load(
@@ -36,10 +45,12 @@ public:
             reader_count_[index].fetch_add(1U, std::memory_order_acq_rel);
             if (active_index_.load(std::memory_order_acquire) == index)
             {
-                const T value = slots_[index];
-                reader_count_[index].fetch_sub(
-                    1U, std::memory_order_release);
-                return value;
+                struct Pin
+                {
+                    std::atomic<uint32_t>& count;
+                    ~Pin() { count.fetch_sub(1U, std::memory_order_release); }
+                } pin{reader_count_[index]};
+                return visitor(slots_[index]);
             }
             reader_count_[index].fetch_sub(1U, std::memory_order_release);
         }
